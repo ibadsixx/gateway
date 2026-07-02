@@ -1,0 +1,121 @@
+import { router } from '../../routing/router';
+import { databaseRegistry } from '../../registry/databaseRegistry';
+import type { DatabaseProject } from '../../registry/databaseRegistry';
+import { getDatabaseProvider } from '../../providers/database';
+import { connectionConfigFromProject } from '../../providers/database/types';
+import type { DatabaseConnectionConfig } from '../../providers/database/types';
+import { eventBus } from '../../events/bus';
+import { metricsService } from '../../metrics';
+import { RetryEngine } from '../../retry/engine';
+import { generateId } from '../../utils';
+
+interface QueryResult {
+  id: string;
+  [key: string]: unknown;
+}
+
+function getConfig(project: DatabaseProject | undefined): DatabaseConnectionConfig | undefined {
+  if (!project) return undefined;
+  return connectionConfigFromProject(project);
+}
+
+class DatabaseLayer {
+  async read(domain: string, id: string): Promise<QueryResult | null> {
+    const start = Date.now();
+    try {
+      const connection = await router.route(domain, id);
+      const project = await databaseRegistry.getProjectById(connection);
+      const config = getConfig(project);
+      const provider = getDatabaseProvider(project?.provider || 'supabase');
+      const result = await RetryEngine.execute(() => provider.find(domain, id, config));
+      metricsService.record('db.read.duration', Date.now() - start, { domain });
+      return result;
+    } catch (error) {
+      metricsService.increment('db.read.errors', { domain });
+      throw error;
+    }
+  }
+
+  async write(domain: string, data: Record<string, unknown>): Promise<QueryResult> {
+    const start = Date.now();
+    try {
+      const connection = await router.route(domain);
+      const project = await databaseRegistry.getProjectById(connection);
+      const config = getConfig(project);
+      const provider = getDatabaseProvider(project?.provider || 'supabase');
+      const result = await RetryEngine.execute(() => provider.create(domain, data, config));
+
+      eventBus.emit({
+        type: `${domain}.created`,
+        payload: { id: result.id, data },
+        metadata: { timestamp: new Date(), source: 'database-layer' },
+      });
+
+      metricsService.record('db.write.duration', Date.now() - start, { domain });
+      return result;
+    } catch (error) {
+      metricsService.increment('db.write.errors', { domain });
+      throw error;
+    }
+  }
+
+  async update(domain: string, id: string, data: Record<string, unknown>): Promise<QueryResult> {
+    const start = Date.now();
+    try {
+      const connection = await router.route(domain, id);
+      const project = await databaseRegistry.getProjectById(connection);
+      const config = getConfig(project);
+      const provider = getDatabaseProvider(project?.provider || 'supabase');
+      const result = await RetryEngine.execute(() => provider.update(domain, id, data, config));
+
+      eventBus.emit({
+        type: `${domain}.updated`,
+        payload: { id, data },
+        metadata: { timestamp: new Date(), source: 'database-layer' },
+      });
+
+      metricsService.record('db.update.duration', Date.now() - start, { domain });
+      return result;
+    } catch (error) {
+      metricsService.increment('db.update.errors', { domain });
+      throw error;
+    }
+  }
+
+  async delete(domain: string, id: string, permanent = false): Promise<void> {
+    const start = Date.now();
+    try {
+      if (permanent) {
+        const connection = await router.route(domain, id);
+        const project = await databaseRegistry.getProjectById(connection);
+        const config = getConfig(project);
+        const provider = getDatabaseProvider(project?.provider || 'supabase');
+        await RetryEngine.execute(() => provider.delete(domain, id, config));
+      } else {
+        await this.update(domain, id, { deletedAt: new Date() } as Record<string, unknown>);
+      }
+
+      eventBus.emit({
+        type: `${domain}.deleted`,
+        payload: { id, permanent },
+        metadata: { timestamp: new Date(), source: 'database-layer' },
+      });
+
+      metricsService.record('db.delete.duration', Date.now() - start, { domain });
+    } catch (error) {
+      metricsService.increment('db.delete.errors', { domain });
+      throw error;
+    }
+  }
+
+  async query(domain: string, filter: Record<string, unknown>): Promise<QueryResult[]> {
+    const connection = await router.route(domain);
+    const project = await databaseRegistry.getProjectById(connection);
+    const config = getConfig(project);
+    const provider = getDatabaseProvider(project?.provider || 'supabase');
+    const results = await provider.query(domain, { ...filter, deletedAt: null }, config);
+    return results;
+  }
+}
+
+export const database = new DatabaseLayer();
