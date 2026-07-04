@@ -28,6 +28,9 @@ export interface InfrastructureProjectRow {
   used_space: number;
   priority: number;
   load_weight: number;
+  write_enabled?: boolean;
+  health_status?: HealthStatus;
+  management_pat?: string;
   region: string | null;
   response_time: number | null;
   last_health_check: string | null;

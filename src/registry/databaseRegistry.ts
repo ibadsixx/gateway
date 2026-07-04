@@ -16,6 +16,8 @@ export interface DatabaseProject {
   region?: string;
   responseTime?: number;
   loadWeight?: number;
+  writeEnabled?: boolean;
+  healthStatus?: 'online' | 'degraded' | 'offline';
   lastHealthCheck?: Date;
 }
 
@@ -54,6 +56,8 @@ function toLegacyProject(row: InfrastructureProjectRow): DatabaseProject {
     region: row.region || undefined,
     responseTime: row.response_time ?? undefined,
     loadWeight: row.load_weight,
+    writeEnabled: row.write_enabled !== false,
+    healthStatus: row.health_status || undefined,
     lastHealthCheck: row.last_health_check ? new Date(row.last_health_check) : undefined,
   };
 }
@@ -94,6 +98,7 @@ class DatabaseRegistry {
     serviceKey?: string;
     anonKey?: string;
     loadWeight?: number;
+    writeEnabled?: boolean;
   }): Promise<void> {
     const dbProviders = await infrastructureDb.getProviders();
     const providerRow = dbProviders.find(p => p.name.toLowerCase() === project.provider.toLowerCase())
@@ -133,6 +138,11 @@ class DatabaseRegistry {
     }
 
     this.invalidateCache();
+  }
+
+  async getWritableProject(domain: string): Promise<DatabaseProject | undefined> {
+    const row = await infrastructureDb.getWritableProject(domain);
+    return row ? toLegacyProject(row) : undefined;
   }
 
   async getActiveProjects(domain: string): Promise<DatabaseProject[]> {

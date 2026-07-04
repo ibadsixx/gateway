@@ -19,11 +19,13 @@ declare class InfrastructureDatabase {
     getProviderByName(name: string): Promise<ProviderRow | null>;
     getProjects(domain?: string): Promise<InfrastructureProjectRow[]>;
     getActiveProjects(domain?: string): Promise<InfrastructureProjectRow[]>;
+    getWritableProject(domain: string): Promise<InfrastructureProjectRow | null>;
     getProjectById(id: string): Promise<InfrastructureProjectRow | null>;
     getProjectByKey(key: string): Promise<InfrastructureProjectRow | null>;
     registerProject(project: Omit<InfrastructureProjectRow, 'id' | 'created_at' | 'updated_at'>): Promise<InfrastructureProjectRow>;
     updateProjectStatus(id: string, status: ProjectStatus): Promise<void>;
     updateProjectHealth(id: string, responseTime: number, usedSpace: number): Promise<void>;
+    collectUsageMetrics(): Promise<void>;
     getStorageAccounts(): Promise<StorageProviderRow[]>;
     getActiveStorageAccounts(): Promise<StorageProviderRow[]>;
     getStorageAccountById(id: string): Promise<StorageProviderRow | null>;

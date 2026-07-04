@@ -35,6 +35,8 @@ function toLegacyProject(row) {
         region: row.region || undefined,
         responseTime: row.response_time ?? undefined,
         loadWeight: row.load_weight,
+        writeEnabled: row.write_enabled !== false,
+        healthStatus: row.health_status || undefined,
         lastHealthCheck: row.last_health_check ? new Date(row.last_health_check) : undefined,
     };
 }
@@ -94,6 +96,10 @@ class DatabaseRegistry {
             await infrastructureDb_1.infrastructureDb.setCurrentWriteProject(project.domain, firstActive.id);
         }
         this.invalidateCache();
+    }
+    async getWritableProject(domain) {
+        const row = await infrastructureDb_1.infrastructureDb.getWritableProject(domain);
+        return row ? toLegacyProject(row) : undefined;
     }
     async getActiveProjects(domain) {
         const rows = await infrastructureDb_1.infrastructureDb.getActiveProjects(domain);

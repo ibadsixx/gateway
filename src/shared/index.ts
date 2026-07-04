@@ -8,7 +8,8 @@ export type Domain =
   | 'pages'
   | 'reports'
   | 'media'
-  | 'notifications';
+  | 'notifications'
+  | 'blocking';
 
 export type ProjectStatus = 'ACTIVE' | 'READ_ONLY' | 'DISABLED' | 'MAINTENANCE';
 

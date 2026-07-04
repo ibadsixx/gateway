@@ -2,7 +2,6 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.router = void 0;
 const databaseRegistry_1 = require("../registry/databaseRegistry");
-const infrastructureDb_1 = require("../infrastructure/database/infrastructureDb");
 const circuit_breaker_1 = require("../circuit-breaker");
 const engine_1 = require("../retry/engine");
 const crypto_1 = require("crypto");
@@ -26,55 +25,17 @@ class Router {
         return this.getProjectConnection(domain, selected);
     }
     async routeWrite(domain) {
-        const writeTarget = await infrastructureDb_1.infrastructureDb.getCurrentWriteProject(domain);
-        if (writeTarget) {
-            const cb = this.getOrCreateCircuitBreaker(writeTarget.id);
-            if (cb.getState() !== 'OPEN') {
-                return this.getProjectConnection(domain, {
-                    id: writeTarget.id,
-                    domain: writeTarget.domain,
-                    provider: '',
-                    status: 'ACTIVE',
-                    priority: writeTarget.priority,
-                    capacity: writeTarget.capacity,
-                    usedSpace: writeTarget.used_space,
-                    connectionName: writeTarget.project_url,
-                    loadWeight: writeTarget.load_weight,
-                    lastHealthCheck: writeTarget.last_health_check ? new Date(writeTarget.last_health_check) : undefined,
-                });
-            }
+        const project = await databaseRegistry_1.databaseRegistry.getWritableProject(domain);
+        if (!project) {
+            throw new Error(`No writable project found for domain: ${domain}`);
         }
-        const activeProjects = await databaseRegistry_1.databaseRegistry.getActiveProjects(domain);
-        if (activeProjects.length === 0) {
-            throw new Error(`No active projects available for domain: ${domain}`);
-        }
-        const selected = this.selectByLoad(activeProjects);
-        return this.getProjectConnection(domain, selected);
+        return project.id;
     }
     selectByHash(entityId, projects) {
         const hash = (0, crypto_1.createHash)('md5').update(entityId).digest('hex');
         const hashNum = parseInt(hash.substring(0, 8), 16);
         const index = hashNum % projects.length;
         return projects[index];
-    }
-    selectByLoad(projects) {
-        const withWeight = projects.map(p => ({
-            project: p,
-            weight: p.loadWeight ?? 1,
-            capacityRatio: p.usedSpace / Math.max(p.capacity, 1),
-        }));
-        const adjustedWeights = withWeight.map(w => ({
-            ...w,
-            adjustedWeight: w.weight * (1 - w.capacityRatio),
-        }));
-        const totalAdjusted = adjustedWeights.reduce((s, w) => s + Math.max(w.adjustedWeight, 0.1), 0);
-        let random = Math.random() * totalAdjusted;
-        for (const w of adjustedWeights) {
-            random -= Math.max(w.adjustedWeight, 0.1);
-            if (random <= 0)
-                return w.project;
-        }
-        return adjustedWeights[adjustedWeights.length - 1].project;
     }
     async getProjectConnection(domain, project) {
         const cb = this.getOrCreateCircuitBreaker(project.id);

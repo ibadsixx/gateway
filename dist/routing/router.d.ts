@@ -4,7 +4,6 @@ declare class Router {
     private routeRead;
     private routeWrite;
     private selectByHash;
-    private selectByLoad;
     private getProjectConnection;
     private getOrCreateCircuitBreaker;
 }

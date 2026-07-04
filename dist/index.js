@@ -10,8 +10,6 @@ const middleware_1 = require("./api/middleware");
 const monitoring_1 = require("./infrastructure/monitoring");
 const features_1 = require("./features");
 const config_1 = require("./config");
-const databaseRegistry_1 = require("./registry/databaseRegistry");
-const storageRegistry_1 = require("./registry/storageRegistry");
 const permissions_1 = require("./permissions");
 const bus_1 = require("./events/bus");
 const queue_1 = require("./jobs/queue");
@@ -34,117 +32,6 @@ initializeDefaults()
 async function initializeDefaults() {
     await infrastructureDb_1.infrastructureDb.initialize();
     await config_1.configCenter.ensureLoaded();
-    await databaseRegistry_1.databaseRegistry.register({
-        id: 'posts-1',
-        domain: 'posts',
-        provider: 'supabase',
-        status: 'ACTIVE',
-        priority: 1,
-        capacity: 1000000000,
-        usedSpace: 500000000,
-        connectionName: 'supabase_posts_1',
-        loadWeight: 50,
-    });
-    await databaseRegistry_1.databaseRegistry.register({
-        id: 'posts-2',
-        domain: 'posts',
-        provider: 'supabase',
-        status: 'ACTIVE',
-        priority: 2,
-        capacity: 1000000000,
-        usedSpace: 100000000,
-        connectionName: 'supabase_posts_2',
-        loadWeight: 30,
-    });
-    await databaseRegistry_1.databaseRegistry.register({
-        id: 'posts-3',
-        domain: 'posts',
-        provider: 'supabase',
-        status: 'ACTIVE',
-        priority: 3,
-        capacity: 1000000000,
-        usedSpace: 10000000,
-        connectionName: 'supabase_posts_3',
-        loadWeight: 20,
-    });
-    await databaseRegistry_1.databaseRegistry.register({
-        id: 'comments-1',
-        domain: 'comments',
-        provider: 'supabase',
-        status: 'ACTIVE',
-        priority: 1,
-        capacity: 500000000,
-        usedSpace: 200000000,
-        connectionName: 'supabase_comments_1',
-        loadWeight: 50,
-    });
-    await databaseRegistry_1.databaseRegistry.register({
-        id: 'comments-2',
-        domain: 'comments',
-        provider: 'supabase',
-        status: 'ACTIVE',
-        priority: 2,
-        capacity: 500000000,
-        usedSpace: 50000000,
-        connectionName: 'supabase_comments_2',
-        loadWeight: 30,
-    });
-    await databaseRegistry_1.databaseRegistry.register({
-        id: 'comments-3',
-        domain: 'comments',
-        provider: 'supabase',
-        status: 'ACTIVE',
-        priority: 3,
-        capacity: 500000000,
-        usedSpace: 10000000,
-        connectionName: 'supabase_comments_3',
-        loadWeight: 20,
-    });
-    await databaseRegistry_1.databaseRegistry.register({
-        id: 'stories-1',
-        domain: 'stories',
-        provider: 'supabase',
-        status: 'ACTIVE',
-        priority: 1,
-        capacity: 300000000,
-        usedSpace: 150000000,
-        connectionName: 'supabase_stories_1',
-    });
-    await databaseRegistry_1.databaseRegistry.register({
-        id: 'conversations-1',
-        domain: 'conversations',
-        provider: 'supabase',
-        status: 'ACTIVE',
-        priority: 1,
-        capacity: 500000000,
-        usedSpace: 0,
-        connectionName: 'sbp_f34579f61778d8ab2a7f46d0800a6654a7cea67f',
-        loadWeight: 100,
-    });
-    await storageRegistry_1.storageRegistry.register({
-        id: 'cloudinary-1',
-        provider: 'cloudinary',
-        status: 'ACTIVE',
-        capacity: 10000000000,
-        usedSpace: 9500000000,
-        priority: 1,
-    });
-    await storageRegistry_1.storageRegistry.register({
-        id: 'cloudinary-2',
-        provider: 'cloudinary',
-        status: 'ACTIVE',
-        capacity: 10000000000,
-        usedSpace: 1000000000,
-        priority: 2,
-    });
-    await storageRegistry_1.storageRegistry.register({
-        id: 's3-main',
-        provider: 's3',
-        status: 'ACTIVE',
-        capacity: 50000000000,
-        usedSpace: 5000000000,
-        priority: 3,
-    });
     features_1.featureFlags.enable('posts');
     features_1.featureFlags.enable('comments');
     features_1.featureFlags.enable('stories');
@@ -155,6 +42,7 @@ async function initializeDefaults() {
     features_1.featureFlags.enable('reports');
     features_1.featureFlags.enable('media');
     features_1.featureFlags.enable('notifications');
+    features_1.featureFlags.enable('blocking');
     await config_1.configCenter.set('maxUploadSize', 10485760, 'number');
     await config_1.configCenter.set('aiModerationEnabled', true, 'boolean');
     await config_1.configCenter.set('softDeleteRetentionDays', 30, 'number');

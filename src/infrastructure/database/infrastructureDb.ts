@@ -86,6 +86,44 @@ class InfrastructureDatabase {
     return projects.filter(p => p.status === 'active');
   }
 
+  async getWritableProject(domain: string): Promise<InfrastructureProjectRow | null> {
+    if (this.fallback) {
+      const candidates = this.fallbackProjects.filter(p =>
+        p.domain === domain && p.write_enabled && p.status === 'active'
+          && p.health_status !== 'offline'
+          && (p.capacity <= 0 || (p.used_space / p.capacity) * 100 < 90),
+      );
+      return candidates.sort((a, b) => a.priority - b.priority)[0] || null;
+    }
+    let { data, error } = await this.client!.from('infrastructure_projects')
+      .select('*')
+      .eq('domain', domain)
+      .eq('status', 'active')
+      .eq('write_enabled', true)
+      .eq('health_status', 'online')
+      .order('priority', { ascending: true })
+      .limit(10);
+    if (error?.code === 'PGRST204') {
+      ({ data, error } = await this.client!.from('infrastructure_projects')
+        .select('*')
+        .eq('domain', domain)
+        .eq('status', 'active')
+        .eq('write_enabled', true)
+        .order('priority', { ascending: true })
+        .limit(10));
+    }
+    if (error) throw new Error(`Failed to fetch writable project: ${error.message}`);
+
+    const projects = (data as InfrastructureProjectRow[]) || [];
+    if (projects.length === 0) return null;
+
+    const healthy = projects.filter(p =>
+      p.capacity <= 0 || (p.used_space / p.capacity) * 100 < 90,
+    );
+
+    return healthy[0] || projects[0];
+  }
+
   async getProjectById(id: string): Promise<InfrastructureProjectRow | null> {
     if (this.fallback) return this.fallbackProjects.find(p => p.id === id) || null;
     const { data, error } = await this.client!.from('infrastructure_projects').select('*').eq('id', id).single();
@@ -153,6 +191,46 @@ class InfrastructureDatabase {
     }
     const { error } = await this.client!.from('infrastructure_projects').update(update).eq('id', id);
     if (error) throw new Error(`Failed to update project health: ${error.message}`);
+  }
+
+  async collectUsageMetrics(): Promise<void> {
+    if (this.fallback) return;
+    const { data, error } = await this.client!.from('infrastructure_projects')
+      .select('id, project_key, domain, project_url, management_pat')
+      .not('management_pat', 'is', null)
+      .like('project_url', 'https://%.supabase.co');
+    if (error) {
+      console.error('[InfrastructureDB] Failed to fetch projects for metrics:', error.message);
+      return;
+    }
+    const projects = (data as InfrastructureProjectRow[]) || [];
+    for (const project of projects) {
+      const match = project.project_url?.match(/https:\/\/(.+)\.supabase\.co/);
+      if (!match || !project.management_pat) continue;
+      const projectRef = match[1];
+      try {
+        const res = await fetch(`https://api.supabase.com/v1/projects/${projectRef}/database/query`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${project.management_pat}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ query: 'SELECT COALESCE(SUM(pg_total_relation_size(c.oid)), 0) AS db_size FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = \'public\' AND c.relkind IN (\'r\', \'m\', \'p\')' }),
+        });
+        if (!res.ok) {
+          console.warn(`[InfrastructureDB] Failed to get size for ${project.project_key}: ${res.status}`);
+          continue;
+        }
+        const rows = await res.json() as { db_size: number }[];
+        const usedBytes = rows?.[0]?.db_size ?? 0;
+        await this.client!.from('infrastructure_projects')
+          .update({ used_space: usedBytes, last_health_check: new Date().toISOString() })
+          .eq('id', project.id);
+        console.log(`[InfrastructureDB] ${project.project_key}: ${(usedBytes / 1e6).toFixed(1)} MB used`);
+      } catch (err) {
+        console.warn(`[InfrastructureDB] Error querying ${project.project_key}:`, (err as Error).message);
+      }
+    }
   }
 
   // ---- Storage Providers ----
@@ -396,13 +474,13 @@ class InfrastructureDatabase {
     const supabaseId = this.fallbackProviders[0].id;
 
     this.fallbackProjects = [
-      { id: crypto.randomUUID(), project_key: 'posts_1', domain: 'posts', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 1000000000, used_space: 500000000, priority: 1, load_weight: 50, region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: crypto.randomUUID(), project_key: 'posts_2', domain: 'posts', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 1000000000, used_space: 100000000, priority: 2, load_weight: 30, region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: crypto.randomUUID(), project_key: 'posts_3', domain: 'posts', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 1000000000, used_space: 10000000, priority: 3, load_weight: 20, region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: crypto.randomUUID(), project_key: 'comments_1', domain: 'comments', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 500000000, used_space: 200000000, priority: 1, load_weight: 50, region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: crypto.randomUUID(), project_key: 'comments_2', domain: 'comments', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 500000000, used_space: 50000000, priority: 2, load_weight: 30, region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: crypto.randomUUID(), project_key: 'comments_3', domain: 'comments', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 500000000, used_space: 10000000, priority: 3, load_weight: 20, region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: crypto.randomUUID(), project_key: 'stories_1', domain: 'stories', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 300000000, used_space: 150000000, priority: 1, load_weight: 100, region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: crypto.randomUUID(), project_key: 'posts_1', domain: 'posts', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 500000000, used_space: 500000000, priority: 1, load_weight: 50, write_enabled: true, health_status: 'online', region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: crypto.randomUUID(), project_key: 'posts_2', domain: 'posts', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 500000000, used_space: 100000000, priority: 2, load_weight: 30, write_enabled: true, health_status: 'online', region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: crypto.randomUUID(), project_key: 'posts_3', domain: 'posts', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 500000000, used_space: 10000000, priority: 3, load_weight: 20, write_enabled: true, health_status: 'online', region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: crypto.randomUUID(), project_key: 'comments_1', domain: 'comments', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 500000000, used_space: 200000000, priority: 1, load_weight: 50, write_enabled: true, health_status: 'online', region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: crypto.randomUUID(), project_key: 'comments_2', domain: 'comments', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 500000000, used_space: 50000000, priority: 2, load_weight: 30, write_enabled: true, health_status: 'online', region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: crypto.randomUUID(), project_key: 'comments_3', domain: 'comments', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 500000000, used_space: 10000000, priority: 3, load_weight: 20, write_enabled: true, health_status: 'online', region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: crypto.randomUUID(), project_key: 'stories_1', domain: 'stories', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 500000000, used_space: 150000000, priority: 1, load_weight: 100, write_enabled: true, health_status: 'online', region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
     ];
     this.fallbackProjects.sort((a, b) => a.priority - b.priority);
 

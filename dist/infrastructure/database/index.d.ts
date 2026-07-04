@@ -8,6 +8,7 @@ declare class DatabaseLayer {
     update(domain: string, id: string, data: Record<string, unknown>): Promise<QueryResult>;
     delete(domain: string, id: string, permanent?: boolean): Promise<void>;
     query(domain: string, filter: Record<string, unknown>): Promise<QueryResult[]>;
+    private routeByHash;
 }
 export declare const database: DatabaseLayer;
 export {};

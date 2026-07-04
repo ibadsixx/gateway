@@ -1,4 +1,4 @@
-import { router } from '../../routing/router';
+import { routingService } from '../../routing/service';
 import { databaseRegistry } from '../../registry/databaseRegistry';
 import type { DatabaseProject } from '../../registry/databaseRegistry';
 import { getDatabaseProvider } from '../../providers/database';
@@ -7,15 +7,14 @@ import type { DatabaseConnectionConfig } from '../../providers/database/types';
 import { eventBus } from '../../events/bus';
 import { metricsService } from '../../metrics';
 import { RetryEngine } from '../../retry/engine';
-import { generateId } from '../../utils';
+import { createHash } from 'crypto';
 
 interface QueryResult {
   id: string;
   [key: string]: unknown;
 }
 
-function getConfig(project: DatabaseProject | undefined): DatabaseConnectionConfig | undefined {
-  if (!project) return undefined;
+function getConfig(project: DatabaseProject): DatabaseConnectionConfig | undefined {
   return connectionConfigFromProject(project);
 }
 
@@ -23,10 +22,13 @@ class DatabaseLayer {
   async read(domain: string, id: string): Promise<QueryResult | null> {
     const start = Date.now();
     try {
-      const connection = await router.route(domain, id);
-      const project = await databaseRegistry.getProjectById(connection);
+      const activeProjects = await databaseRegistry.getActiveProjects(domain);
+      if (activeProjects.length === 0) {
+        throw new Error(`No active projects for domain: ${domain}`);
+      }
+      const project = this.routeByHash(activeProjects, id);
       const config = getConfig(project);
-      const provider = getDatabaseProvider(project?.provider || 'supabase');
+      const provider = getDatabaseProvider(project.provider || 'supabase');
       const result = await RetryEngine.execute(() => provider.find(domain, id, config));
       metricsService.record('db.read.duration', Date.now() - start, { domain });
       return result;
@@ -39,10 +41,9 @@ class DatabaseLayer {
   async write(domain: string, data: Record<string, unknown>): Promise<QueryResult> {
     const start = Date.now();
     try {
-      const connection = await router.route(domain);
-      const project = await databaseRegistry.getProjectById(connection);
+      const project = await routingService.getWritableProject(domain);
       const config = getConfig(project);
-      const provider = getDatabaseProvider(project?.provider || 'supabase');
+      const provider = getDatabaseProvider(project.provider || 'supabase');
       const result = await RetryEngine.execute(() => provider.create(domain, data, config));
 
       eventBus.emit({
@@ -62,10 +63,13 @@ class DatabaseLayer {
   async update(domain: string, id: string, data: Record<string, unknown>): Promise<QueryResult> {
     const start = Date.now();
     try {
-      const connection = await router.route(domain, id);
-      const project = await databaseRegistry.getProjectById(connection);
+      const activeProjects = await databaseRegistry.getActiveProjects(domain);
+      if (activeProjects.length === 0) {
+        throw new Error(`No active projects for domain: ${domain}`);
+      }
+      const project = this.routeByHash(activeProjects, id);
       const config = getConfig(project);
-      const provider = getDatabaseProvider(project?.provider || 'supabase');
+      const provider = getDatabaseProvider(project.provider || 'supabase');
       const result = await RetryEngine.execute(() => provider.update(domain, id, data, config));
 
       eventBus.emit({
@@ -86,10 +90,13 @@ class DatabaseLayer {
     const start = Date.now();
     try {
       if (permanent) {
-        const connection = await router.route(domain, id);
-        const project = await databaseRegistry.getProjectById(connection);
+        const activeProjects = await databaseRegistry.getActiveProjects(domain);
+        if (activeProjects.length === 0) {
+          throw new Error(`No active projects for domain: ${domain}`);
+        }
+        const project = this.routeByHash(activeProjects, id);
         const config = getConfig(project);
-        const provider = getDatabaseProvider(project?.provider || 'supabase');
+        const provider = getDatabaseProvider(project.provider || 'supabase');
         await RetryEngine.execute(() => provider.delete(domain, id, config));
       } else {
         await this.update(domain, id, { deletedAt: new Date() } as Record<string, unknown>);
@@ -109,12 +116,18 @@ class DatabaseLayer {
   }
 
   async query(domain: string, filter: Record<string, unknown>): Promise<QueryResult[]> {
-    const connection = await router.route(domain);
-    const project = await databaseRegistry.getProjectById(connection);
+    const project = await routingService.getWritableProject(domain);
     const config = getConfig(project);
-    const provider = getDatabaseProvider(project?.provider || 'supabase');
+    const provider = getDatabaseProvider(project.provider || 'supabase');
     const results = await provider.query(domain, { ...filter, deletedAt: null }, config);
     return results;
+  }
+
+  private routeByHash(projects: DatabaseProject[], entityId: string): DatabaseProject {
+    if (projects.length === 1) return projects[0];
+    const hash = createHash('md5').update(entityId).digest('hex');
+    const hashNum = parseInt(hash.substring(0, 8), 16);
+    return projects[hashNum % projects.length];
   }
 }
 

@@ -13,6 +13,8 @@ export interface DatabaseProject {
     region?: string;
     responseTime?: number;
     loadWeight?: number;
+    writeEnabled?: boolean;
+    healthStatus?: 'online' | 'degraded' | 'offline';
     lastHealthCheck?: Date;
 }
 declare class DatabaseRegistry {
@@ -35,7 +37,9 @@ declare class DatabaseRegistry {
         serviceKey?: string;
         anonKey?: string;
         loadWeight?: number;
+        writeEnabled?: boolean;
     }): Promise<void>;
+    getWritableProject(domain: string): Promise<DatabaseProject | undefined>;
     getActiveProjects(domain: string): Promise<DatabaseProject[]>;
     getActiveProject(domain: string): Promise<DatabaseProject | undefined>;
     getProjectById(id: string): Promise<DatabaseProject | undefined>;

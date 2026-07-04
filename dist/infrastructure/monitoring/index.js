@@ -19,6 +19,7 @@ class MonitoringService {
     }
     async check() {
         const writeThreshold = config_1.configCenter.get('writeThreshold', 90);
+        await infrastructureDb_1.infrastructureDb.collectUsageMetrics();
         const databases = await databaseRegistry_1.databaseRegistry.getAllProjects();
         for (const db of databases) {
             const responseTime = Math.random() * 200;

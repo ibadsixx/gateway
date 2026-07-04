@@ -1,26 +1,28 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.database = void 0;
-const router_1 = require("../../routing/router");
+const service_1 = require("../../routing/service");
 const databaseRegistry_1 = require("../../registry/databaseRegistry");
 const database_1 = require("../../providers/database");
 const types_1 = require("../../providers/database/types");
 const bus_1 = require("../../events/bus");
 const metrics_1 = require("../../metrics");
 const engine_1 = require("../../retry/engine");
+const crypto_1 = require("crypto");
 function getConfig(project) {
-    if (!project)
-        return undefined;
     return (0, types_1.connectionConfigFromProject)(project);
 }
 class DatabaseLayer {
     async read(domain, id) {
         const start = Date.now();
         try {
-            const connection = await router_1.router.route(domain, id);
-            const project = await databaseRegistry_1.databaseRegistry.getProjectById(connection);
+            const activeProjects = await databaseRegistry_1.databaseRegistry.getActiveProjects(domain);
+            if (activeProjects.length === 0) {
+                throw new Error(`No active projects for domain: ${domain}`);
+            }
+            const project = this.routeByHash(activeProjects, id);
             const config = getConfig(project);
-            const provider = (0, database_1.getDatabaseProvider)(project?.provider || 'supabase');
+            const provider = (0, database_1.getDatabaseProvider)(project.provider || 'supabase');
             const result = await engine_1.RetryEngine.execute(() => provider.find(domain, id, config));
             metrics_1.metricsService.record('db.read.duration', Date.now() - start, { domain });
             return result;
@@ -33,10 +35,9 @@ class DatabaseLayer {
     async write(domain, data) {
         const start = Date.now();
         try {
-            const connection = await router_1.router.route(domain);
-            const project = await databaseRegistry_1.databaseRegistry.getProjectById(connection);
+            const project = await service_1.routingService.getWritableProject(domain);
             const config = getConfig(project);
-            const provider = (0, database_1.getDatabaseProvider)(project?.provider || 'supabase');
+            const provider = (0, database_1.getDatabaseProvider)(project.provider || 'supabase');
             const result = await engine_1.RetryEngine.execute(() => provider.create(domain, data, config));
             bus_1.eventBus.emit({
                 type: `${domain}.created`,
@@ -54,10 +55,13 @@ class DatabaseLayer {
     async update(domain, id, data) {
         const start = Date.now();
         try {
-            const connection = await router_1.router.route(domain, id);
-            const project = await databaseRegistry_1.databaseRegistry.getProjectById(connection);
+            const activeProjects = await databaseRegistry_1.databaseRegistry.getActiveProjects(domain);
+            if (activeProjects.length === 0) {
+                throw new Error(`No active projects for domain: ${domain}`);
+            }
+            const project = this.routeByHash(activeProjects, id);
             const config = getConfig(project);
-            const provider = (0, database_1.getDatabaseProvider)(project?.provider || 'supabase');
+            const provider = (0, database_1.getDatabaseProvider)(project.provider || 'supabase');
             const result = await engine_1.RetryEngine.execute(() => provider.update(domain, id, data, config));
             bus_1.eventBus.emit({
                 type: `${domain}.updated`,
@@ -76,10 +80,13 @@ class DatabaseLayer {
         const start = Date.now();
         try {
             if (permanent) {
-                const connection = await router_1.router.route(domain, id);
-                const project = await databaseRegistry_1.databaseRegistry.getProjectById(connection);
+                const activeProjects = await databaseRegistry_1.databaseRegistry.getActiveProjects(domain);
+                if (activeProjects.length === 0) {
+                    throw new Error(`No active projects for domain: ${domain}`);
+                }
+                const project = this.routeByHash(activeProjects, id);
                 const config = getConfig(project);
-                const provider = (0, database_1.getDatabaseProvider)(project?.provider || 'supabase');
+                const provider = (0, database_1.getDatabaseProvider)(project.provider || 'supabase');
                 await engine_1.RetryEngine.execute(() => provider.delete(domain, id, config));
             }
             else {
@@ -98,12 +105,18 @@ class DatabaseLayer {
         }
     }
     async query(domain, filter) {
-        const connection = await router_1.router.route(domain);
-        const project = await databaseRegistry_1.databaseRegistry.getProjectById(connection);
+        const project = await service_1.routingService.getWritableProject(domain);
         const config = getConfig(project);
-        const provider = (0, database_1.getDatabaseProvider)(project?.provider || 'supabase');
+        const provider = (0, database_1.getDatabaseProvider)(project.provider || 'supabase');
         const results = await provider.query(domain, { ...filter, deletedAt: null }, config);
         return results;
+    }
+    routeByHash(projects, entityId) {
+        if (projects.length === 1)
+            return projects[0];
+        const hash = (0, crypto_1.createHash)('md5').update(entityId).digest('hex');
+        const hashNum = parseInt(hash.substring(0, 8), 16);
+        return projects[hashNum % projects.length];
     }
 }
 exports.database = new DatabaseLayer();
