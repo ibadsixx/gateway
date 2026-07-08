@@ -18,11 +18,6 @@ export interface DatabaseProject {
     lastHealthCheck?: Date;
 }
 declare class DatabaseRegistry {
-    private cache;
-    private cacheTimestamp;
-    private readonly cacheTtl;
-    private getCached;
-    private invalidateCache;
     register(project: {
         id?: string;
         project_key?: string;
@@ -47,6 +42,11 @@ declare class DatabaseRegistry {
     updateHealth(id: string, responseTime: number, usedSpace: number): Promise<void>;
     getAllProjects(): Promise<DatabaseProject[]>;
     getProjectsByDomain(domain: string): Promise<DatabaseProject[]>;
+    private getProviders;
+    private getDomain;
+    private registerDomain;
+    private setCurrentWriteProject;
+    private getCurrentWriteProject;
     private selectByLoad;
 }
 export declare const databaseRegistry: DatabaseRegistry;

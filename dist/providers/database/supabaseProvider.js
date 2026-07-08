@@ -1,17 +1,15 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.SupabaseProvider = void 0;
-const supabase_js_1 = require("@supabase/supabase-js");
+const client_factory_1 = require("../../client-factory");
 class SupabaseProvider {
-    clients = new Map();
     getClient(config) {
         if (!config?.projectUrl || !config?.serviceKey)
             return null;
-        const key = `${config.projectUrl}:${config.serviceKey}`;
-        if (!this.clients.has(key)) {
-            this.clients.set(key, (0, supabase_js_1.createClient)(config.projectUrl, config.serviceKey));
-        }
-        return this.clients.get(key);
+        return client_factory_1.clientFactory.getClient({
+            projectUrl: config.projectUrl,
+            serviceKey: config.serviceKey,
+        });
     }
     async create(domain, data, config) {
         const client = this.getClient(config);

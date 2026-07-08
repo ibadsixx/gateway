@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.databaseRegistry = void 0;
+const project_manager_1 = require("../project-manager");
 const infrastructureDb_1 = require("../infrastructure/database/infrastructureDb");
 function toLegacyStatus(dbStatus) {
     switch (dbStatus) {
@@ -19,91 +20,68 @@ function toDbStatus(status) {
         case 'MAINTENANCE': return 'maintenance';
     }
 }
-function toLegacyProject(row) {
+function toLegacyProject(info) {
     return {
-        id: row.id,
-        domain: row.domain,
+        id: info.id,
+        domain: info.domain,
         provider: '',
-        status: toLegacyStatus(row.status),
-        priority: row.priority,
-        capacity: row.capacity,
-        usedSpace: row.used_space,
-        connectionName: row.project_url,
-        projectUrl: row.project_url || undefined,
-        serviceKey: row.service_key || undefined,
-        anonKey: row.anon_key || undefined,
-        region: row.region || undefined,
-        responseTime: row.response_time ?? undefined,
-        loadWeight: row.load_weight,
-        writeEnabled: row.write_enabled !== false,
-        healthStatus: row.health_status || undefined,
-        lastHealthCheck: row.last_health_check ? new Date(row.last_health_check) : undefined,
+        status: toLegacyStatus(info.status),
+        priority: info.priority,
+        capacity: info.capacity,
+        usedSpace: info.usedSpace,
+        connectionName: info.projectUrl,
+        projectUrl: info.projectUrl || undefined,
+        serviceKey: info.serviceKey || undefined,
+        anonKey: info.anonKey || undefined,
+        region: info.region || undefined,
+        responseTime: info.responseTime ?? undefined,
+        loadWeight: info.loadWeight,
+        writeEnabled: info.writeEnabled,
+        healthStatus: info.healthStatus || undefined,
+        lastHealthCheck: info.lastHealthCheck ? new Date(info.lastHealthCheck) : undefined,
     };
 }
 class DatabaseRegistry {
-    cache = new Map();
-    cacheTimestamp = 0;
-    cacheTtl = 5000;
-    async getCached(domain) {
-        if (Date.now() - this.cacheTimestamp > this.cacheTtl) {
-            this.cache.clear();
-        }
-        const key = `domain:${domain}`;
-        if (!this.cache.has(key)) {
-            const rows = await infrastructureDb_1.infrastructureDb.getProjects(domain);
-            this.cache.set(key, rows.map(toLegacyProject));
-            this.cacheTimestamp = Date.now();
-        }
-        return this.cache.get(key) || [];
-    }
-    invalidateCache() {
-        this.cache.clear();
-    }
     async register(project) {
-        const dbProviders = await infrastructureDb_1.infrastructureDb.getProviders();
+        const dbProviders = await this.getProviders();
         const providerRow = dbProviders.find(p => p.name.toLowerCase() === project.provider.toLowerCase())
             || dbProviders.find(p => p.type === 'database');
-        await infrastructureDb_1.infrastructureDb.registerProject({
-            project_key: (project.id || project.project_key || `${project.domain}_${Date.now()}`),
+        await project_manager_1.projectManager.register({
+            projectKey: project.id || project.project_key || `${project.domain}_${Date.now()}`,
             domain: project.domain,
-            provider_id: providerRow?.id || crypto.randomUUID(),
-            project_url: project.projectUrl || project.connectionName || '',
-            service_key: project.serviceKey || '',
-            anon_key: project.anonKey || '',
+            providerId: providerRow?.id || crypto.randomUUID(),
+            projectUrl: project.projectUrl || project.connectionName || '',
+            serviceKey: project.serviceKey || '',
+            anonKey: project.anonKey || '',
             status: toDbStatus(project.status),
             capacity: project.capacity,
-            used_space: project.usedSpace,
+            usedSpace: project.usedSpace,
             priority: project.priority,
-            load_weight: project.loadWeight ?? 100,
-            region: null,
-            response_time: null,
-            last_health_check: null,
+            loadWeight: project.loadWeight ?? 100,
         });
-        const domain = await infrastructureDb_1.infrastructureDb.getDomain(project.domain);
-        const dbProjects = await infrastructureDb_1.infrastructureDb.getProjects(project.domain);
-        const activeProjects = dbProjects.filter(p => p.status === 'active');
+        const domainRow = await this.getDomain(project.domain);
+        const allProjects = await project_manager_1.projectManager.getProjects(project.domain);
+        const activeProjects = allProjects.filter(p => p.status === 'active');
         const firstActive = activeProjects.length > 0
             ? activeProjects.reduce((a, b) => a.priority <= b.priority ? a : b)
             : null;
-        if (!domain) {
-            await infrastructureDb_1.infrastructureDb.registerDomain({
+        if (!domainRow) {
+            await this.registerDomain({
                 name: project.domain,
                 current_write_project: firstActive?.id || null,
-                next_project: null,
             });
         }
-        else if (!domain.current_write_project && firstActive) {
-            await infrastructureDb_1.infrastructureDb.setCurrentWriteProject(project.domain, firstActive.id);
+        else if (!domainRow.current_write_project && firstActive) {
+            await this.setCurrentWriteProject(project.domain, firstActive.id);
         }
-        this.invalidateCache();
     }
     async getWritableProject(domain) {
-        const row = await infrastructureDb_1.infrastructureDb.getWritableProject(domain);
-        return row ? toLegacyProject(row) : undefined;
+        const entry = project_manager_1.projectManager.getWritableProject(domain);
+        return entry ? toLegacyProject(entry.project) : undefined;
     }
     async getActiveProjects(domain) {
-        const rows = await infrastructureDb_1.infrastructureDb.getActiveProjects(domain);
-        return rows.map(toLegacyProject);
+        const projects = project_manager_1.projectManager.getReadableProjects(domain);
+        return projects.map(e => toLegacyProject(e.project));
     }
     async getActiveProject(domain) {
         const active = await this.getActiveProjects(domain);
@@ -111,7 +89,7 @@ class DatabaseRegistry {
             return undefined;
         if (active.length === 1)
             return active[0];
-        const writeTarget = await infrastructureDb_1.infrastructureDb.getCurrentWriteProject(domain);
+        const writeTarget = await this.getCurrentWriteProject(domain);
         if (writeTarget) {
             const match = active.find(p => p.id === writeTarget.id);
             if (match)
@@ -120,22 +98,41 @@ class DatabaseRegistry {
         return this.selectByLoad(active);
     }
     async getProjectById(id) {
-        const row = await infrastructureDb_1.infrastructureDb.getProjectById(id);
-        return row ? toLegacyProject(row) : undefined;
+        const info = await project_manager_1.projectManager.getProject(id);
+        return info ? toLegacyProject(info) : undefined;
     }
     async updateStatus(id, status) {
-        await infrastructureDb_1.infrastructureDb.updateProjectStatus(id, toDbStatus(status));
-        this.invalidateCache();
+        await project_manager_1.projectManager.updateStatus(id, toDbStatus(status));
     }
     async updateHealth(id, responseTime, usedSpace) {
-        await infrastructureDb_1.infrastructureDb.updateProjectHealth(id, responseTime, usedSpace);
+        await project_manager_1.projectManager.updateHealth(id, responseTime, usedSpace);
     }
     async getAllProjects() {
-        const rows = await infrastructureDb_1.infrastructureDb.getProjects();
-        return rows.map(toLegacyProject);
+        const projects = await project_manager_1.projectManager.getProjects();
+        return projects.map(toLegacyProject);
     }
     async getProjectsByDomain(domain) {
-        return this.getCached(domain);
+        const projects = await project_manager_1.projectManager.getProjects(domain);
+        return projects.map(toLegacyProject);
+    }
+    async getProviders() {
+        return infrastructureDb_1.infrastructureDb.getProviders();
+    }
+    async getDomain(name) {
+        return infrastructureDb_1.infrastructureDb.getDomain(name);
+    }
+    async registerDomain(data) {
+        return infrastructureDb_1.infrastructureDb.registerDomain({
+            name: data.name,
+            current_write_project: data.current_write_project,
+            next_project: null,
+        });
+    }
+    async setCurrentWriteProject(domain, projectId) {
+        return infrastructureDb_1.infrastructureDb.setCurrentWriteProject(domain, projectId);
+    }
+    async getCurrentWriteProject(domain) {
+        return infrastructureDb_1.infrastructureDb.getCurrentWriteProject(domain);
     }
     selectByLoad(projects) {
         const now = Date.now();

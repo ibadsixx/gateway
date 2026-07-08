@@ -10,13 +10,8 @@ function validateRequest(req, res, next) {
     }
     next();
 }
-const allowedDomains = new Set([
-    'users', 'posts', 'comments', 'stories',
-    'conversations', 'groups', 'pages', 'reports',
-    'media', 'notifications',
-]);
 function validateDomain(domain) {
-    return allowedDomains.has(domain);
+    return typeof domain === 'string' && domain.length > 0 && /^[a-z][a-z0-9_-]*$/.test(domain);
 }
 function validateDomainMiddleware(req, res, next) {
     const { domain } = req.params;

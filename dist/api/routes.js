@@ -15,6 +15,7 @@ const registry_1 = require("../discovery/registry");
 const queue_1 = require("../jobs/queue");
 const notifications_1 = require("../notifications");
 const search_1 = require("../search");
+const project_manager_1 = require("../project-manager");
 const v1 = (0, express_1.Router)();
 v1.post('/:domain', validation_1.validation.validateDomainMiddleware, async (req, res) => {
     const { domain } = req.params;
@@ -165,6 +166,15 @@ system.get('/queue', (_req, res) => {
 });
 system.get('/rate-limits', (_req, res) => {
     res.json({ message: 'Check X-RateLimit headers on responses' });
+});
+system.post('/reload-registry', async (_req, res) => {
+    try {
+        await project_manager_1.projectManager.refreshRegistry();
+        res.json({ status: 'ok', message: 'Registry cache reloaded' });
+    }
+    catch (error) {
+        res.status(500).json({ error: 'Failed to reload registry' });
+    }
 });
 const router = (0, express_1.Router)();
 exports.router = router;

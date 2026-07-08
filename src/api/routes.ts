@@ -14,6 +14,7 @@ import { eventBus } from '../events/bus';
 import { jobQueue } from '../jobs/queue';
 import { notificationQueue } from '../notifications';
 import { searchService } from '../search';
+import { projectManager } from '../project-manager';
 
 const v1 = Router();
 
@@ -176,6 +177,15 @@ system.get('/queue', (_req, res) => {
 
 system.get('/rate-limits', (_req, res) => {
   res.json({ message: 'Check X-RateLimit headers on responses' });
+});
+
+system.post('/reload-registry', async (_req, res) => {
+  try {
+    await projectManager.refreshRegistry();
+    res.json({ status: 'ok', message: 'Registry cache reloaded' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to reload registry' });
+  }
 });
 
 const router = Router();

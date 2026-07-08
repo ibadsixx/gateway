@@ -1,6 +1,5 @@
 import { DatabaseProvider, QueryResult, DatabaseConnectionConfig } from './types';
 export declare class SupabaseProvider implements DatabaseProvider {
-    private clients;
     private getClient;
     create(domain: string, data: Record<string, unknown>, config?: DatabaseConnectionConfig): Promise<QueryResult>;
     update(domain: string, id: string, data: Record<string, unknown>, config?: DatabaseConnectionConfig): Promise<QueryResult>;

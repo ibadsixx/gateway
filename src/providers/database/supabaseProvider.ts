@@ -1,16 +1,14 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { SupabaseClient } from '@supabase/supabase-js';
+import { clientFactory } from '../../client-factory';
 import { DatabaseProvider, QueryResult, DatabaseConnectionConfig } from './types';
 
 export class SupabaseProvider implements DatabaseProvider {
-  private clients = new Map<string, SupabaseClient>();
-
   private getClient(config?: DatabaseConnectionConfig): SupabaseClient | null {
     if (!config?.projectUrl || !config?.serviceKey) return null;
-    const key = `${config.projectUrl}:${config.serviceKey}`;
-    if (!this.clients.has(key)) {
-      this.clients.set(key, createClient(config.projectUrl, config.serviceKey));
-    }
-    return this.clients.get(key)!;
+    return clientFactory.getClient({
+      projectUrl: config.projectUrl,
+      serviceKey: config.serviceKey,
+    });
   }
 
   async create(domain: string, data: Record<string, unknown>, config?: DatabaseConnectionConfig): Promise<QueryResult> {

@@ -6,10 +6,9 @@ import { monitoring } from './infrastructure/monitoring';
 import { featureFlags } from './features';
 import { configCenter } from './config';
 import { permissionEngine } from './permissions';
-import { eventBus } from './events/bus';
-import { jobQueue } from './jobs/queue';
-import { searchService } from './search';
 import { infrastructureDb } from './infrastructure/database/infrastructureDb';
+import { jobQueue } from './jobs/queue';
+import { projectManager } from './project-manager';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -30,19 +29,14 @@ initializeDefaults()
 
 async function initializeDefaults(): Promise<void> {
   await infrastructureDb.initialize();
+  await projectManager.load();
   await configCenter.ensureLoaded();
 
-  featureFlags.enable('posts');
-  featureFlags.enable('comments');
-  featureFlags.enable('stories');
-  featureFlags.enable('users');
-  featureFlags.enable('conversations');
-  featureFlags.enable('groups');
-  featureFlags.enable('pages');
-  featureFlags.enable('reports');
-  featureFlags.enable('media');
-  featureFlags.enable('notifications');
-  featureFlags.enable('blocking');
+  const projects = projectManager.getProjects();
+  const domains = [...new Set(projects.map(p => p.domain))];
+  for (const domain of domains) {
+    featureFlags.enable(domain);
+  }
 
   await configCenter.set('maxUploadSize', 10485760, 'number');
   await configCenter.set('aiModerationEnabled', true, 'boolean');
@@ -61,16 +55,13 @@ async function initializeDefaults(): Promise<void> {
     console.log(`Sending notification: ${job.id}`, job.payload);
   });
 
-  eventBus.on('post.created', async (event) => {
-    jobQueue.enqueue('notification.send', {
-      userId: event.payload.id as string,
-      title: 'Post Created',
-      body: 'Your post has been published',
-    });
-    await searchService.index('posts', event.payload.id as string, event.payload.data as Record<string, unknown>);
-  });
-
   monitoring.start();
+
+  setInterval(() => {
+    projectManager.refreshRegistry().catch(err =>
+      console.error('[Cache] Periodic registry refresh failed:', err),
+    );
+  }, 60000);
 
   console.log('Tone API Gateway initialized with all services');
 }
