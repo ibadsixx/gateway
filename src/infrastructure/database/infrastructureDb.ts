@@ -16,6 +16,7 @@ import type {
 interface InfrastructureDbConfig {
   supabaseUrl?: string;
   supabaseKey?: string;
+  forceFallback?: boolean;
 }
 
 class InfrastructureDatabase {
@@ -31,6 +32,14 @@ class InfrastructureDatabase {
   private initialized = false;
 
   async initialize(config?: InfrastructureDbConfig): Promise<void> {
+    if (config?.forceFallback) {
+      console.warn('[InfrastructureDB] Forced fallback mode.');
+      this.fallback = true;
+      this.initFallback();
+      this.initialized = true;
+      return;
+    }
+
     const url = config?.supabaseUrl || process.env.INFRA_SUPABASE_URL;
     const key = config?.supabaseKey || process.env.INFRA_SUPABASE_KEY;
 
