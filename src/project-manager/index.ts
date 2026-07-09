@@ -63,6 +63,10 @@ class ProjectManager {
     const grouped = new Map<string, CachedProject[]>();
     for (const row of rows) {
       const project = toProjectInfo(row);
+      if (!project.projectUrl || !project.serviceKey) {
+        console.warn(`[ProjectManager] Skipping project ${project.projectKey}: missing projectUrl or serviceKey`);
+        continue;
+      }
       const cached: CachedProject = {
         project,
         client: clientFactory.getClientFromProject(project),
@@ -166,6 +170,9 @@ class ProjectManager {
       last_health_check: null,
     });
     const info = toProjectInfo(row);
+    if (!info.projectUrl || !info.serviceKey) {
+      return info;
+    }
     const cached: CachedProject = {
       project: info,
       client: clientFactory.getClientFromProject(info),
