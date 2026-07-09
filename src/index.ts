@@ -7,4 +7,4 @@ const app = express();
 middleware(app);
 app.use('/api', router);
 
-export default app;
+export { app };

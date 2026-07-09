@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import app from './index';
+import { app } from './index';
 import { monitoring } from './infrastructure/monitoring';
 import { projectManager } from './project-manager';
 import { infrastructureDb } from './infrastructure/database/infrastructureDb';
