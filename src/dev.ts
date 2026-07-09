@@ -1,14 +1,20 @@
 import 'dotenv/config';
-import { app } from './index';
+import express from 'express';
+import { router } from './api/routes';
+import { middleware } from './api/middleware';
 import { monitoring } from './infrastructure/monitoring';
-import { projectManager } from './project-manager';
-import { infrastructureDb } from './infrastructure/database/infrastructureDb';
-import { configCenter } from './config';
 import { featureFlags } from './features';
+import { configCenter } from './config';
 import { permissionEngine } from './permissions';
+import { infrastructureDb } from './infrastructure/database/infrastructureDb';
 import { jobQueue } from './jobs/queue';
+import { projectManager } from './project-manager';
 
+const app = express();
 const PORT = process.env.PORT || 3000;
+
+middleware(app);
+app.use('/api', router);
 
 async function initializeDefaults(): Promise<void> {
   try {
