@@ -5,8 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "ts-node src/index.ts"
+    "start": "node dist/dev.js",
+    "dev": "ts-node src/dev.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.0",
