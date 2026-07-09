@@ -16,17 +16,6 @@ const PORT = process.env.PORT || 3000;
 middleware(app);
 app.use('/api', router);
 
-initializeDefaults()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Tone API Gateway running on port ${PORT}`);
-    });
-  })
-  .catch((error) => {
-    console.error('Failed to initialize Gateway:', error);
-    process.exit(1);
-  });
-
 async function initializeDefaults(): Promise<void> {
   await infrastructureDb.initialize();
   await projectManager.load();
@@ -64,6 +53,19 @@ async function initializeDefaults(): Promise<void> {
   }, 60000);
 
   console.log('Tone API Gateway initialized with all services');
+}
+
+if (process.env.VERCEL !== '1') {
+  initializeDefaults()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Tone API Gateway running on port ${PORT}`);
+      });
+    })
+    .catch((error) => {
+      console.error('Failed to initialize Gateway:', error);
+      process.exit(1);
+    });
 }
 
 export default app;

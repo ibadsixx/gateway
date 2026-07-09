@@ -43,4 +43,10 @@ export function middleware(app: Express): void {
 
     next();
   });
+
+  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+    console.error('[Error]', err.message);
+    metricsService.increment('error.unhandled', { message: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  });
 }

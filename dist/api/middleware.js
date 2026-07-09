@@ -43,5 +43,10 @@ function middleware(app) {
         };
         next();
     });
+    app.use((err, _req, res, _next) => {
+        console.error('[Error]', err.message);
+        metrics_1.metricsService.increment('error.unhandled', { message: err.message });
+        res.status(500).json({ error: 'Internal server error' });
+    });
 }
 //# sourceMappingURL=middleware.js.map

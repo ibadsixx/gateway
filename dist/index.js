@@ -18,16 +18,6 @@ const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3000;
 (0, middleware_1.middleware)(app);
 app.use('/api', routes_1.router);
-initializeDefaults()
-    .then(() => {
-    app.listen(PORT, () => {
-        console.log(`Tone API Gateway running on port ${PORT}`);
-    });
-})
-    .catch((error) => {
-    console.error('Failed to initialize Gateway:', error);
-    process.exit(1);
-});
 async function initializeDefaults() {
     await infrastructureDb_1.infrastructureDb.initialize();
     await project_manager_1.projectManager.load();
@@ -55,6 +45,18 @@ async function initializeDefaults() {
         project_manager_1.projectManager.refreshRegistry().catch(err => console.error('[Cache] Periodic registry refresh failed:', err));
     }, 60000);
     console.log('Tone API Gateway initialized with all services');
+}
+if (process.env.VERCEL !== '1') {
+    initializeDefaults()
+        .then(() => {
+        app.listen(PORT, () => {
+            console.log(`Tone API Gateway running on port ${PORT}`);
+        });
+    })
+        .catch((error) => {
+        console.error('Failed to initialize Gateway:', error);
+        process.exit(1);
+    });
 }
 exports.default = app;
 //# sourceMappingURL=index.js.map

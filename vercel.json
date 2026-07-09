@@ -1,0 +1,11 @@
+{
+  "functions": {
+    "api/index.ts": {
+      "memory": 512,
+      "maxDuration": 30
+    }
+  },
+  "routes": [
+    { "source": "/(.*)", "destination": "/api/index.ts" }
+  ]
+}
