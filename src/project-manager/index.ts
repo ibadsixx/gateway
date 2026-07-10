@@ -87,7 +87,7 @@ class ProjectManager {
     if (!entries) return null;
     const candidates = entries.filter(e =>
       e.project.writeEnabled
-        && e.project.status === 'active'
+        && e.project.status.toLowerCase() === 'active'
         && e.project.healthStatus !== 'offline'
         && (e.project.capacity <= 0 || (e.project.usedSpace / e.project.capacity) * 100 < 90),
     );
@@ -98,7 +98,7 @@ class ProjectManager {
   getReadableProjects(domain: string): CachedProject[] {
     const entries = this.cache.get(domain);
     if (!entries) return [];
-    return entries.filter(e => e.project.status === 'active');
+    return entries.filter(e => e.project.status.toLowerCase() === 'active');
   }
 
   getReadClient(domain: string, entityId: string): CachedProject {
