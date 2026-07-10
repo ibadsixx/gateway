@@ -10,6 +10,9 @@ import { jobQueue } from '../src/jobs/queue';
 
 const app = express();
 middleware(app);
+app.get('/', (_req, res) => {
+  res.status(200).end();
+});
 app.use('/api', router);
 
 let initialized = false;

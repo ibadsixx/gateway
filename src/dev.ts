@@ -14,6 +14,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 middleware(app);
+app.get('/', (_req, res) => {
+  res.status(200).end();
+});
 app.use('/api', router);
 
 async function initializeDefaults(): Promise<void> {
