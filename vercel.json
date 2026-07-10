@@ -1,10 +1,4 @@
 {
-  "functions": {
-    "api/[...slug].ts": {
-      "memory": 512,
-      "maxDuration": 30
-    }
-  },
   "rewrites": [
     { "source": "/((?!api/).*)", "destination": "/api/[...slug]" }
   ]
