@@ -27,8 +27,9 @@ v1.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
   try {
     const result = await database.write(domain, req.body);
     res.status(201).json(result);
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+  } catch (error: any) {
+    console.error(`[POST /${domain}]`, error?.message || error);
+    res.status(500).json({ error: error?.message || 'Internal server error' });
   }
 });
 
@@ -45,8 +46,8 @@ v1.get('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => 
       return;
     }
     res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || 'Internal server error' });
   }
 });
 
