@@ -1,10 +1,10 @@
 import express from 'express';
-import { router } from './api/routes';
-import { middleware } from './api/middleware';
-import { infrastructureDb } from './infrastructure/database/infrastructureDb';
-import { projectManager } from './project-manager';
-import { configCenter } from './config';
-import { featureFlags } from './features';
+import { router } from '../src/api/routes';
+import { middleware } from '../src/api/middleware';
+import { infrastructureDb } from '../src/infrastructure/database/infrastructureDb';
+import { projectManager } from '../src/project-manager';
+import { configCenter } from '../src/config';
+import { featureFlags } from '../src/features';
 
 const app = express();
 middleware(app);
