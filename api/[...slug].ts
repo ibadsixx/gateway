@@ -1,10 +1,10 @@
 import express from 'express';
-import { router } from '../../src/api/routes';
-import { middleware } from '../../src/api/middleware';
-import { infrastructureDb } from '../../src/infrastructure/database/infrastructureDb';
-import { projectManager } from '../../src/project-manager';
-import { configCenter } from '../../src/config';
-import { featureFlags } from '../../src/features';
+import { router } from '../src/api/routes';
+import { middleware } from '../src/api/middleware';
+import { infrastructureDb } from '../src/infrastructure/database/infrastructureDb';
+import { projectManager } from '../src/project-manager';
+import { configCenter } from '../src/config';
+import { featureFlags } from '../src/features';
 
 const app = express();
 middleware(app);
@@ -25,7 +25,7 @@ async function ensureInit() {
       try { await projectManager.load(); } catch {}
       try { await configCenter.ensureLoaded(); } catch {}
 
-      for (const domain of [...new Set(projectManager.getProjects().map(p => p.domain))]) {
+      for (const domain of [...new Set(projectManager.getProjects().map((p: any) => p.domain))]) {
         featureFlags.enable(domain);
       }
 
