@@ -195,4 +195,36 @@ router.get('/health', (_req, res) => {
   res.redirect('/api/system/health');
 });
 
+router.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
+  const { domain } = req.params;
+  if (!featureFlags.isEnabled(domain)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  try {
+    const result = await database.write(domain, req.body);
+    res.status(201).json(result);
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.get('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => {
+  const { domain, id } = req.params;
+  if (!featureFlags.isEnabled(domain)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  try {
+    const result = await database.read(domain, id);
+    if (!result) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 export { router };
