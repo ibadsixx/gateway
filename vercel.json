@@ -1,11 +1,11 @@
 {
   "functions": {
-    "api/index.ts": {
+    "src/index.ts": {
       "memory": 512,
       "maxDuration": 30
     }
   },
   "rewrites": [
-    { "source": "/((?!api/).*)", "destination": "/api/index.ts" }
+    { "source": "/((?!api/).*)", "destination": "/src/index.ts" }
   ]
 }
