@@ -1,12 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { createClient } from '@supabase/supabase-js';
 import { auth, AuthUser } from '../auth';
-
-const SUPABASE_URL = process.env.SUPABASE_URL || process.env.INFRA_SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.INFRA_SUPABASE_KEY;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
-
-const supabaseAdmin = createClient(SUPABASE_URL!, SUPABASE_SERVICE_KEY!);
 
 const authRouter = Router();
 
@@ -20,7 +13,13 @@ authRouter.post('/sign-up', async (req: Request, res: Response) => {
       return;
     }
 
-    const { data, error } = await supabaseAdmin.auth.admin.createUser({
+    const supabase = await auth.getSupabaseClient();
+    if (!supabase) {
+      res.status(500).json({ error: 'Auth service not configured' });
+      return;
+    }
+
+    const { data, error } = await supabase.auth.admin.createUser({
       email,
       password,
       email_confirm: true,
@@ -32,31 +31,10 @@ authRouter.post('/sign-up', async (req: Request, res: Response) => {
       return;
     }
 
-    // Generate tokens for the new user
-    const { data: tokens, error: tokenError } = await supabaseAdmin.auth.admin.generateLink({
-      type: 'magiclink',
-      email,
-    });
-
-    if (tokenError) {
-      res.status(201).json({ 
-        data: { user: data.user, session: null },
-        error: null 
-      });
-      return;
-    }
-
     res.status(201).json({
       data: {
         user: data.user,
-        session: {
-          access_token: tokens.properties?.action_link?.split('token=')[1] || '',
-          refresh_token: '',
-          expires_in: 3600,
-          expires_at: Math.floor(Date.now() / 1000) + 3600,
-          token_type: 'bearer',
-          user: data.user,
-        },
+        session: null,
       },
       error: null,
     });
@@ -76,7 +54,13 @@ authRouter.post('/sign-in', async (req: Request, res: Response) => {
       return;
     }
 
-    const { data, error } = await supabaseAdmin.auth.signInWithPassword({
+    const supabase = await auth.getSupabaseClient();
+    if (!supabase) {
+      res.status(500).json({ error: 'Auth service not configured' });
+      return;
+    }
+
+    const { data, error } = await supabase.auth.signInWithPassword({
       email,
       password,
     });
@@ -104,8 +88,10 @@ authRouter.post('/sign-out', auth.authenticate.bind(auth), async (req: Request, 
   try {
     const token = auth.extractTokenFromHeader(req.headers.authorization);
     if (token) {
-      // Revoke the refresh token
-      await supabaseAdmin.auth.admin.signOut(token);
+      const supabase = await auth.getSupabaseClient();
+      if (supabase) {
+        await supabase.auth.admin.signOut(token);
+      }
     }
     res.json({ error: null });
   } catch (error) {
@@ -123,8 +109,14 @@ authRouter.get('/session', auth.authenticate.bind(auth), async (req: Request, re
       return;
     }
 
+    const supabase = await auth.getSupabaseClient();
+    if (!supabase) {
+      res.status(500).json({ error: 'Auth service not configured' });
+      return;
+    }
+
     // Get fresh user data from Supabase
-    const { data, error } = await supabaseAdmin.auth.admin.getUserById(user.id);
+    const { data, error } = await supabase.auth.admin.getUserById(user.id);
 
     if (error) {
       res.status(404).json({ error: 'User not found' });
@@ -156,25 +148,21 @@ authRouter.post('/refresh', auth.authenticate.bind(auth), async (req: Request, r
       return;
     }
 
-    // Generate a new session for the user
-    const { data, error } = await supabaseAdmin.auth.admin.generateLink({
-      type: 'magiclink',
-      email: user.email || '',
-    });
-
-    if (error) {
-      res.status(500).json({ error: 'Failed to refresh session' });
+    const supabase = await auth.getSupabaseClient();
+    if (!supabase) {
+      res.status(500).json({ error: 'Auth service not configured' });
       return;
     }
 
     // Get fresh user data
-    const { data: userData } = await supabaseAdmin.auth.admin.getUserById(user.id);
+    const { data: userData } = await supabase.auth.admin.getUserById(user.id);
 
+    // For now, return the current token (refresh token exchange would require the refresh token)
     res.json({
       data: {
         session: {
           user: userData?.user || { id: user.id, email: user.email },
-          access_token: data.properties?.action_link?.split('token=')[1] || auth.extractTokenFromHeader(req.headers.authorization),
+          access_token: auth.extractTokenFromHeader(req.headers.authorization),
           refresh_token: '',
           expires_in: 3600,
           expires_at: Math.floor(Date.now() / 1000) + 3600,
@@ -198,7 +186,13 @@ authRouter.put('/user', auth.authenticate.bind(auth), async (req: Request, res: 
       return;
     }
 
-    const { data, error } = await supabaseAdmin.auth.admin.updateUserById(
+    const supabase = await auth.getSupabaseClient();
+    if (!supabase) {
+      res.status(500).json({ error: 'Auth service not configured' });
+      return;
+    }
+
+    const { data, error } = await supabase.auth.admin.updateUserById(
       user.id,
       { user_metadata: req.body }
     );
