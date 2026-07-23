@@ -15,8 +15,19 @@ import { jobQueue } from '../jobs/queue';
 import { notificationQueue } from '../notifications';
 import { searchService } from '../search';
 import { projectManager } from '../project-manager';
+import { auth } from '../auth';
+import { authRouter } from './auth';
 
 const v1 = Router();
+
+// Apply auth middleware to all v1 routes except system endpoints
+v1.use((req, res, next) => {
+  // Skip auth for system endpoints
+  if (req.path.startsWith('/system') || req.path === '/health') {
+    return next();
+  }
+  return auth.authenticate(req, res, next);
+});
 
 v1.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
   const { domain } = req.params;
@@ -189,13 +200,15 @@ system.post('/reload-registry', async (_req, res) => {
 });
 
 const router = Router();
+router.use('/auth', authRouter);
 router.use('/v1', v1);
 router.use('/system', system);
 router.get('/health', (_req, res) => {
   res.redirect('/api/system/health');
 });
 
-router.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
+// Apply auth middleware to non-v1 domain routes
+router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain } = req.params;
   if (!featureFlags.isEnabled(domain)) {
     res.status(404).json({ error: 'Not found' });
@@ -209,7 +222,7 @@ router.post('/:domain', validation.validateDomainMiddleware, async (req, res) =>
   }
 });
 
-router.get('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => {
+router.get('/:domain/:id', auth.authenticate.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain, id } = req.params;
   if (!featureFlags.isEnabled(domain)) {
     res.status(404).json({ error: 'Not found' });

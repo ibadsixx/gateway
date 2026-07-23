@@ -2,18 +2,19 @@
   "name": "tone-api-gateway",
   "version": "1.0.0",
   "description": "Tone API Gateway - Single entry point for the Tone ecosystem",
-    "main": "dist/src/dev.js",
-    "scripts": {
-      "build": "tsc",
-      "start": "node dist/src/dev.js",
-      "dev": "ts-node src/dev.ts"
-    },
+  "main": "dist/src/dev.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/src/dev.js",
+    "dev": "ts-node src/dev.ts"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.0",
     "@types/pg": "^8.20.0",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^4.18.2",
+    "jose": "^6.2.4",
     "pg": "^8.22.0",
     "zod": "^3.22.4"
   },
