@@ -1,5 +1,4 @@
 import { Request, Response, NextFunction } from 'express';
-import { jwtVerify, JWTPayload } from 'jose';
 import { createClient } from '@supabase/supabase-js';
 
 const INFRA_SUPABASE_URL = process.env.INFRA_SUPABASE_URL;
@@ -106,6 +105,8 @@ class AuthService {
         return null;
       }
 
+      // dynamic import to avoid ERR_REQUIRE_ESM (jose is ESM-only)
+      const { jwtVerify } = await new Function('s', 'return import(s)')('jose') as typeof import('jose');
       const jwtSecret = new TextEncoder().encode(credentials.jwt_secret);
       const { payload } = await jwtVerify(token, jwtSecret);
       
