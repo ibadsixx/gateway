@@ -222,6 +222,35 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
   }
 });
 
+router.get('/:domain', auth.authenticate.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
+  const { domain } = req.params;
+  if (!featureFlags.isEnabled(domain)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  try {
+    const readableProjects = projectManager.getReadableProjects(domain);
+    if (readableProjects.length === 0) {
+      res.json([]);
+      return;
+    }
+    const results = await Promise.all(
+      readableProjects.map(async (entry) => {
+        try {
+          const { data, error } = await entry.client.from(domain).select('*');
+          if (error) return [];
+          return (data as any[]) || [];
+        } catch {
+          return [];
+        }
+      })
+    );
+    res.json(results.flat());
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 router.get('/:domain/:id', auth.authenticate.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain, id } = req.params;
   if (!featureFlags.isEnabled(domain)) {
