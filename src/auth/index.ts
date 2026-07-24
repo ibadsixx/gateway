@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { createClient } from '@supabase/supabase-js';
+import { createHmac } from 'crypto';
 
 const INFRA_SUPABASE_URL = process.env.INFRA_SUPABASE_URL;
 const INFRA_SUPABASE_KEY = process.env.INFRA_SUPABASE_KEY;
@@ -105,11 +106,38 @@ class AuthService {
         return null;
       }
 
-      // dynamic import to avoid ERR_REQUIRE_ESM (jose is ESM-only)
-      const { jwtVerify } = await new Function('s', 'return import(s)')('jose') as typeof import('jose');
-      const jwtSecret = new TextEncoder().encode(credentials.jwt_secret);
-      const { payload } = await jwtVerify(token, jwtSecret);
-      
+      const parts = token.split('.');
+      if (parts.length !== 3) {
+        console.error('[Auth] Malformed JWT: expected 3 parts, got', parts.length);
+        return null;
+      }
+
+      const [headerB64, payloadB64, signatureB64] = parts;
+
+      const header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf8'));
+      const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+
+      if (header.alg !== 'HS256') {
+        console.error('[Auth] Unsupported JWT algorithm:', header.alg);
+        return null;
+      }
+
+      const secret = credentials.jwt_secret;
+      const key = typeof secret === 'string' ? Buffer.from(secret, 'utf8') : Buffer.from(secret);
+      const expectedSig = createHmac('sha256', key)
+        .update(`${headerB64}.${payloadB64}`)
+        .digest('base64url');
+
+      if (expectedSig !== signatureB64) {
+        console.error('[Auth] JWT signature mismatch');
+        return null;
+      }
+
+      if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
+        console.error('[Auth] JWT expired');
+        return null;
+      }
+
       return {
         id: payload.sub || '',
         email: payload.email as string | undefined,
