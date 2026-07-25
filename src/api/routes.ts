@@ -18,6 +18,38 @@ import { projectManager } from '../project-manager';
 import { auth } from '../auth';
 import { authRouter } from './auth';
 
+function applySupabaseFilters(query: any, filters: string | string[] | undefined): any {
+  if (!filters) return query;
+  const filterList = Array.isArray(filters) ? filters : [filters];
+  for (const f of filterList) {
+    const eqIdx = f.indexOf('=');
+    if (eqIdx === -1) continue;
+    const column = f.slice(0, eqIdx);
+    const rest = f.slice(eqIdx + 1);
+    const dotIdx = rest.indexOf('.');
+    if (dotIdx === -1) continue;
+    const op = rest.slice(0, dotIdx);
+    const value = rest.slice(dotIdx + 1);
+    switch (op) {
+      case 'eq': query = query.eq(column, value); break;
+      case 'neq': query = query.neq(column, value); break;
+      case 'gt': query = query.gt(column, value); break;
+      case 'gte': query = query.gte(column, value); break;
+      case 'lt': query = query.lt(column, value); break;
+      case 'lte': query = query.lte(column, value); break;
+      case 'like': query = query.like(column, value); break;
+      case 'ilike': query = query.ilike(column, value); break;
+      case 'in': {
+        const items = value.replace(/^\(|\)$/g, '').split(',');
+        query = query.in(column, items);
+        break;
+      }
+      default: break;
+    }
+  }
+  return query;
+}
+
 const v1 = Router();
 
 // Apply auth middleware to all v1 routes except system endpoints
@@ -84,6 +116,38 @@ v1.delete('/:domain/:id', validation.validateDomainMiddleware, async (req, res) 
   const permanent = req.query.permanent === 'true';
   try {
     await database.delete(domain, id, permanent);
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+v1.delete('/:domain', validation.validateDomainMiddleware, async (req, res) => {
+  const { domain } = req.params;
+  if (!featureFlags.isEnabled(domain)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const filters = req.query.filter as string[] | string | undefined;
+  const permanent = req.query.permanent === 'true';
+  if (!filters) {
+    res.status(400).json({ error: 'No filters provided' });
+    return;
+  }
+  try {
+    const readableProjects = projectManager.getReadableProjects(domain);
+    for (const entry of readableProjects) {
+      try {
+        let query = entry.client.from(domain).select('id');
+        query = applySupabaseFilters(query, filters);
+        const { data } = await query;
+        if (data && (data as any[]).length > 0) {
+          for (const row of data as any[]) {
+            await entry.client.from(domain).delete().eq('id', row.id);
+          }
+        }
+      } catch { /* skip */ }
+    }
     res.status(204).send();
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
@@ -236,10 +300,13 @@ router.get('/:domain', auth.authenticate.bind(auth), validation.validateDomainMi
       res.json([]);
       return;
     }
+    const filters = req.query.filter as string[] | string | undefined;
     const results = await Promise.all(
       readableProjects.map(async (entry) => {
         try {
-          const { data, error } = await entry.client.from(domain).select('*');
+          let query = entry.client.from(domain).select('*');
+          query = applySupabaseFilters(query, filters);
+          const { data, error } = await query;
           if (error) return [];
           return (data as any[]) || [];
         } catch {
