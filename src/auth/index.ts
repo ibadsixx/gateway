@@ -128,29 +128,54 @@ class AuthService {
         return null;
       }
 
+      if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
+        console.error('[Auth] JWT expired');
+        return null;
+      }
+
       const secret = credentials.jwt_secret;
       const key = typeof secret === 'string' ? Buffer.from(secret, 'utf8') : Buffer.from(secret);
       const expectedSig = createHmac('sha256', key)
         .update(`${headerB64}.${payloadB64}`)
         .digest('base64url');
 
-      if (!constantTimeCompare(expectedSig, signatureB64)) {
-        console.error('[Auth] JWT signature mismatch');
+      if (constantTimeCompare(expectedSig, signatureB64)) {
+        return {
+          id: payload.sub || '',
+          email: payload.email as string | undefined,
+          role: payload.role as string | undefined,
+        };
+      }
+
+      console.warn('[Auth] JWT signature mismatch with local secret, falling back to Supabase getUser()');
+      return await this.verifyViaSupabase(token);
+    } catch (error) {
+      console.error('[Auth] Token verification failed:', error);
+      return null;
+    }
+  }
+
+  private async verifyViaSupabase(token: string): Promise<AuthUser | null> {
+    try {
+      const supabase = await this.getSupabaseClient();
+      if (!supabase) {
+        console.error('[Auth] No Supabase client available for getUser() fallback');
         return null;
       }
 
-      if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
-        console.error('[Auth] JWT expired');
+      const { data, error } = await supabase.auth.getUser(token);
+      if (error || !data?.user) {
+        console.error('[Auth] Supabase getUser() failed:', error?.message);
         return null;
       }
 
       return {
-        id: payload.sub || '',
-        email: payload.email as string | undefined,
-        role: payload.role as string | undefined,
+        id: data.user.id,
+        email: data.user.email,
+        role: data.user.role,
       };
     } catch (error) {
-      console.error('[Auth] Token verification failed:', error);
+      console.error('[Auth] Supabase getUser() fallback failed:', error);
       return null;
     }
   }
