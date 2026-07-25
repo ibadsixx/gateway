@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { createClient } from '@supabase/supabase-js';
-import { createHmac } from 'crypto';
+import { createHmac, timingSafeEqual } from 'crypto';
 
 const INFRA_SUPABASE_URL = process.env.INFRA_SUPABASE_URL;
 const INFRA_SUPABASE_KEY = process.env.INFRA_SUPABASE_KEY;
@@ -32,7 +32,6 @@ let cacheTimestamp = 0;
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 async function getAuthCredentials(domain: string = 'users'): Promise<AuthCredentials | null> {
-  // Return cached credentials if fresh
   if (cachedCredentials && Date.now() - cacheTimestamp < CACHE_TTL) {
     return cachedCredentials;
   }
@@ -44,7 +43,7 @@ async function getAuthCredentials(domain: string = 'users'): Promise<AuthCredent
 
   try {
     const infraClient = createClient(INFRA_SUPABASE_URL, INFRA_SUPABASE_KEY);
-    
+
     const { data, error } = await infraClient
       .from('infrastructure_projects')
       .select('project_url, anon_key, service_key, jwt_secret')
@@ -74,6 +73,13 @@ async function getAuthCredentials(domain: string = 'users'): Promise<AuthCredent
     console.error('[Auth] Error fetching credentials:', error);
     return null;
   }
+}
+
+function constantTimeCompare(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  return timingSafeEqual(bufA, bufB);
 }
 
 class AuthService {
@@ -128,7 +134,7 @@ class AuthService {
         .update(`${headerB64}.${payloadB64}`)
         .digest('base64url');
 
-      if (expectedSig !== signatureB64) {
+      if (!constantTimeCompare(expectedSig, signatureB64)) {
         console.error('[Auth] JWT signature mismatch');
         return null;
       }
@@ -168,6 +174,29 @@ class AuthService {
     if (!credentials) return null;
 
     return createClient(credentials.project_url, credentials.anon_key);
+  }
+
+  authenticateAdmin(req: Request, res: Response, next: NextFunction): void {
+    const adminKey = process.env.ADMIN_API_KEY;
+    if (!adminKey) {
+      console.error('[Auth] ADMIN_API_KEY not configured');
+      res.status(503).json({ error: 'Admin access not configured' });
+      return;
+    }
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Missing admin authorization' });
+      return;
+    }
+
+    const token = authHeader.split(' ')[1];
+    if (!constantTimeCompare(token, adminKey)) {
+      res.status(403).json({ error: 'Invalid admin credentials' });
+      return;
+    }
+
+    next();
   }
 }
 

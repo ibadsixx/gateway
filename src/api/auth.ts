@@ -1,15 +1,35 @@
 import { Router, Request, Response } from 'express';
 import { auth, AuthUser } from '../auth';
+import { rateLimiter } from '../rate-limiting';
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function validateEmail(email: unknown): email is string {
+  return typeof email === 'string' && email.length <= 254 && EMAIL_REGEX.test(email);
+}
+
+function validatePassword(password: unknown): password is string {
+  return typeof password === 'string' && password.length >= 8 && password.length <= 128;
+}
 
 const authRouter = Router();
 
-// Sign up
 authRouter.post('/sign-up', async (req: Request, res: Response) => {
   try {
     const { email, password, options } = req.body;
 
     if (!email || !password) {
       res.status(400).json({ error: 'Email and password are required' });
+      return;
+    }
+
+    if (!validateEmail(email)) {
+      res.status(400).json({ error: 'Invalid email format' });
+      return;
+    }
+
+    if (!validatePassword(password)) {
+      res.status(400).json({ error: 'Password must be between 8 and 128 characters' });
       return;
     }
 
@@ -22,7 +42,7 @@ authRouter.post('/sign-up', async (req: Request, res: Response) => {
     const { data, error } = await supabase.auth.admin.createUser({
       email,
       password,
-      email_confirm: true,
+      email_confirm: false,
       user_metadata: options?.data || {},
     });
 
@@ -44,13 +64,17 @@ authRouter.post('/sign-up', async (req: Request, res: Response) => {
   }
 });
 
-// Sign in
 authRouter.post('/sign-in', async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
 
     if (!email || !password) {
       res.status(400).json({ error: 'Email and password are required' });
+      return;
+    }
+
+    if (!validateEmail(email)) {
+      res.status(400).json({ error: 'Invalid email format' });
       return;
     }
 
@@ -83,7 +107,6 @@ authRouter.post('/sign-in', async (req: Request, res: Response) => {
   }
 });
 
-// Sign out
 authRouter.post('/sign-out', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
   try {
     const token = auth.extractTokenFromHeader(req.headers.authorization);
@@ -96,11 +119,10 @@ authRouter.post('/sign-out', auth.authenticate.bind(auth), async (req: Request, 
     res.json({ error: null });
   } catch (error) {
     console.error('[Auth] Sign-out error:', error);
-    res.json({ error: null }); // Sign out always succeeds
+    res.json({ error: null });
   }
 });
 
-// Get session
 authRouter.get('/session', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
   try {
     const user = req.user;
@@ -115,7 +137,6 @@ authRouter.get('/session', auth.authenticate.bind(auth), async (req: Request, re
       return;
     }
 
-    // Get fresh user data from Supabase
     const { data, error } = await supabase.auth.admin.getUserById(user.id);
 
     if (error) {
@@ -139,12 +160,12 @@ authRouter.get('/session', auth.authenticate.bind(auth), async (req: Request, re
   }
 });
 
-// Refresh session
-authRouter.post('/refresh', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
+authRouter.post('/refresh', async (req: Request, res: Response) => {
   try {
-    const user = req.user;
-    if (!user) {
-      res.status(401).json({ error: 'Not authenticated' });
+    const { refresh_token } = req.body;
+
+    if (!refresh_token || typeof refresh_token !== 'string') {
+      res.status(400).json({ error: 'refresh_token is required' });
       return;
     }
 
@@ -154,20 +175,17 @@ authRouter.post('/refresh', auth.authenticate.bind(auth), async (req: Request, r
       return;
     }
 
-    // Get fresh user data
-    const { data: userData } = await supabase.auth.admin.getUserById(user.id);
+    const { data, error } = await supabase.auth.refreshSession({ refresh_token });
 
-    // For now, return the current token (refresh token exchange would require the refresh token)
+    if (error || !data.session) {
+      res.status(401).json({ error: error?.message || 'Invalid refresh token' });
+      return;
+    }
+
     res.json({
       data: {
-        session: {
-          user: userData?.user || { id: user.id, email: user.email },
-          access_token: auth.extractTokenFromHeader(req.headers.authorization),
-          refresh_token: '',
-          expires_in: 3600,
-          expires_at: Math.floor(Date.now() / 1000) + 3600,
-          token_type: 'bearer',
-        },
+        session: data.session,
+        user: data.user,
       },
       error: null,
     });
@@ -177,13 +195,28 @@ authRouter.post('/refresh', auth.authenticate.bind(auth), async (req: Request, r
   }
 });
 
-// Update user
+const ALLOWED_METADATA_KEYS = new Set([
+  'display_name', 'avatar_url', 'bio', 'location', 'website',
+]);
+
 authRouter.put('/user', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
   try {
     const user = req.user;
     if (!user) {
       res.status(401).json({ error: 'Not authenticated' });
       return;
+    }
+
+    if (!req.body || typeof req.body !== 'object') {
+      res.status(400).json({ error: 'Request body is required' });
+      return;
+    }
+
+    const sanitizedMetadata: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(req.body)) {
+      if (ALLOWED_METADATA_KEYS.has(key)) {
+        sanitizedMetadata[key] = typeof value === 'string' ? value.slice(0, 500) : value;
+      }
     }
 
     const supabase = await auth.getSupabaseClient();
@@ -194,7 +227,7 @@ authRouter.put('/user', auth.authenticate.bind(auth), async (req: Request, res: 
 
     const { data, error } = await supabase.auth.admin.updateUserById(
       user.id,
-      { user_metadata: req.body }
+      { user_metadata: sanitizedMetadata }
     );
 
     if (error) {
