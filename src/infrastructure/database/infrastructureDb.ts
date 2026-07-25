@@ -108,19 +108,8 @@ class InfrastructureDatabase {
       .select('*')
       .eq('domain', domain)
       .eq('status', 'active')
-      .eq('write_enabled', true)
-      .eq('health_status', 'online')
       .order('priority', { ascending: true })
       .limit(10);
-    if (error?.code === 'PGRST204') {
-      ({ data, error } = await this.client!.from('infrastructure_projects')
-        .select('*')
-        .eq('domain', domain)
-        .eq('status', 'active')
-        .eq('write_enabled', true)
-        .order('priority', { ascending: true })
-        .limit(10));
-    }
     if (error) throw new Error(`Failed to fetch writable project: ${error.message}`);
 
     const projects = (data as InfrastructureProjectRow[]) || [];
@@ -493,6 +482,7 @@ class InfrastructureDatabase {
       { id: crypto.randomUUID(), project_key: 'profiles_1', domain: 'profiles', provider_id: supabaseId, project_url: '', service_key: '', anon_key: '', status: 'active', capacity: 500000000, used_space: 50000000, priority: 1, load_weight: 100, write_enabled: true, health_status: 'online', region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
       { id: crypto.randomUUID(), project_key: 'pages_1', domain: 'pages', provider_id: supabaseId, project_url: 'https://lqczlmiyxvxtfwwaykvq.supabase.co', service_key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxxY3psbWl5eHZ4dGZ3d2F5a3ZxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjU2NzIxMCwiZXhwIjoyMDg4MTQzMjEwfQ.OMOFTwrvaLpWOJWiNUk58NvZE4lmBQj1qzSUAhPzarY', anon_key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxxY3psbWl5eHZ4dGZ3d2F5a3ZxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NjcyMTAsImV4cCI6MjA4ODE0MzIxMH0.xOe353amV2aTuUTP7EnCo1mCutnmYaXycQzIsKdeIsE', status: 'active', capacity: 500000000, used_space: 50000000, priority: 1, load_weight: 100, write_enabled: true, health_status: 'online', region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
       { id: crypto.randomUUID(), project_key: 'page_followers_1', domain: 'page_followers', provider_id: supabaseId, project_url: 'https://lqczlmiyxvxtfwwaykvq.supabase.co', service_key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxxY3psbWl5eHZ4dGZ3d2F5a3ZxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjU2NzIxMCwiZXhwIjoyMDg4MTQzMjEwfQ.OMOFTwrvaLpWOJWiNUk58NvZE4lmBQj1qzSUAhPzarY', anon_key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxxY3psbWl5eHZ4dGZ3d2F5a3ZxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NjcyMTAsImV4cCI6MjA4ODE0MzIxMH0.xOe353amV2aTuUTP7EnCo1mCutnmYaXycQzIsKdeIsE', status: 'active', capacity: 500000000, used_space: 50000000, priority: 1, load_weight: 100, write_enabled: true, health_status: 'online', region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: crypto.randomUUID(), project_key: 'page_posts_1', domain: 'page_posts', provider_id: supabaseId, project_url: 'https://lqczlmiyxvxtfwwaykvq.supabase.co', service_key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxxY3psbWl5eHZ4dGZ3d2F5a3ZxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MjU2NzIxMCwiZXhwIjoyMDg4MTQzMjEwfQ.OMOFTwrvaLpWOJWiNUk58NvZE4lmBQj1qzSUAhPzarY', anon_key: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxxY3psbWl5eHZ4dGZ3d2F5a3ZxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NjcyMTAsImV4cCI6MjA4ODE0MzIxMH0.xOe353amV2aTuUTP7EnCo1mCutnmYaXycQzIsKdeIsE', status: 'active', capacity: 500000000, used_space: 50000000, priority: 1, load_weight: 100, write_enabled: true, health_status: 'online', region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
     ];
     this.fallbackProjects.sort((a, b) => a.priority - b.priority);
 
