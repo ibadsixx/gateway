@@ -11,7 +11,7 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || '')
 
 export function middleware(app: Express): void {
   app.use(cors({
-    origin: ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : false,
+    origin: ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     maxAge: 86400,
