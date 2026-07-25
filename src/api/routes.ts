@@ -138,12 +138,27 @@ v1.delete('/:domain', validation.validateDomainMiddleware, async (req, res) => {
     const readableProjects = projectManager.getReadableProjects(domain);
     for (const entry of readableProjects) {
       try {
-        let query = entry.client.from(domain).select('id');
+        let query = entry.client.from(domain).select('*');
         query = applySupabaseFilters(query, filters);
         const { data } = await query;
         if (data && (data as any[]).length > 0) {
           for (const row of data as any[]) {
-            await entry.client.from(domain).delete().eq('id', row.id);
+            if (row.id) {
+              await entry.client.from(domain).delete().eq('id', row.id);
+            } else {
+              let del = entry.client.from(domain).delete();
+              for (const f of (Array.isArray(filters) ? filters : [filters])) {
+                const eqIdx = f.indexOf('=');
+                if (eqIdx === -1) continue;
+                const col = f.slice(0, eqIdx);
+                const rest = f.slice(eqIdx + 1);
+                const dotIdx = rest.indexOf('.');
+                if (dotIdx === -1) continue;
+                const val = rest.slice(dotIdx + 1);
+                del = del.eq(col, val);
+              }
+              await del;
+            }
           }
         }
       } catch { /* skip */ }
