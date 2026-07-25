@@ -143,6 +143,7 @@ v1.post('/notifications/send', async (req, res) => {
 
 const system = Router();
 
+// Public: health check only
 system.get('/health', (_req, res) => {
   res.json({
     status: 'healthy',
@@ -151,15 +152,16 @@ system.get('/health', (_req, res) => {
   });
 });
 
+// All remaining system endpoints require admin authentication
+system.use(auth.authenticateAdmin.bind(auth));
+
 system.get('/storage', async (_req, res) => {
   const status = await projectRegistry.getInfrastructureStatus();
   res.json(status.storage);
 });
 
-system.get('/databases', async (_req, res) => {
-  const status = await projectRegistry.getInfrastructureStatus();
-  res.json(status.databases);
-});
+// /databases endpoint REMOVED — it exposed all Supabase service keys publicly.
+// Use the Supabase Management API or direct project access for database operations.
 
 system.get('/metrics', (_req, res) => {
   res.json(metricsService.getSnapshot());
