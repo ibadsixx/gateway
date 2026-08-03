@@ -187,6 +187,10 @@ class AuthService {
     return authHeader.split(' ')[1];
   }
 
+  async getProjectCredentials(): Promise<AuthCredentials | null> {
+    return getAuthCredentials();
+  }
+
   async getSupabaseClient(): Promise<ReturnType<typeof createClient> | null> {
     const credentials = await getAuthCredentials();
     if (!credentials) return null;
