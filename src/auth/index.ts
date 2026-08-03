@@ -26,14 +26,14 @@ declare global {
   }
 }
 
-// Cache credentials to avoid repeated lookups
-let cachedCredentials: AuthCredentials | null = null;
-let cacheTimestamp = 0;
+// Cache credentials to avoid repeated lookups (per-domain)
+const credentialCache = new Map<string, { credentials: AuthCredentials; timestamp: number }>();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 async function getAuthCredentials(domain: string = 'users'): Promise<AuthCredentials | null> {
-  if (cachedCredentials && Date.now() - cacheTimestamp < CACHE_TTL) {
-    return cachedCredentials;
+  const cached = credentialCache.get(domain);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return cached.credentials;
   }
 
   if (!INFRA_SUPABASE_URL || !INFRA_SUPABASE_KEY) {
@@ -60,15 +60,15 @@ async function getAuthCredentials(domain: string = 'users'): Promise<AuthCredent
       return null;
     }
 
-    cachedCredentials = {
+    const credentials: AuthCredentials = {
       project_url: data.project_url,
       anon_key: data.anon_key,
       service_key: data.service_key,
       jwt_secret: data.jwt_secret,
     };
-    cacheTimestamp = Date.now();
+    credentialCache.set(domain, { credentials, timestamp: Date.now() });
 
-    return cachedCredentials;
+    return credentials;
   } catch (error) {
     console.error('[Auth] Error fetching credentials:', error);
     return null;
@@ -187,8 +187,8 @@ class AuthService {
     return authHeader.split(' ')[1];
   }
 
-  async getProjectCredentials(): Promise<AuthCredentials | null> {
-    return getAuthCredentials();
+  async getProjectCredentials(domain: string = 'users'): Promise<AuthCredentials | null> {
+    return getAuthCredentials(domain);
   }
 
   async getSupabaseClient(): Promise<ReturnType<typeof createClient> | null> {

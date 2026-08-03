@@ -18,8 +18,17 @@ class RoutingService {
     const { client } = entry;
 
     return RetryEngine.execute(async () => {
-      const { data: inserted, error } = await client.from(domain).insert(data).select().single();
-      if (error) return Promise.reject(new Error(`Insert error: ${error.message}`));
+      const { _on_conflict, ...payload } = data;
+      let inserted: unknown;
+      if (typeof _on_conflict === 'string' && _on_conflict.length > 0) {
+        const { data: upserted, error } = await client.from(domain).upsert(payload, { onConflict: _on_conflict }).select().single();
+        if (error) return Promise.reject(new Error(`Upsert error: ${error.message}`));
+        inserted = upserted;
+      } else {
+        const { data: created, error } = await client.from(domain).insert(payload).select().single();
+        if (error) return Promise.reject(new Error(`Insert error: ${error.message}`));
+        inserted = created;
+      }
       const result = inserted as QueryResult;
 
       eventBus.emit({

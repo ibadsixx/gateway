@@ -15,7 +15,7 @@ import { jobQueue } from '../jobs/queue';
 import { notificationQueue } from '../notifications';
 import { searchService } from '../search';
 import { projectManager } from '../project-manager';
-import { auth } from '../auth';
+import { auth, AuthCredentials } from '../auth';
 import { authRouter } from './auth';
 
 function applySupabaseFilters(query: any, filters: string | string[] | undefined): any {
@@ -282,16 +282,45 @@ system.post('/reload-registry', async (_req, res) => {
 
 const rpcRouter = Router();
 
+// RPC functions that must run against a non-default project.
+// The default RPC proxy targets the 'users' project; functions that operate on
+// tables hosted elsewhere (e.g. ad topics in the advertisers project) are routed
+// here by name to their owning domain. These are SECURITY DEFINER functions that
+// take explicit parameters, so they run with the owning project's anon key.
+const RPC_DOMAIN_OVERRIDES: Record<string, string> = {
+  seed_default_ad_topics: 'ad_topics',
+};
+
 rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
   try {
-    const credentials = await auth.getProjectCredentials();
+    const domain = RPC_DOMAIN_OVERRIDES[req.params.function] || 'users';
+    let credentials: AuthCredentials | null = null;
+    let bearer: string | null = null;
+
+    if (domain === 'users') {
+      credentials = await auth.getProjectCredentials('users');
+      bearer = auth.extractTokenFromHeader(req.headers.authorization);
+    } else {
+      const projects = projectManager.getReadableProjects(domain);
+      const project = projects[0];
+      if (project) {
+        credentials = {
+          project_url: project.project.projectUrl,
+          anon_key: project.project.anonKey,
+          service_key: project.project.serviceKey,
+          jwt_secret: '',
+        };
+        // Functions routed to a non-default project run as that project's anon role
+        // (they are SECURITY DEFINER and receive the acting user explicitly).
+        bearer = project.project.anonKey;
+      }
+    }
+
     if (!credentials) {
       res.status(500).json({ error: 'Auth service not configured' });
       return;
     }
-
-    const accessToken = auth.extractTokenFromHeader(req.headers.authorization);
-    if (!accessToken) {
+    if (!bearer) {
       res.status(401).json({ error: 'Missing authorization header' });
       return;
     }
@@ -302,7 +331,7 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
       headers: {
         'Content-Type': 'application/json',
         apikey: credentials.anon_key,
-        Authorization: `Bearer ${accessToken}`,
+        Authorization: `Bearer ${bearer}`,
       },
       body: JSON.stringify(req.body || {}),
     });
