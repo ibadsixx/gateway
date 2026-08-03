@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { validation } from './validation';
 import { database } from '../infrastructure/database';
 import { storage } from '../infrastructure/storage';
@@ -280,8 +280,68 @@ system.post('/reload-registry', async (_req, res) => {
   }
 });
 
+const rpcRouter = Router();
+
+rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
+  try {
+    const credentials = await auth.getProjectCredentials();
+    if (!credentials) {
+      res.status(500).json({ error: 'Auth service not configured' });
+      return;
+    }
+
+    const accessToken = auth.extractTokenFromHeader(req.headers.authorization);
+    if (!accessToken) {
+      res.status(401).json({ error: 'Missing authorization header' });
+      return;
+    }
+
+    const url = `${credentials.project_url}/rest/v1/rpc/${encodeURIComponent(req.params.function)}`;
+    const upstream = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: credentials.anon_key,
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify(req.body || {}),
+    });
+
+    const text = await upstream.text();
+
+    if (upstream.status === 204) {
+      res.status(200).json(null);
+      return;
+    }
+
+    let payload: unknown = null;
+    if (text) {
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = text;
+      }
+    }
+
+    if (!upstream.ok) {
+      const message =
+        (payload && typeof payload === 'object' && (payload as any).message) ||
+        (payload && typeof payload === 'object' && (payload as any).msg) ||
+        `RPC failed (${upstream.status})`;
+      res.status(upstream.status === 404 ? 400 : upstream.status).json({ error: message });
+      return;
+    }
+
+    res.status(200).json(payload);
+  } catch (error) {
+    console.error('[Gateway] RPC proxy error:', error);
+    res.status(502).json({ error: 'RPC proxy failed' });
+  }
+});
+
 const router = Router();
 router.use('/auth', authRouter);
+router.use('/rpc', rpcRouter);
 router.use('/v1', v1);
 router.use('/system', system);
 router.get('/health', (_req, res) => {
