@@ -291,6 +291,7 @@ const RPC_DOMAIN_OVERRIDES: Record<string, string> = {
   seed_default_ad_topics: 'ad_topics',
   add_blocked_nickname: 'blocking',
   add_blocked_sender: 'blocking',
+  get_blocked_nicknames: 'blocking',
   remove_blocked_nickname: 'blocking',
   remove_blocked_sender: 'blocking',
   block_user: 'blocking',
