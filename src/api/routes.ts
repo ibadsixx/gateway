@@ -289,6 +289,22 @@ const rpcRouter = Router();
 // take explicit parameters, so they run with the owning project's anon key.
 const RPC_DOMAIN_OVERRIDES: Record<string, string> = {
   seed_default_ad_topics: 'ad_topics',
+  add_blocked_nickname: 'blocking',
+  add_blocked_sender: 'blocking',
+  remove_blocked_nickname: 'blocking',
+  remove_blocked_sender: 'blocking',
+  block_user: 'blocking',
+  unblock_user: 'blocking',
+  get_blocked_users: 'blocking',
+  get_blocked_senders: 'blocking',
+  get_blocked_user_ids: 'blocking',
+  get_restricted_users: 'blocking',
+  get_user_blocks: 'blocking',
+  get_block_relation: 'blocking',
+  is_blocked: 'blocking',
+  is_restricted: 'blocking',
+  restrict_user: 'blocking',
+  unrestrict_user: 'blocking',
 };
 
 rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
