@@ -69,9 +69,16 @@ async function initializeDefaults(): Promise<void> {
   monitoring.start();
 
   setInterval(() => {
-    projectManager.refreshRegistry().catch(err =>
-      console.error('[Cache] Periodic registry refresh failed:', err),
-    );
+    projectManager.refreshRegistry()
+      .then(() => {
+        const projects = projectManager.getProjects();
+        for (const domain of [...new Set(projects.map(p => p.domain))]) {
+          featureFlags.enable(domain);
+        }
+      })
+      .catch(err =>
+        console.error('[Cache] Periodic registry refresh failed:', err),
+      );
   }, 60000);
 
   console.log('Tone API Gateway initialized with all services');
