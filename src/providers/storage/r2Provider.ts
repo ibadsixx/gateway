@@ -1,7 +1,7 @@
-import { StorageProvider, UploadResult } from './types';
+import { StorageProvider, UploadResult, UploadCredentials } from './types';
 
 export class R2Provider implements StorageProvider {
-  async upload(path: string, _buffer: Buffer, mimeType: string): Promise<UploadResult> {
+  async upload(path: string, _buffer: Buffer, mimeType: string, _credentials?: UploadCredentials): Promise<UploadResult> {
     console.log(`[Cloudflare R2] Uploading ${path} (${mimeType})`);
     return { url: `https://r2.cloudflarestorage.com/tone/${path}`, id: crypto.randomUUID() };
   }

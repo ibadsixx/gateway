@@ -1,13 +1,13 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import type {
   InfrastructureProjectRow,
-  StorageProviderRow,
+  InfrastructureStorageRow,
   DomainRow,
   GatewaySettingRow,
   HealthLogRow,
   ProviderRow,
   ProjectStatus,
-  StorageStatus,
+  StorageAccountStatus,
   HealthStatus,
   ResourceType,
   SettingType,
@@ -24,7 +24,7 @@ class InfrastructureDatabase {
   private fallback = true;
 
   private fallbackProjects: InfrastructureProjectRow[] = [];
-  private fallbackStorage: StorageProviderRow[] = [];
+  private fallbackStorage: InfrastructureStorageRow[] = [];
   private fallbackDomains: DomainRow[] = [];
   private fallbackSettings: Map<string, GatewaySettingRow> = new Map();
   private fallbackHealthLogs: HealthLogRow[] = [];
@@ -231,66 +231,73 @@ class InfrastructureDatabase {
     }
   }
 
-  // ---- Storage Providers ----
+  // ---- Storage Accounts (infrastructure_storage) ----
 
-  async getStorageAccounts(): Promise<StorageProviderRow[]> {
+  async getStorageAccounts(): Promise<InfrastructureStorageRow[]> {
     if (this.fallback) return [...this.fallbackStorage];
-    const { data, error } = await this.client!.from('storage_providers').select('*');
+    const { data, error } = await this.client!.from('infrastructure_storage').select('*');
     if (error) throw new Error(`Failed to fetch storage accounts: ${error.message}`);
-    return (data as StorageProviderRow[]) || [];
+    return (data as InfrastructureStorageRow[]) || [];
   }
 
-  async getActiveStorageAccounts(): Promise<StorageProviderRow[]> {
+  async getActiveStorageAccounts(): Promise<InfrastructureStorageRow[]> {
     const accounts = await this.getStorageAccounts();
-    return accounts.filter(a => a.status === 'active');
+    return accounts.filter(a => a.status === 'available');
   }
 
-  async getStorageAccountById(id: string): Promise<StorageProviderRow | null> {
+  async getStorageAccountById(id: string): Promise<InfrastructureStorageRow | null> {
     if (this.fallback) return this.fallbackStorage.find(a => a.id === id) || null;
-    const { data, error } = await this.client!.from('storage_providers').select('*').eq('id', id).single();
+    const { data, error } = await this.client!.from('infrastructure_storage').select('*').eq('id', id).single();
     if (error && error.code !== 'PGRST116') throw new Error(`Failed to fetch storage account: ${error.message}`);
-    return (data as StorageProviderRow) || null;
+    return (data as InfrastructureStorageRow) || null;
   }
 
-  async registerStorageAccount(account: Omit<StorageProviderRow, 'id' | 'created_at' | 'updated_at'>): Promise<StorageProviderRow> {
+  async registerStorageAccount(account: Omit<InfrastructureStorageRow, 'id' | 'available_space' | 'last_update' | 'created_at' | 'updated_at'>): Promise<InfrastructureStorageRow> {
     if (this.fallback) {
-      const row: StorageProviderRow = {
+      const row: InfrastructureStorageRow = {
         id: crypto.randomUUID(),
         ...account,
+        available_space: Math.max(account.capacity - account.used_space, 0),
+        last_update: new Date().toISOString(),
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       };
-      const existing = this.fallbackStorage.findIndex(a => a.provider_key === row.provider_key);
+      const existing = this.fallbackStorage.findIndex(a => a.storage_key === row.storage_key);
       if (existing >= 0) {
         this.fallbackStorage[existing] = row;
       } else {
         this.fallbackStorage.push(row);
       }
-      this.fallbackStorage.sort((a, b) => a.priority - b.priority);
       return row;
     }
-    const { data, error } = await this.client!.from('storage_providers').insert(account).select().single();
+    const { data, error } = await this.client!.from('infrastructure_storage').insert(account).select().single();
     if (error) throw new Error(`Failed to register storage account: ${error.message}`);
-    return data as StorageProviderRow;
+    return data as InfrastructureStorageRow;
   }
 
   async updateStorageUsage(id: string, usedSpace: number): Promise<void> {
     if (this.fallback) {
       const account = this.fallbackStorage.find(a => a.id === id);
-      if (account) account.used_space = usedSpace;
+      if (account) {
+        account.used_space = usedSpace;
+        account.available_space = Math.max(account.capacity - usedSpace, 0);
+        account.last_update = new Date().toISOString();
+      }
       return;
     }
-    const { error } = await this.client!.from('storage_providers').update({ used_space: usedSpace }).eq('id', id);
+    const { error } = await this.client!.from('infrastructure_storage')
+      .update({ used_space: usedSpace, last_update: new Date().toISOString() })
+      .eq('id', id);
     if (error) throw new Error(`Failed to update storage usage: ${error.message}`);
   }
 
-  async updateStorageStatus(id: string, status: StorageStatus): Promise<void> {
+  async updateStorageStatus(id: string, status: StorageAccountStatus): Promise<void> {
     if (this.fallback) {
       const account = this.fallbackStorage.find(a => a.id === id);
       if (account) account.status = status;
       return;
     }
-    const { error } = await this.client!.from('storage_providers').update({ status }).eq('id', id);
+    const { error } = await this.client!.from('infrastructure_storage').update({ status }).eq('id', id);
     if (error) throw new Error(`Failed to update storage status: ${error.message}`);
   }
 
@@ -491,11 +498,10 @@ class InfrastructureDatabase {
     const s3Id = this.fallbackProviders[4].id;
 
     this.fallbackStorage = [
-      { id: crypto.randomUUID(), provider_key: 'cloudinary_1', provider_id: cloudinaryId, cloud_name: '', api_key: '', api_secret: '', status: 'active', capacity: 10000000000, used_space: 9500000000, priority: 1, region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: crypto.randomUUID(), provider_key: 'cloudinary_2', provider_id: cloudinaryId, cloud_name: '', api_key: '', api_secret: '', status: 'active', capacity: 10000000000, used_space: 1000000000, priority: 2, region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
-      { id: crypto.randomUUID(), provider_key: 's3_main', provider_id: s3Id, cloud_name: '', api_key: '', api_secret: '', status: 'active', capacity: 50000000000, used_space: 5000000000, priority: 3, region: null, response_time: null, last_health_check: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: crypto.randomUUID(), storage_key: 'cloudinary_1', provider_id: cloudinaryId, cloud_name: '', api_key: '', api_secret: '', status: 'available', capacity: 10000000000, used_space: 9500000000, available_space: 500000000, last_update: new Date().toISOString(), created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: crypto.randomUUID(), storage_key: 'cloudinary_2', provider_id: cloudinaryId, cloud_name: '', api_key: '', api_secret: '', status: 'available', capacity: 10000000000, used_space: 1000000000, available_space: 9000000000, last_update: new Date().toISOString(), created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+      { id: crypto.randomUUID(), storage_key: 's3_main', provider_id: s3Id, cloud_name: '', api_key: '', api_secret: '', status: 'full', capacity: 50000000000, used_space: 50000000000, available_space: 0, last_update: new Date().toISOString(), created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
     ];
-    this.fallbackStorage.sort((a, b) => a.priority - b.priority);
 
     const defaults: Array<{ key: string; value: unknown; type: SettingType }> = [
       { key: 'writeThreshold', value: 90, type: 'number' },

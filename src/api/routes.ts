@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import busboy from 'busboy';
 import { validation } from './validation';
 import { database } from '../infrastructure/database';
 import { storage } from '../infrastructure/storage';
@@ -51,6 +52,35 @@ function applySupabaseFilters(query: any, filters: string | string[] | undefined
 }
 
 const v1 = Router();
+
+const MAX_UPLOAD_SIZE = 150 * 1024 * 1024;
+
+function parseMultipartUpload(req: Request): Promise<{ buffer: Buffer; mimeType: string }> {
+  return new Promise((resolve, reject) => {
+    const bb = busboy({ headers: req.headers, limits: { files: 1, fileSize: MAX_UPLOAD_SIZE, fields: 10 } });
+    let buffer = Buffer.alloc(0);
+    let mimeType = 'application/octet-stream';
+
+    bb.on('file', (_name, stream, info) => {
+      mimeType = info.mimeType || mimeType;
+      stream.on('data', (chunk: Buffer) => {
+        buffer = Buffer.concat([buffer, chunk]);
+      });
+    });
+
+    bb.on('error', (err) => reject(err));
+
+    bb.on('close', () => {
+      if (buffer.length === 0) {
+        reject(new Error('No file received'));
+        return;
+      }
+      resolve({ buffer, mimeType });
+    });
+
+    req.pipe(bb);
+  });
+}
 
 // Apply auth middleware to all v1 routes except system endpoints
 v1.use((req, res, next) => {
@@ -395,6 +425,23 @@ router.get('/health', (_req, res) => {
 });
 
 // Apply auth middleware to non-v1 domain routes
+router.post('/storage/:bucket/*', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
+  const { bucket } = req.params;
+  const path = req.params[0];
+  if (!bucket || !path) {
+    res.status(400).json({ error: 'bucket and path are required' });
+    return;
+  }
+  try {
+    const { buffer, mimeType } = await parseMultipartUpload(req);
+    const result = await storage.upload({ buffer, mimeType, bucket, path });
+    res.status(201).json(result);
+  } catch (error) {
+    console.error('[Gateway] Storage upload failed:', (error as Error).message);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
 router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain } = req.params;
   if (!featureFlags.isEnabled(domain)) {

@@ -2,6 +2,7 @@ export type ProviderType = 'database' | 'storage' | 'ai' | 'search';
 export type ProviderStatus = 'active' | 'inactive' | 'disabled';
 export type ProjectStatus = 'active' | 'read_only' | 'disabled' | 'maintenance';
 export type StorageStatus = 'active' | 'disabled' | 'maintenance';
+export type StorageAccountStatus = 'available' | 'full';
 export type HealthStatus = 'online' | 'degraded' | 'offline';
 export type ResourceType = 'database' | 'storage' | 'service';
 export type SettingType = 'string' | 'number' | 'boolean' | 'json';
@@ -38,20 +39,18 @@ export interface InfrastructureProjectRow {
   updated_at: string;
 }
 
-export interface StorageProviderRow {
+export interface InfrastructureStorageRow {
   id: string;
-  provider_key: string;
+  storage_key: string;
   provider_id: string;
   cloud_name: string;
   api_key: string;
   api_secret: string;
-  status: StorageStatus;
+  status: StorageAccountStatus;
   capacity: number;
   used_space: number;
-  priority: number;
-  region: string | null;
-  response_time: number | null;
-  last_health_check: string | null;
+  available_space: number;
+  last_update: string;
   created_at: string;
   updated_at: string;
 }
