@@ -18,6 +18,7 @@ import { searchService } from '../search';
 import { projectManager } from '../project-manager';
 import { auth, AuthCredentials } from '../auth';
 import { authRouter } from './auth';
+import { realtimeRouter } from './realtime';
 
 function applySupabaseFilters(query: any, filters: string | string[] | undefined): any {
   if (!filters) return query;
@@ -418,6 +419,7 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
 const router = Router();
 router.use('/auth', authRouter);
 router.use('/rpc', rpcRouter);
+router.use('/realtime', realtimeRouter);
 router.use('/v1', v1);
 router.use('/system', system);
 router.get('/health', (_req, res) => {
