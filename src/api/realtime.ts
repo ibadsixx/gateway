@@ -30,10 +30,28 @@ realtimeRouter.get('/ice-servers', auth.authenticate.bind(auth), (_req: Request,
   res.json({ iceServers: [...DEFAULT_STUN_SERVERS, ...turnServers] });
 });
 
+const CHANNEL_RE = /^calls:[\w-]+$/;
+
+function isCallChannel(channel: string): boolean {
+  return CHANNEL_RE.test(channel);
+}
+
 realtimeRouter.get('/subscribe/:channel', auth.authenticate.bind(auth), (req: Request, res: Response) => {
   const channel = req.params.channel || '';
   if (!channel) {
     res.status(400).json({ error: 'Channel is required' });
+    return;
+  }
+  if (!isCallChannel(channel)) {
+    res.status(400).json({ error: 'Invalid channel format' });
+    return;
+  }
+
+  // Security: a user may only subscribe to their own signaling channel.
+  // Otherwise any authenticated client could read (and spoof) another user's
+  // call signaling by subscribing to calls:<theirId>.
+  if (channel !== `calls:${req.user?.id}`) {
+    res.status(403).json({ error: 'You may only subscribe to your own channel' });
     return;
   }
 
@@ -65,8 +83,12 @@ realtimeRouter.get('/subscribe/:channel', auth.authenticate.bind(auth), (req: Re
 
 realtimeRouter.post('/publish', auth.authenticate.bind(auth), (req: Request, res: Response) => {
   const { channel, event, payload, excludeConnId } = req.body || {};
-  if (typeof channel !== 'string' || !channel || typeof event !== 'string' || !event) {
-    res.status(400).json({ error: 'channel and event are required' });
+  if (typeof channel !== 'string' || !channel || !isCallChannel(channel)) {
+    res.status(400).json({ error: 'channel must be a valid calls channel' });
+    return;
+  }
+  if (typeof event !== 'string' || !event) {
+    res.status(400).json({ error: 'event is required' });
     return;
   }
   const delivered = channelHub.publish(
