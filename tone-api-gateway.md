@@ -215,7 +215,7 @@ Verified against `https://gateway-iota-two.vercel.app`:
 | `GET /api/system/health` | `200` healthy |
 | `GET /api/system/features` | `503` "Admin access not configured" (`ADMIN_API_KEY` undefined) |
 | `GET /api/posts` (no token) | `401` — data routes now require a Bearer token (`auth.authenticate` on `/:domain`) |
-| `GET /api/profiles` (no token) | `401` — host `kswqecvwphalmsggtccm.supabase.co` resolves and answers HTTP 401 |
+| `GET /api/profiles` (no token) | `401` — host the profiles-domain resolves and answers HTTP 401 |
 | `GET /api/friends` (no token) | `404 {"error":"Not found"}` — `friends` had **no registered domain** (`featureFlags.isEnabled('friends')` false); registered July 2026, enabled on next cold start |
 | `POST /api/auth/sign-up` | `400 {"error":"{}"}` |
 | `POST /api/auth/sign-in` | `401 "Invalid login credentials"` |
@@ -299,41 +299,41 @@ curl -X POST https://gateway-iota-two.vercel.app/api/comments \
 
 The gateway is **table-as-domain**: `GET /api/:domain` routes to the project(s) registered for that domain. At startup the feature flag for a domain is only enabled if it appears in the live infra DB `infrastructure_projects` table (`api/[...slug].ts:45-49` → `projectManager.load()` → `infrastructureDb.getProjects()`); when the flag is off the route returns `404 {"error":"Not found"}` (`src/api/routes.ts:306-311`). Routing reads the same cached project rows grouped by `domain` (`project-manager/index.ts:74-102`).
 
-**~100 domains** are currently registered across **13 Supabase projects** (was 12; the users-domain project `ojdhztcetykgvrcwlwen` is where all 226 app migrations were applied and hosts the bulk of the social-graph tables).
+**~100 domains** are currently registered across **13 Supabase projects** (was 12; the users-domain project `<project-8>` is where all 226 app migrations were applied and hosts the bulk of the social-graph tables).
 
 ### Primary domains
 
 | Domain | Supabase Project | Status | Description |
 |--------|-----------------|--------|-------------|
-| `posts` | `qxvvjsamqzrwcsnoiwkl` | Active | Posts + `likes`, `post_shares`, `post_tags`, `reported_posts`, `saved_posts`, `shares` |
-| `comments` | `zkhxahlmrtvurgohlloh` | Active | Comments + `comment_reactions`, `comment_shares`, `reels_comments` |
-| `stories` | `jbwqgdzogbshrswxgtmr` | Active | Stories + 9 `story_*` sub-domains |
-| `notifications` | `xzztngahelfdpgkqxenl` | Active | User notifications |
-| `pages` | `lqczlmiyxvxtfwwaykvq` | Active | Pages + `page_followers`, `page_posts` |
-| `conversations` | `jzjbvitxdumpnqdloteo` | Active | Conversations + `messages`, `message_requests`, `message_reactions`, `message_reports`, `pinned_messages`, `conversation_clears`, `conversation_participants`, `conversation_reports` |
-| `hashtags` | `gikunqxmxpvpcterfezx` | Active | Hashtags, follows, analytics |
-| `advertisers` | `ojqywevkueltcxlbrntf` | Active | Advertisers + `ad_activity`, `ad_advertisers`, `ad_settings`, `ad_topics` |
-| `music` | `ogpgaelxuulfsdwgjmvj` | Active | Music library (also exposed as `music_library`) |
-| `blocking` | `kfvixrlseqifcgszgnxm` | Active | Blocking |
-| `profiles` | `kswqecvwphalmsggtccm` | Auth-gated | User profiles + `profile_details`, `profile_posts`, `profile_reports`. Host resolves and answers HTTP 401; data route returns 401 without a Bearer token. Reachability with a valid token unverified. |
-| `groups` | `ppyesrjlayditktmmmdq` | Active | Groups + `group_follows`, `group_members`, `group_pins`, `group_posts` |
-| `users` | `ojdhztcetykgvrcwlwen` | Active | 48 social-graph tables (see full registry below) |
+| `posts` | `<project-11>` | Active | Posts + `likes`, `post_shares`, `post_tags`, `reported_posts`, `saved_posts`, `shares` |
+| `comments` | `<project-13>` | Active | Comments + `comment_reactions`, `comment_shares`, `reels_comments` |
+| `stories` | `<project-2>` | Active | Stories + 9 `story_*` sub-domains |
+| `notifications` | `<project-12>` | Active | User notifications |
+| `pages` | `<project-6>` | Active | Pages + `page_followers`, `page_posts` |
+| `conversations` | `<project-3>` | Active | Conversations + `messages`, `message_requests`, `message_reactions`, `message_reports`, `pinned_messages`, `conversation_clears`, `conversation_participants`, `conversation_reports` |
+| `hashtags` | `<project-1>` | Active | Hashtags, follows, analytics |
+| `advertisers` | `<project-9>` | Active | Advertisers + `ad_activity`, `ad_advertisers`, `ad_settings`, `ad_topics` |
+| `music` | `<project-7>` | Active | Music library (also exposed as `music_library`) |
+| `blocking` | `<project-4>` | Active | Blocking |
+| `profiles` | `<project-5>` | Auth-gated | User profiles + `profile_details`, `profile_posts`, `profile_reports`. Host resolves and answers HTTP 401; data route returns 401 without a Bearer token. Reachability with a valid token unverified. |
+| `groups` | `<project-10>` | Active | Groups + `group_follows`, `group_members`, `group_pins`, `group_posts` |
+| `users` | `<project-8>` | Active | 48 social-graph tables (see full registry below) |
 
 ### Full domain registry (from live `infrastructure_projects`, July 2026)
 
-- **`ojdhztcetykgvrcwlwen` (48)** — `users`, `audience_lists`, `bug_reports`, `call_history`, `colleges`, `companies`, `content_preferences`, `editor_projects`, `encryption_verifications`, `export_requests`, `family_relationships`, `followers`, `follows`, `friends`, `friendships`, `hidden_content`, `hidden_reels`, `high_schools`, `life_events`, `lives`, `locations`, `mentions`, `muted_users`, `notification_delivery_settings`, `notification_preferences`, `other_names`, `pokes`, `post_notifications`, `privacy_settings`, `reactions`, `reel_preference_signals`, `reel_reports`, `reels_activity`, `reels_likes`, `saved_ads`, `search_history`, `status_visibility`, `sticker_packs`, `stickers`, `technical_feedback`, `user_activity`, `user_ad_interactions`, `user_ad_partner_settings`, `user_contacts`, `user_device_keys`, `user_encryption_keys`, `user_feedback`, `user_preferences`
-- **`jbwqgdzogbshrswxgtmr` (10)** — `stories`, `story_highlight_items`, `story_highlights`, `story_mentions`, `story_poll_votes`, `story_polls`, `story_question_responses`, `story_questions`, `story_reactions`, `story_views`
-- **`jzjbvitxdumpnqdloteo` (9)** — `conversations`, `conversation_clears`, `conversation_participants`, `conversation_reports`, `message_reactions`, `message_reports`, `message_requests`, `messages`, `pinned_messages`
-- **`qxvvjsamqzrwcsnoiwkl` (7)** — `posts`, `likes`, `post_shares`, `post_tags`, `reported_posts`, `saved_posts`, `shares`
-- **`ppyesrjlayditktmmmdq` (5)** — `groups`, `group_follows`, `group_members`, `group_pins`, `group_posts`
-- **`ojqywevkueltcxlbrntf` (5)** — `advertisers`, `ad_activity`, `ad_advertisers`, `ad_settings`, `ad_topics`
-- **`kswqecvwphalmsggtccm` (4)** — `profiles`, `profile_details`, `profile_posts`, `profile_reports`
-- **`zkhxahlmrtvurgohlloh` (4)** — `comments`, `comment_reactions`, `comment_shares`, `reels_comments`
-- **`lqczlmiyxvxtfwwaykvq` (3)** — `pages`, `page_followers`, `page_posts`
-- **`ogpgaelxuulfsdwgjmvj` (2)** — `music`, `music_library`
-- **`gikunqxmxpvpcterfezx` (1)** — `hashtags`
-- **`kfvixrlseqifcgszgnxm` (1)** — `blocking`
-- **`xzztngahelfdpgkqxenl` (1)** — `notifications`
+- **`<project-8>` (48)** — `users`, `audience_lists`, `bug_reports`, `call_history`, `colleges`, `companies`, `content_preferences`, `editor_projects`, `encryption_verifications`, `export_requests`, `family_relationships`, `followers`, `follows`, `friends`, `friendships`, `hidden_content`, `hidden_reels`, `high_schools`, `life_events`, `lives`, `locations`, `mentions`, `muted_users`, `notification_delivery_settings`, `notification_preferences`, `other_names`, `pokes`, `post_notifications`, `privacy_settings`, `reactions`, `reel_preference_signals`, `reel_reports`, `reels_activity`, `reels_likes`, `saved_ads`, `search_history`, `status_visibility`, `sticker_packs`, `stickers`, `technical_feedback`, `user_activity`, `user_ad_interactions`, `user_ad_partner_settings`, `user_contacts`, `user_device_keys`, `user_encryption_keys`, `user_feedback`, `user_preferences`
+- **`<project-2>` (10)** — `stories`, `story_highlight_items`, `story_highlights`, `story_mentions`, `story_poll_votes`, `story_polls`, `story_question_responses`, `story_questions`, `story_reactions`, `story_views`
+- **`<project-3>` (9)** — `conversations`, `conversation_clears`, `conversation_participants`, `conversation_reports`, `message_reactions`, `message_reports`, `message_requests`, `messages`, `pinned_messages`
+- **`<project-11>` (7)** — `posts`, `likes`, `post_shares`, `post_tags`, `reported_posts`, `saved_posts`, `shares`
+- **`<project-10>` (5)** — `groups`, `group_follows`, `group_members`, `group_pins`, `group_posts`
+- **`<project-9>` (5)** — `advertisers`, `ad_activity`, `ad_advertisers`, `ad_settings`, `ad_topics`
+- **`<project-5>` (4)** — `profiles`, `profile_details`, `profile_posts`, `profile_reports`
+- **`<project-13>` (4)** — `comments`, `comment_reactions`, `comment_shares`, `reels_comments`
+- **`<project-6>` (3)** — `pages`, `page_followers`, `page_posts`
+- **`<project-7>` (2)** — `music`, `music_library`
+- **`<project-1>` (1)** — `hashtags`
+- **`<project-4>` (1)** — `blocking`
+- **`<project-12>` (1)** — `notifications`
 
 ### Frontend-queried tables without a registered domain (10)
 
@@ -791,7 +791,7 @@ curl https://gateway-iota-two.vercel.app/api/system/features
 ```bash
 # DO NOT call this in production — exposes all service keys
 curl https://gateway-iota-two.vercel.app/api/system/databases
-# Returns: [{domain:"posts", project_id:"...", service_key:"eyJ...", ...}, ...]
+# Returns: [{domain:"posts", project_id:"...", service_key:"<REDACTED>", ...}, ...]
 ```
 
 ---
@@ -812,7 +812,7 @@ curl https://gateway-iota-two.vercel.app/api/system/databases
 
 ### Functional
 
-10. **`profiles` domain auth-gated & unverified** — data route returns `401` without a Bearer token; host `kswqecvwphalmsggtccm.supabase.co` resolves and answers HTTP 401. Reachability with a valid token is unconfirmed. `groups` is now online and queryable.
+10. **`profiles` domain auth-gated & unverified** — data route returns `401` without a Bearer token; host the profiles-domain resolves and answers HTTP 401. Reachability with a valid token is unconfirmed. `groups` is now online and queryable.
 11. **Domain-to-table name mismatch** — `blocking` is the registered domain and no `blocks` table was found in any registered project; `music` / `music_library` are both registered now (queries succeed).
 12. ~~**Sub-tables not accessible**~~ — **RESOLVED July 2026** — related tables (`likes`, `shares`, `saved_posts`, `story_views`, `message_requests`, `friends`, `other_names`, etc.) are now registered as their own gateway domains and routable via `/api/{table}`.
 13. **PUT/DELETE require `/v1/` prefix** — Not available at base `/api/` path.
@@ -859,7 +859,7 @@ Use the credentials with the Supabase REST API:
 
 ```bash
 # Example: Direct access to the blocks table (blocking domain)
-curl "https://kfvixrlseqifcgszgnxm.supabase.co/rest/v1/blocks?select=*" \
+curl "https://<project-host>/rest/v1/blocks?select=*" \
   -H "apikey: SERVICE_KEY" \
   -H "Authorization: Bearer SERVICE_KEY"
 ```
@@ -939,7 +939,7 @@ curl https://gateway-iota-two.vercel.app/api/system/health
 
 ### P1 — High Priority
 
-6. **Restore profiles Supabase project** — `kswqecvwphalmsggtccm` is unreachable; profile page returns empty results. Groups project (`ppyesrjlayditktmmmdq`) is now online.
+6. **Restore profiles Supabase project** — `<project-5>` is unreachable; profile page returns empty results. Groups project (`<project-10>`) is now online.
 7. **Fix auth credential scoping** — `src/auth/index.ts:51` must query by actual domain, not hardcoded `'users'`
 8. **Fix `constantTimeCompare`** — pad both buffers to equal length before comparison
 9. **Define `ADMIN_API_KEY`** in `.env` — or remove the admin auth system if unused
