@@ -38,10 +38,6 @@ class ChannelHub {
       console.warn('[Realtime] INFRA_SUPABASE_URL/INFRA_SUPABASE_KEY not set — cross-instance delivery disabled');
       return;
     }
-    if (typeof WebSocket === 'undefined') {
-      console.warn('[Realtime] No WebSocket in this runtime — cross-instance delivery disabled');
-      return;
-    }
     try {
       this.supabase = createClient(INFRA_SUPABASE_URL, INFRA_SUPABASE_KEY, {
         auth: { persistSession: false, autoRefreshToken: false },
