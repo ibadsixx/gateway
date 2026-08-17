@@ -74,6 +74,7 @@ class ChannelHub {
   publish(channel: string, event: string, payload: unknown, excludeConnId?: string): number {
     let delivered = 0;
     const subs = this.channels.get(channel);
+    const subCount = subs ? subs.size : 0;
     if (subs) {
       const data = JSON.stringify({ event, payload });
       for (const [connId, sub] of subs) {
@@ -82,6 +83,7 @@ class ChannelHub {
       }
     }
     const hasBus = !!(this.supabase && this.bus);
+    console.log(`[Realtime] publish ${event}→${channel}: ${delivered}/${subCount} local delivered, bus=${hasBus ? 'active' : 'inactive'}`);
     this.relay(channel, event, payload);
     if (!hasBus && delivered === 0) {
       console.warn(`[Realtime] publish ${event}→${channel}: 0 local subscribers, no bus — message lost`);

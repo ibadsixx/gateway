@@ -36,13 +36,31 @@ function isCallChannel(channel: string): boolean {
   return CHANNEL_RE.test(channel);
 }
 
+// Debug endpoint — returns current hub state
+realtimeRouter.get('/debug', (req: Request, res: Response) => {
+  const debug: Record<string, unknown> = {};
+  const channels = (channelHub as any).channels as Map<string, Map<string, unknown>> | undefined;
+  if (channels) {
+    const channelState: Record<string, number> = {};
+    for (const [ch, subs] of channels) {
+      channelState[ch] = subs.size;
+    }
+    debug.subscribers = channelState;
+  }
+  debug.hasBus = !!(channelHub as any).bus;
+  debug.hasSupabase = !!(channelHub as any).supabase;
+  res.json(debug);
+});
+
 realtimeRouter.get('/subscribe/:channel', auth.authenticate.bind(auth), (req: Request, res: Response) => {
   const channel = req.params.channel || '';
+  console.log(`[Realtime] SUBSCRIBE request: channel=${channel} user=${req.user?.id}`);
   if (!channel) {
     res.status(400).json({ error: 'Channel is required' });
     return;
   }
   if (!isCallChannel(channel)) {
+    console.warn(`[Realtime] SUBSCRIBE rejected: invalid channel format: ${channel}`);
     res.status(400).json({ error: 'Invalid channel format' });
     return;
   }
@@ -51,6 +69,7 @@ realtimeRouter.get('/subscribe/:channel', auth.authenticate.bind(auth), (req: Re
   // Otherwise any authenticated client could read (and spoof) another user's
   // call signaling by subscribing to calls:<theirId>.
   if (channel !== `calls:${req.user?.id}`) {
+    console.warn(`[Realtime] SUBSCRIBE rejected: channel ${channel} does not match user ${req.user?.id}`);
     res.status(403).json({ error: 'You may only subscribe to your own channel' });
     return;
   }
@@ -64,6 +83,7 @@ realtimeRouter.get('/subscribe/:channel', auth.authenticate.bind(auth), (req: Re
   res.flushHeaders?.();
 
   const connId = channelHub.subscribe(channel, res);
+  console.log(`[Realtime] SUBSCRIBE OK: channel=${channel} connId=${connId} user=${req.user?.id}`);
   res.write(`event: init\ndata: ${JSON.stringify({ connId })}\n\n`);
 
   const heartbeat = setInterval(() => {
@@ -78,16 +98,21 @@ realtimeRouter.get('/subscribe/:channel', auth.authenticate.bind(auth), (req: Re
   req.on('close', () => {
     clearInterval(heartbeat);
     channelHub.unsubscribe(channel, connId);
+    console.log(`[Realtime] SUBSCRIBE closed: channel=${channel} connId=${connId}`);
   });
 });
 
 realtimeRouter.post('/publish', auth.authenticate.bind(auth), (req: Request, res: Response) => {
   const { channel, event, payload, excludeConnId } = req.body || {};
+  console.log(`[Realtime] PUBLISH request: channel=${channel} event=${event} user=${req.user?.id} exclude=${excludeConnId || 'none'}`);
+  console.log(`[Realtime] PUBLISH body keys: ${Object.keys(req.body || {}).join(', ')} body type: ${typeof req.body}`);
   if (typeof channel !== 'string' || !channel || !isCallChannel(channel)) {
+    console.warn(`[Realtime] PUBLISH rejected: invalid channel: "${channel}"`);
     res.status(400).json({ error: 'channel must be a valid calls channel' });
     return;
   }
   if (typeof event !== 'string' || !event) {
+    console.warn(`[Realtime] PUBLISH rejected: invalid event: "${event}"`);
     res.status(400).json({ error: 'event is required' });
     return;
   }
@@ -97,6 +122,7 @@ realtimeRouter.post('/publish', auth.authenticate.bind(auth), (req: Request, res
     payload,
     typeof excludeConnId === 'string' ? excludeConnId : undefined
   );
+  console.log(`[Realtime] PUBLISH result: channel=${channel} event=${event} delivered=${delivered}`);
   res.status(200).json({ ok: true, delivered });
 });
 

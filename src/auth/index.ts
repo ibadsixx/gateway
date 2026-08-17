@@ -86,6 +86,7 @@ class AuthService {
   async authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
     const authHeader = req.headers.authorization;
     if (!authHeader?.startsWith('Bearer ')) {
+      console.warn(`[Auth] Missing Bearer token for ${req.method} ${req.originalUrl}`);
       res.status(401).json({ error: 'Missing authorization header' });
       return;
     }
@@ -94,12 +95,14 @@ class AuthService {
     try {
       const user = await this.verifyToken(token);
       if (!user) {
+        console.warn(`[Auth] Invalid token for ${req.method} ${req.originalUrl}`);
         res.status(401).json({ error: 'Invalid or expired token' });
         return;
       }
       req.user = user;
       next();
     } catch (error) {
+      console.error(`[Auth] Auth error for ${req.method} ${req.originalUrl}:`, (error as Error).message);
       res.status(401).json({ error: 'Invalid or expired token' });
     }
   }
