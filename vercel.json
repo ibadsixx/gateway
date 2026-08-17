@@ -1,4 +1,11 @@
 {
+  "buildCommand": "npm run build",
+  "installCommand": "npm install",
+  "functions": {
+    "api/[...slug].ts": {
+      "maxDuration": 300
+    }
+  },
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/[...slug]" }
   ]

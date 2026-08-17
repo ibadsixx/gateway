@@ -5,3 +5,4 @@ api/*.d.ts
 api/*.d.ts.map
 api/*.js.map
 .env
+node_modules/.package-lock.json
