@@ -19,6 +19,8 @@ interface InfrastructureDbConfig {
   forceFallback?: boolean;
 }
 
+const INFRA_QUERY_API_TEMPLATE = process.env.INFRA_QUERY_API_TEMPLATE;
+
 class InfrastructureDatabase {
   private client: SupabaseClient | null = null;
   private fallback = true;
@@ -193,21 +195,26 @@ class InfrastructureDatabase {
 
   async collectUsageMetrics(): Promise<void> {
     if (this.fallback) return;
+    if (!INFRA_QUERY_API_TEMPLATE) {
+      console.warn('[InfrastructureDB] INFRA_QUERY_API_TEMPLATE not set — usage metrics collection disabled');
+      return;
+    }
     const { data, error } = await this.client!.from('infrastructure_projects')
       .select('id, project_key, domain, project_url, management_pat')
       .not('management_pat', 'is', null)
-      .like('project_url', 'https://%.supabase.co');
+      .not('project_url', 'is', null);
     if (error) {
       console.error('[InfrastructureDB] Failed to fetch projects for metrics:', error.message);
       return;
     }
     const projects = (data as InfrastructureProjectRow[]) || [];
     for (const project of projects) {
-      const match = project.project_url?.match(/https:\/\/(.+)\.supabase\.co/);
-      if (!match || !project.management_pat) continue;
-      const projectRef = match[1];
+      const refMatch = /^https:\/\/([^./]+)\./.exec(project.project_url ?? '');
+      if (!refMatch || !project.management_pat) continue;
+      const projectRef = refMatch[1];
       try {
-        const res = await fetch(`https://api.supabase.com/v1/projects/${projectRef}/database/query`, {
+        const endpoint = INFRA_QUERY_API_TEMPLATE.replace('{ref}', encodeURIComponent(projectRef));
+        const res = await fetch(endpoint, {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${project.management_pat}`,
