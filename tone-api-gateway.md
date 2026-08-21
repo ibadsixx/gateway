@@ -29,6 +29,7 @@ The API Gateway is the single entry point for all Tone ecosystem databases. Each
   - [hashtags](#hashtags)
   - [advertisers](#advertisers)
 - [System Endpoints](#system-endpoints)
+- [Realtime Endpoints (SSE)](#realtime-endpoints-sse)
 - [Bugs](#bugs)
 - [Known Limitations](#known-limitations)
 - [Direct Database Access (Deprecated)](#direct-database-access-deprecated)
@@ -205,6 +206,7 @@ All state is held in memory and lost on Vercel cold starts:
 | 12 | ~~**Gateway client join cardinality inverted**~~ | `src/lib/gateway.ts:183-227` | ~~To-one embedded joins (`!fk`, `:alias` on an `_id`/FK column) resolved as arrays — `post.profiles` was an array, so `profiles?.display_name` was `undefined` ("Unknown" author names in the feed).~~ | **FIXED** — `JoinSpec` now carries `kind: 'one' | 'many'` (line 189); `effectiveIsArray = kind === 'many'` (line 508) |
 | 13 | ~~**Gateway client dropped the join key during column selection**~~ | `src/lib/gateway.ts:514-522` | ~~The picker kept only requested columns and stripped the `relatedCol` key column used for matching — zero rows ever matched, so the join silently produced nothing even with correct cardinality.~~ | **FIXED** — column picker always retains `spec.relatedCol` (line 516) |
 | 14 | ~~**Gateway client `not.` operator serialized incorrectly**~~ | `src/lib/gateway.ts` | ~~`not()` emitted `{col}=not.{op}.{value}`, which parsed to the wrong column/operator and silently matched nothing.~~ | **FIXED (Aug 2, 2026)** — both builders emit PostgREST-correct `not.{col}={op}.{value}`; `is` now handles `null`/`true`/`false`; count joins return `[{ count }]`; bulk `.update()` without an `id=eq.` filter falls back to fetch → client-side filter → per-id `PUT /api/v1/:domain/:id` (`_bulkUpdate`) |
+| 15 | ~~**Call signaling client left peers permanently "busy"**~~ | `tone-your-social-voice/src/contexts/call/CallContext.tsx`, `callTabCoordinator.ts` | ~~Three holes: a crashed tab never cleaned up the cross-tab localStorage counter, so every incoming call auto-replied busy **forever (survived reloads)**; `call-ended` published during the callee's SSE reconnect window was lost with no replay (the 300s Vercel cap guarantees this window on every call >5 min); nothing verified the local call was alive before replying busy and no callee ring timeout existed.~~ | **FIXED (Aug 21, 2026, frontend `b5c54ff`)** — counter entries heartbeat every 15s and self-clear when stale >75s (legacy values heal on load); incoming calls are accepted instead of auto-busy when the own peer connection is `failed`/`closed`; watchdog ends zombie `'connected'` calls; 45s ring timeout; `call-ended` retries twice on `delivered=0` to bridge reconnect gaps |
 
 ---
 
@@ -780,6 +782,10 @@ Like all gateway state, the hub is process-local — signaling only fans out to 
 **Authorization:** `subscribe` only accepts a channel owned by the caller — you may only subscribe to `calls:<yourUserId>` (any other channel returns `403`), so no client can read or spoof another user's signaling. `publish` accepts any valid `calls:<userId>` channel (that's how a call is initiated) and returns `{ok, delivered}` so the caller can detect a callee with no active connection. (Added in `67ce1bd`.)
 
 > **Production caveat (Vercel):** the hub is single-process, so two users landing on different Vercel function instances never see each other's signaling, and Hobby-plan functions cap at a 300s duration — the SSE stream is killed mid-call for any call longer than 5 minutes (504 `FUNCTION_INVOCATION_TIMEOUT`). **This gateway's SSE signaling is therefore intended for local development** (`npm run dev`, single long-lived process) and best-effort in production. Production-grade signaling would need a shared pub/sub (e.g. Redis) or a dedicated long-lived relay host; WebRTC media itself remains peer-to-peer and is unaffected by these limits once the call is established.
+>
+> **Client-side mitigation (Aug 21, 2026, frontend `b5c54ff`):** because the 300s cap guarantees a reconnect window on every call longer than ~5 minutes, the frontend no longer trusts single-shot delivery for call teardown: `call-ended` publishes retry twice when the gateway reports `delivered=0`, incoming calls are accepted instead of auto-replied busy when the callee's own peer connection is `failed`/`closed`/missing, a watchdog ends zombie `'connected'` calls, unanswered rings time out after 45s, and the cross-tab active-call counter heartbeats (15s) with stale entries (>75s) self-clearing — so a lost signal or crashed tab can no longer leave a user permanently "busy".
+>
+> **Call chat-log messages (Aug 21, 2026, frontend `2042cfb`):** every terminal call path (ended / missed / declined / disconnected) now also writes one system message into the shared DM via the regular `messages` table — plaintext JSON envelope (`{"__call":{status,callType,duration}}`) in `content` with `is_system: true`, written by the caller only (same single-writer rule as `call_history`; no schema change, no new gateway route). Rendering/parsing lives in frontend `src/lib/callLog.ts`; busy dials are intentionally not logged.
 
 ```bash
 # Subscribe (Bearer token required, keep the connection open)
@@ -1011,9 +1017,9 @@ curl https://gateway-iota-two.vercel.app/api/system/health
 | Critical security issues | 4 | 2 |
 | High-severity issues | 5 | 0 |
 | Medium-severity issues | 3 | 0 |
-| Low-severity issues | 14 | 5 |
-| **Total issues** | **26** | **7** |
+| Low-severity issues | 15 | 6 |
+| **Total issues** | **27** | **8** |
 
-*Accounting (Aug 2026):* Critical = Security Audit #1–#4 (2 fixed: hardcoded keys, `/api/system/databases` removed). High = Audit #5–#9. Medium = Audit #10–#12. Low = Bugs #1–#14 (5 fixed: gateway-client #10–#14). Total = 26, fixed = 7, open = 19.
+*Accounting (Aug 2026):* Critical = Security Audit #1–#4 (2 fixed: hardcoded keys, `/api/system/databases` removed). High = Audit #5–#9. Medium = Audit #10–#12. Low = Bugs #1–#15 (6 fixed: gateway/signaling-client #10–#15). Total = 27, fixed = 8, open = 19.
 
 The gateway has a well-structured 29-module architecture with clean separation of concerns, a correct circuit breaker pattern, and a retry engine with exponential backoff. However, it is in **prototype state**: system endpoints are now admin-gated and `/api/system/databases` was removed, but `ADMIN_API_KEY` is undefined so admin endpoints always return 503; state is held in memory and resets on Vercel cold starts; and there is zero test coverage. The code works for demo purposes but is **not production-ready** without addressing the remaining security and reliability issues above. Gateway-**client** fixes: a July 2026 debugging session fixed join cardinality inversion and the dropped join-key column (Bugs #12, #13), and a July 2026 config-only session registered ~80 missing table-as-domain entries in the live infra DB (98/105 frontend-queried tables routable; 3 of the original 108 are storage buckets — activates on next cold start), resolving the "Failed to load friends"/"Failed to load other names" 404 toasts without any gateway source changes. An Aug 2, 2026 client session fixed the `not.` operator serialization and added `is`/count-join support plus a bulk-update fallback (Bug #14). Two Aug 4, 2026 changes follow up on those sessions: the gateway now re-enables feature flags for newly registered domains on the periodic `refreshRegistry` cycle (`e3ee66d`), removing the cold-start wait; and the frontend replaced the broken cross-project chat RPCs with per-domain gateway table queries in `src/api/conversations.ts` (`c57b6f2`, see the conversations schema note above).
