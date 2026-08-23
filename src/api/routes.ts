@@ -17,8 +17,23 @@ import { notificationQueue } from '../notifications';
 import { searchService } from '../search';
 import { projectManager } from '../project-manager';
 import { auth, AuthCredentials } from '../auth';
+import { keepAlive } from '../keep-alive';
+import { infrastructureDb } from '../infrastructure/database/infrastructureDb';
 import { authRouter } from './auth';
 import { realtimeRouter } from './realtime';
+
+function requireKeepAliveToken(req: Request, res: Response, next: () => void): void {
+  const expected = process.env.KEEP_ALIVE_TOKEN || process.env.CRON_SECRET;
+  if (!expected) {
+    next();
+    return;
+  }
+  if (req.headers.authorization === `Bearer ${expected}`) {
+    next();
+    return;
+  }
+  res.status(401).json({ error: 'Unauthorized' });
+}
 
 function applySupabaseFilters(query: any, filters: string | string[] | undefined): any {
   if (!filters) return query;
@@ -441,6 +456,35 @@ router.post('/storage/:bucket/*', auth.authenticate.bind(auth), async (req: Requ
   } catch (error) {
     console.error('[Gateway] Storage upload failed:', (error as Error).message);
     res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+router.get('/keep-alive', async (_req: Request, res: Response) => {
+  try {
+    res.json(await keepAlive.getStatus());
+  } catch (error) {
+    console.error('[KeepAlive] Status failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to collect keep-alive status' });
+  }
+});
+
+router.get('/keep-alive/history/:projectKey', async (req: Request, res: Response) => {
+  try {
+    const limit = Math.min(parseInt(String(req.query.limit ?? '20'), 10) || 20, 100);
+    const logs = await infrastructureDb.getHealthLogs('database', req.params.projectKey, limit);
+    res.json(logs);
+  } catch (error) {
+    console.error('[KeepAlive] History failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to load keep-alive history' });
+  }
+});
+
+router.post('/keep-alive/run', requireKeepAliveToken, async (_req: Request, res: Response) => {
+  try {
+    res.json(await keepAlive.runOnce());
+  } catch (error) {
+    console.error('[KeepAlive] Run failed:', (error as Error).message);
+    res.status(500).json({ error: 'Keep-alive round failed' });
   }
 });
 

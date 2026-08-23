@@ -4,6 +4,7 @@ import { createHmac, timingSafeEqual } from 'crypto';
 
 const INFRA_SUPABASE_URL = process.env.INFRA_SUPABASE_URL;
 const INFRA_SUPABASE_KEY = process.env.INFRA_SUPABASE_KEY;
+const AUTH_DOMAIN = process.env.AUTH_DOMAIN || 'users';
 
 export interface AuthUser {
   id: string;
@@ -30,7 +31,7 @@ declare global {
 const credentialCache = new Map<string, { credentials: AuthCredentials; timestamp: number }>();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
-async function getAuthCredentials(domain: string = 'users'): Promise<AuthCredentials | null> {
+async function getAuthCredentials(domain: string = AUTH_DOMAIN): Promise<AuthCredentials | null> {
   const cached = credentialCache.get(domain);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
     return cached.credentials;
@@ -76,10 +77,12 @@ async function getAuthCredentials(domain: string = 'users'): Promise<AuthCredent
 }
 
 function constantTimeCompare(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);
-  return timingSafeEqual(bufA, bufB);
+  const len = Math.max(bufA.length, bufB.length, 1);
+  const paddedA = Buffer.concat([bufA, Buffer.alloc(len - bufA.length)]);
+  const paddedB = Buffer.concat([bufB, Buffer.alloc(len - bufB.length)]);
+  return timingSafeEqual(paddedA, paddedB) && bufA.length === bufB.length;
 }
 
 class AuthService {
@@ -109,7 +112,7 @@ class AuthService {
 
   async verifyToken(token: string): Promise<AuthUser | null> {
     try {
-      const credentials = await getAuthCredentials();
+      const credentials = await getAuthCredentials(AUTH_DOMAIN);
       if (!credentials) {
         console.error('[Auth] No credentials available for JWT verification');
         return null;
@@ -158,9 +161,9 @@ class AuthService {
     }
   }
 
-  private async verifyViaSupabase(token: string): Promise<AuthUser | null> {
+  private async verifyViaSupabase(token: string, domain: string = AUTH_DOMAIN): Promise<AuthUser | null> {
     try {
-      const supabase = await this.getSupabaseClient();
+      const supabase = await this.getSupabaseClient(domain);
       if (!supabase) {
         console.error('[Auth] No Supabase client available for getUser() fallback');
         return null;
@@ -190,19 +193,19 @@ class AuthService {
     return authHeader.split(' ')[1];
   }
 
-  async getProjectCredentials(domain: string = 'users'): Promise<AuthCredentials | null> {
+  async getProjectCredentials(domain: string = AUTH_DOMAIN): Promise<AuthCredentials | null> {
     return getAuthCredentials(domain);
   }
 
-  async getSupabaseClient(): Promise<ReturnType<typeof createClient> | null> {
-    const credentials = await getAuthCredentials();
+  async getSupabaseClient(domain: string = AUTH_DOMAIN): Promise<ReturnType<typeof createClient> | null> {
+    const credentials = await getAuthCredentials(domain);
     if (!credentials) return null;
 
     return createClient(credentials.project_url, credentials.service_key);
   }
 
-  async getAnonClient(): Promise<ReturnType<typeof createClient> | null> {
-    const credentials = await getAuthCredentials();
+  async getAnonClient(domain: string = AUTH_DOMAIN): Promise<ReturnType<typeof createClient> | null> {
+    const credentials = await getAuthCredentials(domain);
     if (!credentials) return null;
 
     return createClient(credentials.project_url, credentials.anon_key);

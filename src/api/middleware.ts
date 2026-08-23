@@ -29,7 +29,8 @@ export function middleware(app: Express): void {
     res.setHeader('X-API-Version', 'v1');
 
     const key = req.ip || 'unknown';
-    const endpoint = `${req.method} ${req.path}`;
+    const routePath = req.path.replace(/^\/api\b/, '') || '/';
+    const endpoint = `${req.method} ${routePath}`;
     if (!rateLimiter.check(endpoint, key)) {
       metricsService.increment('rate_limit.exceeded', { endpoint });
       res.status(429).json({ error: 'Too many requests' });

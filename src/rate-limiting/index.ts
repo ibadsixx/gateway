@@ -11,8 +11,12 @@ class RateLimiter {
     this.configs.set(endpoint, config);
   }
 
+  private resolveConfig(endpoint: string): RateLimitConfig | undefined {
+    return this.configs.get(endpoint) ?? this.configs.get('*');
+  }
+
   check(endpoint: string, key: string): boolean {
-    const config = this.configs.get(endpoint);
+    const config = this.resolveConfig(endpoint);
     if (!config) return true;
 
     const bucketKey = `${endpoint}:${key}`;
@@ -29,7 +33,7 @@ class RateLimiter {
   }
 
   getRemaining(endpoint: string, key: string): number {
-    const config = this.configs.get(endpoint);
+    const config = this.resolveConfig(endpoint);
     if (!config) return Infinity;
     const bucket = this.buckets.get(`${endpoint}:${key}`);
     if (!bucket) return config.maxRequests;

@@ -43,20 +43,23 @@ class Router {
   }
 
   private async getProjectConnection(domain: string, project: DatabaseProject): Promise<string> {
-    const cb = this.getOrCreateCircuitBreaker(project.id);
+    let currentId = project.id;
+    const attempted = new Set<string>([currentId]);
 
     return RetryEngine.execute(async () => {
-      return cb.call(async () => {
-        await databaseRegistry.updateHealth(project.id, Math.random() * 100, project.usedSpace);
-        return project.id;
+      const breaker = this.getOrCreateCircuitBreaker(currentId);
+      return breaker.call(async () => {
+        await databaseRegistry.updateHealth(currentId, Math.random() * 100, project.usedSpace);
+        return currentId;
       });
     }, {
       maxRetries: 2,
-      onRetry: async (_attempt, _error) => {
+      onRetry: async () => {
         const active = await databaseRegistry.getActiveProjects(domain);
-        const next = active.find(p => p.id !== project.id);
+        const next = active.find(p => !attempted.has(p.id));
         if (next) {
-          project.id = next.id;
+          attempted.add(next.id);
+          currentId = next.id;
         }
       },
     });

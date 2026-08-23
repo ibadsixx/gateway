@@ -9,6 +9,7 @@ import { permissionEngine } from './permissions';
 import { infrastructureDb } from './infrastructure/database/infrastructureDb';
 import { jobQueue } from './jobs/queue';
 import { projectManager } from './project-manager';
+import { keepAlive } from './keep-alive';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -67,6 +68,11 @@ async function initializeDefaults(): Promise<void> {
   });
 
   monitoring.start();
+
+  keepAlive.start();
+  keepAlive.runOnce().catch(err =>
+    console.error('[KeepAlive] Initial probe round failed:', (err as Error).message),
+  );
 
   setInterval(() => {
     projectManager.refreshRegistry()

@@ -6,6 +6,9 @@
       "maxDuration": 300
     }
   },
+  "crons": [
+    { "path": "/api/keep-alive/run", "schedule": "0 3 * * *" }
+  ],
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/[...slug]" }
   ]
