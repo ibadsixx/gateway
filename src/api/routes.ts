@@ -17,12 +17,12 @@ import { notificationQueue } from '../notifications';
 import { searchService } from '../search';
 import { projectManager } from '../project-manager';
 import { auth, AuthCredentials } from '../auth';
-import { keepAlive } from '../keep-alive';
+import { projectHealth } from '../project-health';
 import { infrastructureDb } from '../infrastructure/database/infrastructureDb';
 import { authRouter } from './auth';
 import { realtimeRouter } from './realtime';
 
-function requireKeepAliveToken(req: Request, res: Response, next: () => void): void {
+function requireProbeToken(req: Request, res: Response, next: () => void): void {
   const expected = process.env.KEEP_ALIVE_TOKEN || process.env.CRON_SECRET;
   if (!expected) {
     next();
@@ -459,34 +459,50 @@ router.post('/storage/:bucket/*', auth.authenticate.bind(auth), async (req: Requ
   }
 });
 
-router.get('/keep-alive', async (_req: Request, res: Response) => {
+// Project Health service — canonical mount plus the deprecated `/keep-alive` alias.
+const projectHealthRouter = Router();
+
+projectHealthRouter.get('/', async (_req: Request, res: Response) => {
   try {
-    res.json(await keepAlive.getStatus());
+    res.json(await projectHealth.getStatus());
   } catch (error) {
-    console.error('[KeepAlive] Status failed:', (error as Error).message);
-    res.status(500).json({ error: 'Failed to collect keep-alive status' });
+    console.error('[ProjectHealth] Status failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to collect project health status' });
   }
 });
 
-router.get('/keep-alive/history/:projectKey', async (req: Request, res: Response) => {
+projectHealthRouter.get('/history/:projectKey', async (req: Request, res: Response) => {
   try {
     const limit = Math.min(parseInt(String(req.query.limit ?? '20'), 10) || 20, 100);
     const logs = await infrastructureDb.getHealthLogs('database', req.params.projectKey, limit);
     res.json(logs);
   } catch (error) {
-    console.error('[KeepAlive] History failed:', (error as Error).message);
-    res.status(500).json({ error: 'Failed to load keep-alive history' });
+    console.error('[ProjectHealth] History failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to load project health history' });
   }
 });
 
-router.post('/keep-alive/run', requireKeepAliveToken, async (_req: Request, res: Response) => {
+// Vercel Cron sends GET; manual operators use POST. Default action is a
+// scheduler tick (probes only projects whose slot is due); `?force=1` runs a
+// full immediate round over every active project.
+const runHandler = async (req: Request, res: Response) => {
   try {
-    res.json(await keepAlive.runOnce());
+    const force = String(req.query.force ?? '') === '1' || 'true';
+    const result = force ? await projectHealth.runAll() : await projectHealth.tick();
+    res.json(result);
   } catch (error) {
-    console.error('[KeepAlive] Run failed:', (error as Error).message);
-    res.status(500).json({ error: 'Keep-alive round failed' });
+    console.error('[ProjectHealth] Run failed:', (error as Error).message);
+    res.status(500).json({ error: 'Project health round failed' });
   }
-});
+};
+
+projectHealthRouter.post('/run', requireProbeToken, runHandler);
+projectHealthRouter.get('/run', requireProbeToken, runHandler);
+
+// Registered before the top-level /:domain wildcards so they are never shadowed.
+router.use('/project-health', projectHealthRouter);
+/** @deprecated legacy alias — use /api/project-health instead. */
+router.use('/keep-alive', projectHealthRouter);
 
 router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain } = req.params;

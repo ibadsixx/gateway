@@ -3,6 +3,7 @@ import cors from 'cors';
 import { rateLimiter } from '../rate-limiting';
 import { auditLogger } from '../audit';
 import { metricsService } from '../metrics';
+import { keepAliveScheduler } from '../project-health';
 
 const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',')
@@ -38,6 +39,9 @@ export function middleware(app: Express): void {
     }
 
     const start = Date.now();
+    // Opportunistic keep-alive driver: on live traffic, fire-and-forget a
+    // scheduler tick (self-throttled internally, never awaited, never throws).
+    keepAliveScheduler.maybeTick();
     const originalEnd = res.end.bind(res);
     res.end = function (...args: Parameters<Response['end']>) {
       const duration = Date.now() - start;

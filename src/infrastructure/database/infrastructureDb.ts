@@ -5,6 +5,7 @@ import type {
   DomainRow,
   GatewaySettingRow,
   HealthLogRow,
+  KeepAliveStateRow,
   ProviderRow,
   ProjectStatus,
   StorageAccountStatus,
@@ -31,6 +32,8 @@ class InfrastructureDatabase {
   private fallbackSettings: Map<string, GatewaySettingRow> = new Map();
   private fallbackHealthLogs: HealthLogRow[] = [];
   private fallbackProviders: ProviderRow[] = [];
+  private fallbackKeepAlive = new Map<string, KeepAliveStateRow>();
+  private keepAliveStoreWarned = false;
   private initialized = false;
 
   async initialize(config?: InfrastructureDbConfig): Promise<void> {
@@ -179,6 +182,7 @@ class InfrastructureDatabase {
       response_time: responseTime,
       used_space: usedSpace,
       last_health_check: new Date().toISOString(),
+      health_status: 'online',
     };
     if (this.fallback) {
       const project = this.fallbackProjects.find(p => p.id === id);
@@ -186,11 +190,23 @@ class InfrastructureDatabase {
         project.response_time = responseTime;
         project.used_space = usedSpace;
         project.last_health_check = update.last_health_check!;
+        project.health_status = 'online';
       }
       return;
     }
     const { error } = await this.client!.from('infrastructure_projects').update(update).eq('id', id);
     if (error) throw new Error(`Failed to update project health: ${error.message}`);
+  }
+
+  async updateProjectHealthStatus(id: string, status: HealthStatus): Promise<void> {
+    const update = { health_status: status, updated_at: new Date().toISOString() };
+    if (this.fallback) {
+      const project = this.fallbackProjects.find(p => p.id === id);
+      if (project) project.health_status = status;
+      return;
+    }
+    const { error } = await this.client!.from('infrastructure_projects').update(update).eq('id', id);
+    if (error) throw new Error(`Failed to update project health status: ${error.message}`);
   }
 
   async collectUsageMetrics(): Promise<void> {
@@ -469,6 +485,74 @@ class InfrastructureDatabase {
     const { data, error } = await query;
     if (error) throw new Error(`Failed to fetch health logs: ${error.message}`);
     return (data as HealthLogRow[]) || [];
+  }
+
+  // ---- Keep-Alive Scheduler State (keep_alive_state) ----
+
+  /**
+   * All persisted per-project keep-alive schedules.
+   * Returns `null` when the store is unusable (table not migrated yet / unreachable)
+   * so callers can degrade to in-memory scheduling instead of failing.
+   */
+  async getKeepAliveStates(): Promise<KeepAliveStateRow[] | null> {
+    if (this.fallback) return [...this.fallbackKeepAlive.values()];
+    const { data, error } = await this.client!.from('keep_alive_state').select('*');
+    if (error) {
+      this.warnKeepAliveStore(error.message);
+      return null;
+    }
+    return (data as KeepAliveStateRow[]) || [];
+  }
+
+  /** Insert-or-update one project's schedule row. Failures are logged, never thrown. */
+  async upsertKeepAliveState(row: KeepAliveStateRow): Promise<void> {
+    if (this.fallback) {
+      this.fallbackKeepAlive.set(row.project_key, { ...row });
+      return;
+    }
+    const { error } = await this.client!.from('keep_alive_state').upsert(row, { onConflict: 'project_key' });
+    if (error) this.warnKeepAliveStore(error.message);
+  }
+
+  /**
+   * Atomically claim a due project's slot: advances `next_keepalive_at` only if
+   * it is still in the past, so concurrent instances cannot double-probe.
+   * Returns true when this caller won the claim.
+   */
+  async claimKeepAliveSlot(projectKey: string, dueBeforeIso: string, newNextIso: string): Promise<boolean> {
+    if (this.fallback || !this.client) {
+      const row = this.fallbackKeepAlive.get(projectKey);
+      if (!row || new Date(row.next_keepalive_at).getTime() >= Date.now()) return false;
+      row.next_keepalive_at = newNextIso;
+      row.updated_at = newNextIso;
+      return true;
+    }
+    const { data, error } = await this.client!
+      .from('keep_alive_state')
+      .update({ next_keepalive_at: newNextIso, updated_at: new Date().toISOString() })
+      .eq('project_key', projectKey)
+      .lt('next_keepalive_at', dueBeforeIso)
+      .select('project_key');
+    if (error) {
+      this.warnKeepAliveStore(error.message);
+      return false;
+    }
+    return Array.isArray(data) && data.length > 0;
+  }
+
+  /** Insert the initial schedule row for a newly registered project. */
+  async seedKeepAliveState(row: KeepAliveStateRow): Promise<void> {
+    return this.upsertKeepAliveState(row);
+  }
+
+  private warnKeepAliveStore(detail: string): void {
+    if (this.keepAliveStoreWarned) return;
+    this.keepAliveStoreWarned = true;
+    console.warn(
+      '[InfrastructureDB] keep_alive_state unavailable — keep-alive scheduling degrades to in-memory. ' +
+      'Apply src/db/migrations/003_create_keep_alive_state.sql to the infrastructure database.',
+      `Detail: ${detail}`,
+    );
   }
 
   // ---- Initialization Helpers ----

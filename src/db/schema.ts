@@ -83,3 +83,19 @@ export interface HealthLogRow {
   error_message: string | null;
   checked_at: string;
 }
+
+export type KeepAliveHealth = HealthStatus | 'unknown';
+
+export interface KeepAliveStateRow {
+  project_key: string;
+  project_name: string;
+  last_keepalive_at: string | null;
+  next_keepalive_at: string;
+  keepalive_count_24h: number;
+  count_window_start: string;
+  health_status: KeepAliveHealth;
+  consecutive_failures: number;
+  latency_ms: number | null;
+  last_error: string | null;
+  updated_at: string;
+}
