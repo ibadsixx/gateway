@@ -518,6 +518,38 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
   }
 });
 
+// Auth users live in the users project's `auth.users` schema, and there is no
+// public `users` table, so the generic /:domain read below would return [] for
+// "users". List them via the admin API instead and expose a stripped-down shape
+// (`raw_user_meta_data` mirrors GoTrue's user_metadata) consistent with other
+// domain rows the frontend reads.
+router.get('/users', auth.authenticate.bind(auth), async (_req, res) => {
+  try {
+    const supabase = await auth.getSupabaseClient();
+    if (!supabase) {
+      res.status(500).json({ error: 'Auth service not configured' });
+      return;
+    }
+    const { data, error } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+    res.json(
+      (data?.users || []).map((u) => ({
+        id: u.id,
+        email: u.email ?? null,
+        raw_user_meta_data: u.user_metadata ?? null,
+        created_at: u.created_at ?? null,
+        last_sign_in_at: u.last_sign_in_at ?? null,
+      }))
+    );
+  } catch (error) {
+    console.error('[Auth] List users error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 router.get('/:domain', auth.authenticate.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain } = req.params;
   if (!featureFlags.isEnabled(domain)) {
