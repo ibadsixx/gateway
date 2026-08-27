@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { auth, AuthUser } from '../auth';
 import { rateLimiter } from '../rate-limiting';
 import { mfaService, MfaFactor } from '../mfa';
+import { ensureUserProfile } from '../profile-helper';
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -60,6 +61,23 @@ authRouter.post('/sign-up', async (req: Request, res: Response) => {
     if (error) {
       res.status(400).json({ error: error.message });
       return;
+    }
+
+    // Create the profiles row immediately so new accounts start fully visible
+    // ("People you may know", profile pages, search). Registration should not
+    // fail because of a secondary-table write — log and let the frontend's
+    // ensureProfile / the backfill endpoint heal it if it ever does.
+    const newUser = data.user;
+    if (newUser?.id) {
+      try {
+        await ensureUserProfile({
+          id: newUser.id,
+          email: newUser.email,
+          user_metadata: (newUser.user_metadata || {}) as Record<string, unknown>,
+        });
+      } catch (profileErr) {
+        console.error('[Auth] Could not create profile at sign-up:', profileErr);
+      }
     }
 
     res.status(201).json({

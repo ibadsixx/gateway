@@ -21,6 +21,7 @@ import { projectHealth } from '../project-health';
 import { infrastructureDb } from '../infrastructure/database/infrastructureDb';
 import { authRouter } from './auth';
 import { realtimeRouter } from './realtime';
+import { ensureUserProfile } from '../profile-helper';
 
 function requireProbeToken(req: Request, res: Response, next: () => void): void {
   const expected = process.env.KEEP_ALIVE_TOKEN || process.env.CRON_SECRET;
@@ -279,6 +280,60 @@ system.get('/health', (_req, res) => {
 
 // All remaining system endpoints require admin authentication
 system.use(auth.authenticateAdmin.bind(auth));
+
+// One-off reconciliation: creates a `profiles` row for every auth user that
+// predates profile auto-creation (they previously only existed in auth.users).
+// Safe to re-run; skips accounts that already have a row.
+system.post('/backfill-profiles', async (_req, res) => {
+  try {
+    const supabase = await auth.getSupabaseClient();
+    if (!supabase) {
+      res.status(500).json({ error: 'Auth service not configured' });
+      return;
+    }
+
+    let created = 0;
+    let alreadyExisting = 0;
+    const failed: Array<{ id: string; error: string }> = [];
+    const perPage = 200;
+    let page = 1;
+    let users: any[] = [];
+
+    do {
+      const { data, error } = await supabase.auth.admin.listUsers({ page, perPage });
+      if (error) {
+        res.status(500).json({ error: error.message });
+        return;
+      }
+      users = data?.users || [];
+      for (const u of users) {
+        try {
+          const result = await ensureUserProfile({
+            id: u.id,
+            email: u.email,
+            user_metadata: (u.user_metadata || null) as Record<string, unknown> | null,
+          });
+          if (result.created) created++;
+          else alreadyExisting++;
+        } catch (err) {
+          failed.push({ id: u.id, error: (err as Error).message });
+        }
+      }
+      page++;
+    } while (users.length === perPage);
+
+    res.json({
+      users_checked: created + alreadyExisting + failed.length,
+      created,
+      already_existing: alreadyExisting,
+      failed: failed.length,
+      failures: failed.slice(0, 20),
+    });
+  } catch (error) {
+    console.error('[Backfill] Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 system.get('/storage', async (_req, res) => {
   const status = await projectRegistry.getInfrastructureStatus();
