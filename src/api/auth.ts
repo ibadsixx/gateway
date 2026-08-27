@@ -50,7 +50,10 @@ authRouter.post('/sign-up', async (req: Request, res: Response) => {
     const { data, error } = await supabase.auth.admin.createUser({
       email,
       password,
-      email_confirm: false,
+      // Instant registration: no email verification required.
+      // GoTrue treats this as an already-confirmed user, so they can
+      // sign in immediately after signing up.
+      email_confirm: true,
       user_metadata: options?.data || {},
     });
 
