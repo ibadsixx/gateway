@@ -40,6 +40,18 @@ function applySupabaseFilters(query: any, filters: string | string[] | undefined
   if (!filters) return query;
   const filterList = Array.isArray(filters) ? filters : [filters];
   for (const f of filterList) {
+    // `or=(...)` carries a nested PostgREST filter expression whose value
+    // contains dots and parens, so it can't go through the generic
+    // column=op.value parser below. Handle it first and pass it straight
+    // through to .or(). Previously it silently fell through to `default:
+    // break`, which dropped the OR clause and could make a delete/filter
+    // match far too many rows (e.g. unfriending one person deleting every
+    // accepted friendship).
+    if (f.startsWith('or=')) {
+      const orExpr = f.slice('or='.length);
+      if (orExpr) query = query.or(orExpr);
+      continue;
+    }
     const eqIdx = f.indexOf('=');
     if (eqIdx === -1) continue;
     const column = f.slice(0, eqIdx);
