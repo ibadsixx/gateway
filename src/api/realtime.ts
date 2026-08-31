@@ -30,10 +30,20 @@ realtimeRouter.get('/ice-servers', auth.authenticate.bind(auth), (_req: Request,
   res.json({ iceServers: [...DEFAULT_STUN_SERVERS, ...turnServers] });
 });
 
-const CHANNEL_RE = /^calls:[\w-]+$/;
+const CALL_CHANNEL_RE = /^calls:[\w-]+$/;
+const USER_CHANNEL_RE = /^user:[\w-]+$/;
 
 function isCallChannel(channel: string): boolean {
-  return CHANNEL_RE.test(channel);
+  return CALL_CHANNEL_RE.test(channel);
+}
+
+function isUserChannel(channel: string): boolean {
+  return USER_CHANNEL_RE.test(channel);
+}
+
+// Whether the given channel matches any supported realtime namespace.
+function isValidChannel(channel: string): boolean {
+  return isCallChannel(channel) || isUserChannel(channel);
 }
 
 // Debug endpoint — returns current hub state
@@ -59,7 +69,7 @@ realtimeRouter.get('/subscribe/:channel', auth.authenticate.bind(auth), (req: Re
     res.status(400).json({ error: 'Channel is required' });
     return;
   }
-  if (!isCallChannel(channel)) {
+  if (!isValidChannel(channel)) {
     console.warn(`[Realtime] SUBSCRIBE rejected: invalid channel format: ${channel}`);
     res.status(400).json({ error: 'Invalid channel format' });
     return;
@@ -68,7 +78,7 @@ realtimeRouter.get('/subscribe/:channel', auth.authenticate.bind(auth), (req: Re
   // Security: a user may only subscribe to their own signaling channel.
   // Otherwise any authenticated client could read (and spoof) another user's
   // call signaling by subscribing to calls:<theirId>.
-  if (channel !== `calls:${req.user?.id}`) {
+  if (channel !== `calls:${req.user?.id}` && channel !== `user:${req.user?.id}`) {
     console.warn(`[Realtime] SUBSCRIBE rejected: channel ${channel} does not match user ${req.user?.id}`);
     res.status(403).json({ error: 'You may only subscribe to your own channel' });
     return;
@@ -106,9 +116,9 @@ realtimeRouter.post('/publish', auth.authenticate.bind(auth), (req: Request, res
   const { channel, event, payload, excludeConnId } = req.body || {};
   console.log(`[Realtime] PUBLISH request: channel=${channel} event=${event} user=${req.user?.id} exclude=${excludeConnId || 'none'}`);
   console.log(`[Realtime] PUBLISH body keys: ${Object.keys(req.body || {}).join(', ')} body type: ${typeof req.body}`);
-  if (typeof channel !== 'string' || !channel || !isCallChannel(channel)) {
+  if (typeof channel !== 'string' || !channel || !isValidChannel(channel)) {
     console.warn(`[Realtime] PUBLISH rejected: invalid channel: "${channel}"`);
-    res.status(400).json({ error: 'channel must be a valid calls channel' });
+    res.status(400).json({ error: 'channel must be a valid calls/user channel' });
     return;
   }
   if (typeof event !== 'string' || !event) {
