@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { SupabaseClient } from '@supabase/supabase-js';
 import busboy from 'busboy';
 import { validation } from './validation';
 import { database } from '../infrastructure/database';
@@ -630,6 +631,7 @@ router.get('/:domain', auth.authenticate.bind(auth), validation.validateDomainMi
       return;
     }
     const filters = req.query.filter as string[] | string | undefined;
+    const requesterId = req.user?.id;
     const results = await Promise.all(
       readableProjects.map(async (entry) => {
         try {
@@ -637,7 +639,22 @@ router.get('/:domain', auth.authenticate.bind(auth), validation.validateDomainMi
           query = applySupabaseFilters(query, filters);
           const { data, error } = await query;
           if (error) return [];
-          return (data as any[]) || [];
+          let rows = (data as any[]) || [];
+          // Presence privacy: for `profiles`, do NOT hand presence fields
+          // (last_seen_at / manual_status / is_online) to a requester who is a
+          // NON-FRIEND with a PENDING message request against the profile owner.
+          // This makes presence "actually unavailable" (not just hidden in the
+          // UI) per messages.md. Any pending request in EITHER direction hides
+          // both users' presence; once accepted (or friends) it resumes under
+          // the normal friendship/privacy rules.
+          if (domain === 'profiles' && requesterId) {
+            rows = await redactPendingRequestPresence(
+              rows,
+              requesterId,
+              entry.client
+            );
+          }
+          return rows;
         } catch {
           return [];
         }
@@ -648,6 +665,65 @@ router.get('/:domain', auth.authenticate.bind(auth), validation.validateDomainMi
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// Presence fields that reveal a user's online/activity state to a viewer.
+const PRESENCE_FIELDS = ['last_seen_at', 'manual_status', 'is_online'] as const;
+
+// Redacts presence fields on `profiles` rows for any user who has a PENDING
+// message request with the requester (in either direction) and is NOT an
+// accepted friend. Uses the same friendship/request tables the app already
+// relies on (no second privacy system).
+async function redactPendingRequestPresence(
+  rows: any[],
+  requesterId: string,
+  client: SupabaseClient
+): Promise<any[]> {
+  const partnerIds = rows
+    .map((r: any) => r?.id)
+    .filter((id: unknown): id is string => typeof id === 'string' && id !== requesterId);
+  if (partnerIds.length === 0) return rows;
+
+  const [friendsRes, reqsRes] = await Promise.all([
+    client
+      .from('friends')
+      .select('requester_id, receiver_id, status')
+      .or(`requester_id.eq.${requesterId},receiver_id.eq.${requesterId}`),
+    client
+      .from('message_requests')
+      .select('sender_id, receiver_id, status')
+      .or(`sender_id.eq.${requesterId},receiver_id.eq.${requesterId}`),
+  ]);
+
+  const friends = new Set<string>();
+  for (const f of (friendsRes.data || []) as any[]) {
+    if (f?.status === 'accepted') {
+      friends.add(f.requester_id === requesterId ? f.receiver_id : f.requester_id);
+    }
+  }
+
+  // Map of partnerId -> true when there is a PENDING request in either direction.
+  const pending = new Map<string, boolean>();
+  for (const r of (reqsRes.data || []) as any[]) {
+    const other = r?.sender_id === requesterId ? r?.receiver_id : r?.sender_id;
+    if (typeof other !== 'string' || other === requesterId) continue;
+    if (r?.status === 'accepted') {
+      // Accepted requests count as a granted relationship (presence resumes).
+      friends.add(other);
+    } else if (r?.status === 'pending') {
+      pending.set(other, true);
+    }
+  }
+
+  return rows.map((row: any) => {
+    const id = row?.id;
+    if (typeof id !== 'string' || id === requesterId) return row;
+    // Hide presence only for non-friend + pending.
+    if (friends.has(id) || !pending.get(id)) return row;
+    const redacted = { ...row };
+    for (const field of PRESENCE_FIELDS) redacted[field] = null;
+    return redacted;
+  });
+}
 
 router.get('/:domain/:id', auth.authenticate.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain, id } = req.params;
