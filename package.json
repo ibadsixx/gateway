@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/src/dev.js",
-    "dev": "ts-node src/dev.ts"
+    "dev": "ts-node src/dev.ts",
+    "verify:message-requests": "ts-node src/features/verifyMessageRequestCategory.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.0",

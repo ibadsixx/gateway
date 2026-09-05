@@ -23,6 +23,26 @@ import { infrastructureDb } from '../infrastructure/database/infrastructureDb';
 import { authRouter } from './auth';
 import { realtimeRouter } from './realtime';
 import { ensureUserProfile } from '../profile-helper';
+import { classifyMessageRequest } from '../features/messageRequestCategory';
+
+// Applies the gateway-owned category to a `message_requests` insert body when
+// the request is created (messages.md). The Gateway classifies because friends
+// and conversations live in separate projects, so the DB trigger's
+// `friends`/`restricted_users` references on the conversations host are not
+// reliable. This is authoritative: it overrides any client-supplied value, and
+// because exactly one Message Request is ever inserted per sender/receiver we
+// need exactly one classification — "the category is created only when the
+// first Message Request is made" and never changes with each message.
+async function maybeClassifyMessageRequest(domain: string, body: unknown): Promise<void> {
+  if (domain !== 'message_requests' || !body || typeof body !== 'object') return;
+  const record = body as Record<string, unknown>;
+  if (typeof record['sender_id'] === 'string' && typeof record['receiver_id'] === 'string') {
+    record['category'] = await classifyMessageRequest(
+      record['sender_id'] as string,
+      record['receiver_id'] as string
+    );
+  }
+}
 
 function requireProbeToken(req: Request, res: Response, next: () => void): void {
   const expected = process.env.KEEP_ALIVE_TOKEN || process.env.CRON_SECRET;
@@ -128,6 +148,7 @@ v1.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
     return;
   }
   try {
+    await maybeClassifyMessageRequest(domain, req.body);
     const result = await database.write(domain, req.body);
     res.status(201).json(result);
   } catch (error) {
@@ -160,6 +181,11 @@ v1.put('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => 
     return;
   }
   try {
+    // The category is fixed when the first Message Request is created and must
+    // never be re-classified by a per-message update.
+    if (domain === 'message_requests' && req.body && typeof req.body === 'object') {
+      delete (req.body as Record<string, unknown>).category;
+    }
     const result = await database.update(domain, id, req.body);
     res.json(result);
   } catch (error) {
@@ -579,6 +605,7 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
     return;
   }
   try {
+    await maybeClassifyMessageRequest(domain, req.body);
     const result = await database.write(domain, req.body);
     res.status(201).json(result);
   } catch (error) {
