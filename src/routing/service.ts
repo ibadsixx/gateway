@@ -26,8 +26,29 @@ class RoutingService {
         inserted = upserted;
       } else {
         const { data: created, error } = await client.from(domain).insert(payload).select().single();
-        if (error) return Promise.reject(new Error(`Insert error: ${error.message}`));
-        inserted = created;
+        if (error) {
+          // The SPA sends `conversation_id` on the first `message_requests`
+          // insert even when the live host has NOT applied the migration that
+          // adds the column (20260902000000_...). A missing column makes the
+          // insert fail with a PostgREST 42703 ("column ... does not exist").
+          // Retry ONCE with the schema-stable payload so request delivery to
+          // the recipient is never blocked during a host's migration window.
+          // A real failure (duplicate, RLS, network) still rejects below.
+          if (
+            domain === 'message_requests' &&
+            typeof payload.conversation_id === 'string' &&
+            /conversation_id|42703/i.test(String(error.message))
+          ) {
+            delete payload.conversation_id;
+            const { data: retried, error: retryError } = await client.from(domain).insert(payload).select().single();
+            if (retryError) return Promise.reject(new Error(`Insert error: ${retryError.message}`));
+            inserted = retried;
+          } else {
+            return Promise.reject(new Error(`Insert error: ${error.message}`));
+          }
+        } else {
+          inserted = created;
+        }
       }
       const result = inserted as QueryResult;
 

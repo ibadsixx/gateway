@@ -37,10 +37,20 @@ async function maybeClassifyMessageRequest(domain: string, body: unknown): Promi
   if (domain !== 'message_requests' || !body || typeof body !== 'object') return;
   const record = body as Record<string, unknown>;
   if (typeof record['sender_id'] === 'string' && typeof record['receiver_id'] === 'string') {
+    console.log('[MessageRequest] classify', {
+      sender_id: record['sender_id'],
+      receiver_id: record['receiver_id'],
+      conversation_id: (record['conversation_id'] as string | undefined) ?? null,
+    });
     record['category'] = await classifyMessageRequest(
       record['sender_id'] as string,
       record['receiver_id'] as string
     );
+    console.log('[MessageRequest] classified', {
+      sender_id: record['sender_id'],
+      receiver_id: record['receiver_id'],
+      category: record['category'],
+    });
   }
 }
 
@@ -150,9 +160,13 @@ v1.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
   try {
     await maybeClassifyMessageRequest(domain, req.body);
     const result = await database.write(domain, req.body);
+    if (domain === 'message_requests') {
+      console.log('[MessageRequest] request_created', { id: result?.id });
+    }
     res.status(201).json(result);
   } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+    console.error(`[gateway] POST /api/v1/${domain} failed:`, error);
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Internal server error' });
   }
 });
 
@@ -607,9 +621,13 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
   try {
     await maybeClassifyMessageRequest(domain, req.body);
     const result = await database.write(domain, req.body);
+    if (domain === 'message_requests') {
+      console.log('[MessageRequest] request_created', { id: result?.id });
+    }
     res.status(201).json(result);
   } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+    console.error(`[gateway] POST /api/${domain} failed:`, error);
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Internal server error' });
   }
 });
 
