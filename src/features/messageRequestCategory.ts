@@ -35,17 +35,42 @@ export type MessageRequestCategory = 'you_may_know' | 'spam';
 // The pure decision core, kept separate and dependency-free so the gateway can
 // be verified (see verifyMessageRequestCategory.ts) and so the rule is exactly
 // the messages.md algorithm.
-export function classifyByMutualFriends(opts: {
+//
+// IMPORTANT (messages.md): the category is decided ONLY from the number of
+// UNIQUE users in the intersection friends(sender) ∩ friends(recipient):
+//
+//     mutual_friends_count > 0 -> 'you_may_know'
+//     mutual_friends_count === 0 -> 'spam'
+//
+// There is NO fallback/default 'you_may_know'. A successful lookup that returns
+// an empty array/object is still EXACTLY zero mutual friends -> 'spam'; an empty
+// result is never treated as truthy.
+export interface MutualFriendInput {
   senderFriendIds: Iterable<string>;
   receiverFriendIds: Iterable<string>;
   senderRestricted: boolean;
-}): MessageRequestCategory {
-  if (opts.senderRestricted) return 'spam';
-  const receiverFriends = new Set(opts.receiverFriendIds);
-  for (const id of opts.senderFriendIds) {
-    if (receiverFriends.has(id)) return 'you_may_know';
+}
+
+// The UNIQUE user ids shared by both users' ACTUAL accepted-friendship sets —
+// directly the spec's `intersection(senderFriendIds, recipientFriendIds)`.
+// Duplicate friendship rows (e.g. A->C plus C->A) yield one unique id.
+export function mutualFriendIds(
+  senderFriendIds: Iterable<string>,
+  receiverFriendIds: Iterable<string>
+): string[] {
+  const receiver = new Set(receiverFriendIds);
+  const unique = new Set<string>();
+  for (const id of senderFriendIds) {
+    if (typeof id === 'string' && receiver.has(id)) unique.add(id);
   }
-  return 'spam';
+  return [...unique];
+}
+
+export function classifyByMutualFriends(opts: MutualFriendInput): MessageRequestCategory {
+  // A restricted/blocked sender is ALWAYS 'spam', even when both share friends.
+  if (opts.senderRestricted) return 'spam';
+  const mutual = mutualFriendIds(opts.senderFriendIds, opts.receiverFriendIds);
+  return mutual.length > 0 ? 'you_may_know' : 'spam';
 }
 
 export interface MessageRequestCategoryDeps {
@@ -68,6 +93,12 @@ const defaultDeps: MessageRequestCategoryDeps = {
       .maybeSingle();
     return !!data;
   },
+  // ONLY ACCEPTED friendships count (messages.md: pending / rejected /
+  // cancelled requests, blocked users, followers/following and the two users
+  // themselves are never mutual friends). The DB filter below restricts to
+  // status = 'accepted'; the guards re-enforce it in code so a dropped/mangled
+  // filter can never leak a non-accepted row, and the Set dedupes duplicate
+  // friendship rows.
   async acceptedFriendIds(userId) {
     const entry = projectManager.getReadClient('friends', userId);
     const { data } = await entry.client
@@ -76,10 +107,12 @@ const defaultDeps: MessageRequestCategoryDeps = {
       .or(`requester_id.eq.${userId},receiver_id.eq.${userId}`)
       .eq('status', 'accepted');
     const ids = new Set<string>();
-    for (const f of (data || []) as Array<{ requester_id?: string; receiver_id?: string }>) {
+    for (const f of (data || []) as Array<{ requester_id?: string; receiver_id?: string; status?: string }>) {
       if (!f) continue;
+      if (f.status !== 'accepted') continue;
       const other = f.requester_id === userId ? f.receiver_id : f.requester_id;
-      if (typeof other === 'string') ids.add(other);
+      if (typeof other !== 'string' || other === userId) continue;
+      ids.add(other);
     }
     return ids;
   },
@@ -90,7 +123,18 @@ export async function classifyMessageRequest(
   receiverId: string,
   deps: MessageRequestCategoryDeps = defaultDeps
 ): Promise<MessageRequestCategory> {
-  if (!senderId || !receiverId || senderId === receiverId) return 'spam';
+  if (!senderId || !receiverId || senderId === receiverId) {
+    logClassification({
+      sender_id: senderId,
+      recipient_id: receiverId,
+      sender_friend_ids: [],
+      recipient_friend_ids: [],
+      mutual_friend_ids: [],
+      mutual_friends_count: 0,
+      final_category: 'spam',
+    });
+    return 'spam';
+  }
 
   try {
     const [senderRestricted, senderFriends, receiverFriends] = await Promise.all([
@@ -98,12 +142,54 @@ export async function classifyMessageRequest(
       deps.acceptedFriendIds(senderId).catch(() => new Set<string>()),
       deps.acceptedFriendIds(receiverId).catch(() => new Set<string>()),
     ]);
-    return classifyByMutualFriends({
-      senderFriendIds: senderFriends,
-      receiverFriendIds: receiverFriends,
-      senderRestricted,
+    const senderFriendIds = [...senderFriends];
+    const recipientFriendIds = [...receiverFriends];
+    const shared = mutualFriendIds(senderFriendIds, recipientFriendIds);
+    const category: MessageRequestCategory =
+      senderRestricted || shared.length === 0 ? 'spam' : 'you_may_know';
+    logClassification({
+      sender_id: senderId,
+      recipient_id: receiverId,
+      sender_friend_ids: senderFriendIds,
+      recipient_friend_ids: recipientFriendIds,
+      mutual_friend_ids: shared,
+      mutual_friends_count: shared.length,
+      final_category: category,
     });
+    return category;
   } catch {
+    logClassification({
+      sender_id: senderId,
+      recipient_id: receiverId,
+      sender_friend_ids: [],
+      recipient_friend_ids: [],
+      mutual_friend_ids: [],
+      mutual_friends_count: 0,
+      final_category: 'spam',
+    });
     return 'spam';
   }
+}
+
+// Temporary diagnostic log (messages.md) for the mutual-friend calculation.
+interface ClassificationLog {
+  sender_id: string | null;
+  recipient_id: string | null;
+  sender_friend_ids: string[];
+  recipient_friend_ids: string[];
+  mutual_friend_ids: string[];
+  mutual_friends_count: number;
+  final_category: MessageRequestCategory;
+}
+
+function logClassification(fields: ClassificationLog): void {
+  console.log('[Classification]', {
+    sender_id: fields.sender_id,
+    recipient_id: fields.recipient_id,
+    sender_friend_ids: fields.sender_friend_ids,
+    recipient_friend_ids: fields.recipient_friend_ids,
+    mutual_friend_ids: fields.mutual_friend_ids,
+    mutual_friends_count: fields.mutual_friends_count,
+    final_category: fields.final_category,
+  });
 }

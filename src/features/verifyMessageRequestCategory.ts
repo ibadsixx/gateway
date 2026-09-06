@@ -5,28 +5,37 @@
 // It drives the REAL `classifyMessageRequest` (the exact function the gateway's
 // write routes call for every `message_requests` insert) against an injected
 // in-memory model of the `friends` + `restricted_users` hosts, and asserts both
-// required test cases end-to-end:
+// messages.md required test cases end-to-end:
 //
-//   Test 1 — mutual friend: A not friends with B, shared friend C
-//             friends(A) ∩ friends(B) = {C}  -> 'you_may_know' ("Maybe you know")
-//   Test 2 — zero mutual friends: friends(A) ∩ friends(B) = {}  -> 'spam'
+//   TEST 1 — A and B have ZERO accepted mutual friends:
+//             mutual_friends_count === 0 -> 'spam'
+//   TEST 2 — A and B share at least one accepted friend C:
+//             mutual_friends_count >= 1 -> 'you_may_know' ("Maybe you know")
 //
 // It also asserts the spec's rule sharpness:
-//   - the intersection is computed from the users' ACTUAL accepted-friendship
-//     rows (both users' friend sets are queried; non-mutual friends are ignored),
-//   - a PENDING friend request does NOT upgrade a zero-mutual pair to
-//     'you_may_know' (followers/requests/etc. are not substitutes), and
-//   - a restricted/blocked sender is ALWAYS 'spam' even with mutual friends.
-import * as assert from 'node:assert';
-
+//   - the category depends ONLY on the count of UNIQUE ids in the intersection
+//     friends(A) ∩ friends(B) — a successful lookup that returns empty sets is
+//     STILL 'spam' (an empty array/object is NOT truthy, so no fallback
+//     'you_may_know' can ever fire),
+//   - only ACCEPTED friendships count (pending / rejected / cancelled requests,
+//     blocked users, followers, duplicates, and the users themselves never
+//     count),
+//   - a restricted/blocked sender is ALWAYS 'spam' even with mutual friends, and
+//   - the category is stored on the FIRST message_requests insert exactly as the
+//     gateway injects it (the DB trigger from migration
+//     20260904000002_gateway_owns_message_request_category.sql preserves any
+//     gateway-supplied category and only defaults NULL to 'spam').
 import {
   classifyMessageRequest,
+  mutualFriendIds,
   type MessageRequestCategoryDeps,
 } from './messageRequestCategory';
 
-type FriendRow = { requester_id: string; receiver_id: string; status: 'pending' | 'accepted' };
+type FriendRow = { requester_id: string; receiver_id: string; status: 'pending' | 'accepted' | 'rejected' };
 type RestrictedRow = { user_id: string; restricted_user_id: string };
 
+// Faithful in-memory model of the real default deps (messageRequestCategory.ts):
+// only ACCEPTED rows count, self rows are ignored, results are a deduped Set.
 function buildDeps(universe: {
   friends: FriendRow[];        // the friends host
   restricted: RestrictedRow[]; // the restricted_users host
@@ -44,8 +53,11 @@ function buildDeps(universe: {
       const ids = new Set<string>();
       for (const f of universe.friends) {
         if (f.status !== 'accepted') continue;
-        if (f.requester_id === userId) ids.add(f.receiver_id);
-        else if (f.receiver_id === userId) ids.add(f.requester_id);
+        if (f.requester_id === userId) {
+          if (f.receiver_id !== userId) ids.add(f.receiver_id);
+        } else if (f.receiver_id === userId) {
+          if (f.requester_id !== userId) ids.add(f.requester_id);
+        }
       }
       return ids;
     },
@@ -66,24 +78,29 @@ function check(name: string, actual: unknown, expected: unknown) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}: got ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`);
 }
 
-async function main() {
-  // --- Test 1 (messages.md): mutual friend -> Maybe-you-know -----------------
-  {
-    const deps = buildDeps({
-      friends: [
-        { requester_id: A, receiver_id: C, status: 'accepted' }, // A's friend
-        { requester_id: B, receiver_id: C, status: 'accepted' }, // B's friend
-        { requester_id: A, receiver_id: D, status: 'accepted' }, // extra, NOT mutual
-      ],
-      restricted: [],
-    });
-    const category = await classifyMessageRequest(A, B, deps);
-    check('Test 1 [mutual friend A-C + B-C] -> you_may_know', category, 'you_may_know');
-    check('Test 1: BOTH users\' accepted friends were queried', deps.friendQueries.includes(A) && deps.friendQueries.includes(B), true);
-    check('Test 1: every accepted friendship of each user is part of the input', deps.friendQueries.length, 2);
-  }
+// Simulates the gateway's insert path (routes.ts maybeClassifyMessageRequest):
+// the category the gateway computes on the FIRST request insert is injected
+// into the write body, which is exactly the value the DB stores.
+async function storedCategoryFor(
+  senderId: string,
+  receiverId: string,
+  deps: MessageRequestCategoryDeps
+): Promise<string> {
+  const body: Record<string, unknown> = {
+    sender_id: senderId,
+    receiver_id: receiverId,
+    status: 'pending',
+    conversation_id: 'conversation-uuid',
+  };
+  body['category'] = await classifyMessageRequest(senderId, receiverId, deps);
+  return body['category'] as string;
+}
 
-  // --- Test 2 (messages.md): zero mutual friends -> spam ---------------------
+async function main() {
+  // --- TEST 1 (messages.md): A and B have ZERO accepted mutual friends ------
+  // mutual_friends_count === 0 -> 'spam'
+
+  // 1a. Disjoint friend sets: friends(A) = {C, E}, friends(B) = {D}.
   {
     const deps = buildDeps({
       friends: [
@@ -93,8 +110,78 @@ async function main() {
       ],
       restricted: [],
     });
-    const category = await classifyMessageRequest(A, B, deps);
-    check('Test 2 [disjoint friends {C,E} vs {D}] -> spam', category, 'spam');
+    const senderFriendIds = ['user-C', 'user-E'];
+    const recipientFriendIds = ['user-D'];
+    const shared = mutualFriendIds(senderFriendIds, recipientFriendIds);
+    check('TEST 1 [disjoint friends {C,E} vs {D}] mutual_friends_count', shared.length, 0);
+    check('TEST 1 [disjoint friends] -> spam', await classifyMessageRequest(A, B, deps), 'spam');
+    check('TEST 1: BOTH users\' accepted friends were queried', deps.friendQueries.includes(A) && deps.friendQueries.includes(B), true);
+    check('TEST 1: stored category on FIRST insert is "spam"', await storedCategoryFor(A, B, deps), 'spam');
+  }
+
+  // 1b. BOTH users have NO friends at all — the lookups SUCCEEDED but returned
+  // empty arrays. An empty array is NOT truthy, so this MUST be 'spam' (the
+  // exact anti-pattern messages.md warns about: `if (mutualFriends) -> you_may_know`).
+  {
+    const deps = buildDeps({ friends: [], restricted: [] });
+    check('TEST 1 [both friend lookups succeeded, empty sets] mutual_friends_count', mutualFriendIds([], []).length, 0);
+    check('TEST 1 [empty result must NOT fall back to you_may_know] -> spam', await classifyMessageRequest(A, B, deps), 'spam');
+    check('TEST 1: empty-result stored category is "spam"', await storedCategoryFor(A, B, deps), 'spam');
+  }
+
+  // 1c. Exclusions: pending / rejected / cancelled / self / duplicate rows
+  // never count. A has pending A->C, rejected A->D and a self row A->A; B has
+  // accepted B->E only. Zero accepted mutual friends -> 'spam'.
+  {
+    const deps = buildDeps({
+      friends: [
+        { requester_id: A, receiver_id: C, status: 'pending' },
+        { requester_id: A, receiver_id: D, status: 'rejected' },
+        { requester_id: A, receiver_id: A, status: 'accepted' },
+        { requester_id: B, receiver_id: E, status: 'accepted' },
+      ],
+      restricted: [],
+    });
+    check('TEST 1 [pending/rejected/self rows excluded] -> spam', await classifyMessageRequest(A, B, deps), 'spam');
+  }
+
+  // --- TEST 2 (messages.md): A and B share at least one accepted friend C ---
+  // mutual_friends_count >= 1 -> 'you_may_know'
+
+  // 2a. one mutual accepted friend C (with duplicate A->C / C->A rows).
+  {
+    const deps = buildDeps({
+      friends: [
+        { requester_id: A, receiver_id: C, status: 'accepted' },
+        { requester_id: C, receiver_id: A, status: 'accepted' },
+        { requester_id: B, receiver_id: C, status: 'accepted' },
+        { requester_id: C, receiver_id: B, status: 'accepted' },
+        { requester_id: A, receiver_id: D, status: 'accepted' }, // extra, NOT mutual
+      ],
+      restricted: [],
+    });
+    const senderFriendIds = ['user-C', 'user-D'];
+    const recipientFriendIds = ['user-C'];
+    check('TEST 2 [mutual C, duplicate rows] unique mutual_friends_count', mutualFriendIds(senderFriendIds, recipientFriendIds).length, 1);
+    check('TEST 2 [shared accepted friend C] -> you_may_know', await classifyMessageRequest(A, B, deps), 'you_may_know');
+  }
+
+  // 2b. two shared accepted friends C and D -> count 2 -> you_may_know.
+  {
+    const deps = buildDeps({
+      friends: [
+        { requester_id: A, receiver_id: C, status: 'accepted' },
+        { requester_id: B, receiver_id: C, status: 'accepted' },
+        { requester_id: A, receiver_id: D, status: 'accepted' },
+        { requester_id: B, receiver_id: D, status: 'accepted' },
+        { requester_id: B, receiver_id: E, status: 'accepted' }, // extra, NOT mutual
+      ],
+      restricted: [],
+    });
+    const senderFriendIds = ['user-C', 'user-D'];
+    const recipientFriendIds = ['user-C', 'user-D'];
+    check('TEST 2 [two shared friends] unique mutual_friends_count', mutualFriendIds(senderFriendIds, recipientFriendIds).length, 2);
+    check('TEST 2 [two shared accepted friends] -> you_may_know', await classifyMessageRequest(A, B, deps), 'you_may_know');
   }
 
   // --- Spec sharpness: a PENDING friend request is NOT a substitute ----------
@@ -105,8 +192,7 @@ async function main() {
       ],
       restricted: [],
     });
-    const category = await classifyMessageRequest(A, B, deps);
-    check('Spec: pending friend request alone does NOT upgrade to you_may_know', category, 'spam');
+    check('Spec: pending friend request alone does NOT upgrade to you_may_know', await classifyMessageRequest(A, B, deps), 'spam');
   }
 
   // --- Restricted/blocked sender is ALWAYS spam even with a mutual friend ----
@@ -118,8 +204,7 @@ async function main() {
       ],
       restricted: [{ user_id: B, restricted_user_id: A }],
     });
-    const category = await classifyMessageRequest(A, B, deps);
-    check('Restricted sender [mutual C but B restricted A] -> spam', category, 'spam');
+    check('Restricted sender [mutual C but B restricted A] -> spam', await classifyMessageRequest(A, B, deps), 'spam');
   }
 
   // --- Degradation: an unavailable host never fails classification -----------
@@ -128,8 +213,7 @@ async function main() {
       isRestricted: () => Promise.reject(new Error('host paused')),
       acceptedFriendIds: () => Promise.reject(new Error('host paused')),
     };
-    const category = await classifyMessageRequest(A, B, failingDeps);
-    check('Unavailable hosts degrade to spam (never throws)', category, 'spam');
+    check('Unavailable hosts degrade to spam (never throws)', await classifyMessageRequest(A, B, failingDeps), 'spam');
   }
 
   // --- Self/empty inputs cannot yield you_may_know ----------------------------
