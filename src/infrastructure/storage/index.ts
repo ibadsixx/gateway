@@ -33,6 +33,14 @@ function toBuffer(data: unknown): Buffer | null {
   return null;
 }
 
+function inferResourceType(path: string): string {
+  const ext = path.split('.').pop()?.toLowerCase() ?? '';
+  if (['mp4', 'webm', 'mov', 'm4v', 'avi', 'mkv', 'mp3', 'm4a', 'wav', 'ogg', 'aac', 'flac'].includes(ext)) {
+    return 'video';
+  }
+  return 'image';
+}
+
 class StorageLayer {
   async upload(data: UploadOptions = {}): Promise<UploadResult> {
     let buffer = toBuffer(data.buffer);
@@ -91,6 +99,20 @@ class StorageLayer {
     if (!account) throw new Error('No active storage account');
     const provider = getStorageProvider(account.provider);
     await provider.delete(id);
+  }
+
+  // Resolve a stored `/api/storage/:bucket/:path` URL (the client's
+  // getPublicUrl fallback and any legacy profile_pic / cover_pic / media_url
+  // values that hold the dead gateway path form) to the actual Cloudinary CDN
+  // asset. The gateway stores every upload under the `tone` folder with the
+  // bucket-stripped path as public_id, so the CDN URL can be reconstructed.
+  async resolvePublicUrl(path: string): Promise<{ url: string } | null> {
+    const account = await storageRegistry.getActiveAccount();
+    if (!account || !account.cloudName) return null;
+    const resourceType = inferResourceType(path);
+    return {
+      url: `https://res.cloudinary.com/${account.cloudName}/${resourceType}/upload/v1/tone/${path}`,
+    };
   }
 
   async move(id: string, targetProvider: string): Promise<void> {
