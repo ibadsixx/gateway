@@ -161,7 +161,7 @@ v1.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
     await maybeClassifyMessageRequest(domain, req.body);
     const result = await database.write(domain, req.body);
     if (domain === 'message_requests') {
-      console.log('[MessageRequest] request_created', { id: result?.id });
+      console.log('[MessageRequest] request_created', { id: Array.isArray(result) ? result[0]?.id : result?.id });
     }
     res.status(201).json(result);
   } catch (error) {
@@ -646,7 +646,7 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
     await maybeClassifyMessageRequest(domain, req.body);
     const result = await database.write(domain, req.body);
     if (domain === 'message_requests') {
-      console.log('[MessageRequest] request_created', { id: result?.id });
+      console.log('[MessageRequest] request_created', { id: Array.isArray(result) ? result[0]?.id : result?.id });
     }
     res.status(201).json(result);
   } catch (error) {

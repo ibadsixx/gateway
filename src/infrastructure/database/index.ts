@@ -6,7 +6,7 @@ class DatabaseLayer {
     return routingService.read(domain, id);
   }
 
-  async write(domain: string, data: Record<string, unknown>): Promise<QueryResult> {
+  async write(domain: string, data: Record<string, unknown> | Record<string, unknown>[]): Promise<QueryResult | QueryResult[]> {
     return routingService.write(domain, data);
   }
 

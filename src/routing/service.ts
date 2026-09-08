@@ -9,7 +9,7 @@ export interface QueryResult {
 }
 
 class RoutingService {
-  write(domain: string, data: Record<string, unknown>): Promise<QueryResult> {
+  write(domain: string, data: Record<string, unknown> | Record<string, unknown>[]): Promise<QueryResult | QueryResult[]> {
     const start = Date.now();
     const entry = projectManager.getWritableProject(domain);
     if (!entry) {
@@ -18,6 +18,26 @@ class RoutingService {
     const { client } = entry;
 
     return RetryEngine.execute(async () => {
+      // Multi-row insert: the SPA's Group Chat flow POSTs conversation_participants
+      // as one array of rows. The payload must NOT be spread into an object (an
+      // array becomes {0: row, 1: row, ...} and PostgREST rejects those pseudo
+      // columns with 42703 "could not find the '0' column") and must NOT use
+      // .single() (a bulk insert legitimately returns more than one row).
+      if (Array.isArray(data)) {
+        const { data: created, error } = await client.from(domain).insert(data).select();
+        if (error) return Promise.reject(new Error(`Insert error: ${error.message}`));
+        const result = (created as QueryResult[]) || [];
+        for (const row of result) {
+          eventBus.emit({
+            type: `${domain}.created`,
+            payload: { id: row.id, data: row },
+            metadata: { timestamp: new Date(), source: 'routing-service' },
+          });
+        }
+        metricsService.record('db.write.duration', Date.now() - start, { domain });
+        return result;
+      }
+
       const { _on_conflict, ...payload } = data;
       let inserted: unknown;
       if (typeof _on_conflict === 'string' && _on_conflict.length > 0) {
