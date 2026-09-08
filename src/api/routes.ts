@@ -79,7 +79,15 @@ function applySupabaseFilters(query: any, filters: string | string[] | undefined
     // match far too many rows (e.g. unfriending one person deleting every
     // accepted friendship).
     if (f.startsWith('or=')) {
-      const orExpr = f.slice('or='.length);
+      let orExpr = f.slice('or='.length);
+      // The client builder wraps the OR expression in parens (or=(a,b)).
+      // supabase-js re-wraps the argument and PostgREST rejects the doubly
+      // nested tree ("failed to parse logic tree (((a,b)))"), which made every
+      // read that carried an `or=` filter return [] — e.g. the profile search
+      // and friends list. Strip the client's outer paren layer before .or().
+      while (orExpr.startsWith('(') && orExpr.endsWith(')') && orExpr.length >= 2) {
+        orExpr = orExpr.slice(1, -1);
+      }
       if (orExpr) query = query.or(orExpr);
       continue;
     }
