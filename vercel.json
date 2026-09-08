@@ -7,7 +7,7 @@
     }
   },
   "crons": [
-    { "path": "/api/project-health/run", "schedule": "*/10 * * * *" }
+    { "path": "/api/project-health/run", "schedule": "0 3 * * *" }
   ],
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/[...slug]" }
