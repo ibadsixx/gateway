@@ -24,6 +24,7 @@ import { authRouter } from './auth';
 import { realtimeRouter } from './realtime';
 import { ensureUserProfile } from '../profile-helper';
 import { classifyMessageRequest } from '../features/messageRequestCategory';
+import { leaveGroupConversation } from '../features/leaveGroupConversation';
 
 // Applies the gateway-owned category to a `message_requests` insert body when
 // the request is created (messages.md). The Gateway classifies because friends
@@ -273,6 +274,30 @@ v1.delete('/:domain', validation.validateDomainMiddleware, async (req, res) => {
     }
     res.status(204).send();
   } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+v1.delete('/conversations/:conversationId/leave', async (req, res) => {
+  const { conversationId } = req.params;
+  const userId = req.user?.id;
+  if (!conversationId || !userId) {
+    res.status(400).json({ error: 'Conversation and authenticated user are required' });
+    return;
+  }
+  try {
+    const result = await leaveGroupConversation(conversationId, userId);
+    if (result.status === 'not_member') {
+      res.status(404).json({ error: 'You are not a member of this conversation' });
+      return;
+    }
+    if (result.status === 'not_group') {
+      res.status(400).json({ error: 'Only group conversations can be left' });
+      return;
+    }
+    res.status(204).send();
+  } catch (error) {
+    console.error(`[gateway] Leave group conversation ${conversationId} failed:`, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
