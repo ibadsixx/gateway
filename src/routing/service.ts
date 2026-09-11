@@ -103,10 +103,14 @@ class RoutingService {
     const start = Date.now();
     const entry = projectManager.getReadClient(domain, id);
     const { client } = entry;
+    console.log(`[routing] update ${domain} id=${id} readableProjects=${projectManager.getReadableProjects(domain).length} routedProject=${entry.project.projectKey} body=${JSON.stringify(data)}`);
 
     return RetryEngine.execute(async () => {
       const { data: updated, error } = await client.from(domain).update(data).eq('id', id).select().single();
-      if (error) return Promise.reject(new Error(`Update error: ${error.message}`));
+      if (error) {
+        console.error(`[routing] update ${domain} id=${id} FAILED:`, error);
+        return Promise.reject(new Error(`Update error: ${error.message}`));
+      }
 
       eventBus.emit({
         type: `${domain}.updated`,

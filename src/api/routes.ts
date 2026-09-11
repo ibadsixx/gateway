@@ -204,15 +204,18 @@ v1.put('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => 
     return;
   }
   try {
+    console.log(`[gateway] PUT /api/v1/${domain}/${id}`, { body: req.body });
     // The category is fixed when the first Message Request is created and must
     // never be re-classified by a per-message update.
     if (domain === 'message_requests' && req.body && typeof req.body === 'object') {
       delete (req.body as Record<string, unknown>).category;
     }
     const result = await database.update(domain, id, req.body);
+    console.log(`[gateway] PUT /api/v1/${domain}/${id} succeeded`);
     res.json(result);
   } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+    console.error(`[gateway] PUT /api/v1/${domain}/${id} failed:`, error);
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Internal server error' });
   }
 });
 
