@@ -525,7 +525,21 @@ const RPC_DOMAIN_OVERRIDES: Record<string, string> = {
   is_restricted: 'blocking',
   restrict_user: 'blocking',
   unrestrict_user: 'blocking',
+  // Conversation RPCs operate on tables hosted by the 'conversations' project.
+  // Without this override they default to the 'users' project, which does not
+  // host the conversation tables (calls fail with PGRST202 / 42P01). The
+  // conversations project does not share the users JWT secret, so these
+  // functions cannot read auth.uid() there; the gateway injects the verified
+  // caller id into the RPC arguments instead (see RPC_INJECT_CALLER_ID).
+  add_channel_follower: 'conversations',
+  add_group_member: 'conversations',
 };
+
+// Conversation-domain RPCs are SECURITY DEFINER functions whose auth.uid()
+// check would see NULL on a cross-project anon call. The gateway replaces its
+// own verified caller id into the p_user_id argument before forwarding, so the
+// function's permission checks run against the real user.
+const RPC_INJECT_CALLER_ID = new Set(['add_channel_follower', 'add_group_member']);
 
 rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
   try {
@@ -561,7 +575,20 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
       return;
     }
 
-    const url = `${credentials.project_url}/rest/v1/rpc/${encodeURIComponent(req.params.function)}`;
+    // Conversation RPCs can't read auth.uid() on the owning project (it does
+    // not share the users JWT secret), so pass the gateway-verified caller id
+    // as an explicit argument. req.user.id comes from the authenticated token,
+    // never from the client body.
+    const rpcName = req.params.function;
+    let body = req.body || {};
+    if (RPC_INJECT_CALLER_ID.has(rpcName)) {
+      body = { ...(body as Record<string, unknown>) };
+      if (req.user?.id) {
+        (body as Record<string, unknown>)['p_user_id'] = req.user.id;
+      }
+    }
+
+    const url = `${credentials.project_url}/rest/v1/rpc/${encodeURIComponent(rpcName)}`;
     const upstream = await fetch(url, {
       method: 'POST',
       headers: {
@@ -569,7 +596,7 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
         apikey: credentials.anon_key,
         Authorization: `Bearer ${bearer}`,
       },
-      body: JSON.stringify(req.body || {}),
+      body: JSON.stringify(body),
     });
 
     const text = await upstream.text();
