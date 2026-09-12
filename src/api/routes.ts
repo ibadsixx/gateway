@@ -169,6 +169,11 @@ v1.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
   }
   try {
     await maybeClassifyMessageRequest(domain, req.body);
+    const denied = await enforceMessageWritePolicy(domain, req.user?.id, req.body);
+    if (denied) {
+      res.status(403).json({ error: denied });
+      return;
+    }
     const result = await database.write(domain, req.body);
     if (domain === 'message_requests') {
       console.log('[MessageRequest] request_created', { id: Array.isArray(result) ? result[0]?.id : result?.id });
@@ -499,6 +504,66 @@ system.post('/reload-registry', async (_req, res) => {
   }
 });
 
+// Roles allowed to publish a top-level post into a channel. Channels are
+// broadcast (messages.md): followers are read/reply-only, so only the channel
+// owner and moderators may write new posts. `add_channel_follower` bolts a
+// `follower` participant in, and the publish endpoint
+// (/v1/conversations/:id/publish) already enforces this rule — but the generic
+// `messages` insert route was a bypass: it ran with a service-key client that
+// ignores RLS, so any authenticated caller could insert a top-level post into a
+// channel as if it were a group chat. This helper closes that bypass for every
+// messages insert path (composer fallback, forward, cross-post).
+const CHANNEL_POST_ROLES = new Set(['owner', 'moderator']);
+
+async function enforceMessageWritePolicy(
+  domain: string,
+  userId: string | undefined,
+  body: unknown
+): Promise<string | null> {
+  if (domain !== 'messages' || !userId) return null;
+  const rows = (Array.isArray(body) ? body : [body]) as Array<Record<string, unknown>>;
+  if (rows.length === 0) return null;
+
+  // The authenticated caller owns the send; the client never picks sender_id.
+  for (const row of rows) {
+    if (typeof row['sender_id'] !== 'string' || row['sender_id'] !== userId) {
+      return 'Sender ID does not match authenticated user';
+    }
+  }
+
+  const conversationId = rows[0]['conversation_id'];
+  if (typeof conversationId !== 'string' || conversationId.length === 0) return null;
+
+  // Channel posts require owner/moderator. Conversation and participant rows
+  // live on the same physical host, so the client that locates the channel is
+  // also used for the caller's role.
+  for (const entry of projectManager.getReadableProjects('conversations')) {
+    try {
+      const { data: conv } = await entry.client
+        .from('conversations')
+        .select('type')
+        .eq('id', conversationId)
+        .maybeSingle();
+      if (conv && (conv as { type?: string }).type === 'channel') {
+        const { data: participant } = await entry.client
+          .from('conversation_participants')
+          .select('role')
+          .eq('conversation_id', conversationId)
+          .eq('user_id', userId)
+          .maybeSingle();
+        if (!participant) return 'You are not a participant of this conversation';
+        if (!CHANNEL_POST_ROLES.has((participant as { role?: string }).role as string)) {
+          return 'Only the channel owner or moderators can post';
+        }
+      }
+      return null;
+    } catch {
+      // Try the next readable project.
+    }
+  }
+  return 'Conversation not found';
+}
+
 const rpcRouter = Router();
 
 // RPC functions that must run against a non-default project.
@@ -736,6 +801,11 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
   }
   try {
     await maybeClassifyMessageRequest(domain, req.body);
+    const denied = await enforceMessageWritePolicy(domain, req.user?.id, req.body);
+    if (denied) {
+      res.status(403).json({ error: denied });
+      return;
+    }
     const result = await database.write(domain, req.body);
     if (domain === 'message_requests') {
       console.log('[MessageRequest] request_created', { id: Array.isArray(result) ? result[0]?.id : result?.id });
