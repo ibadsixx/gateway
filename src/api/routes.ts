@@ -25,6 +25,7 @@ import { realtimeRouter } from './realtime';
 import { ensureUserProfile } from '../profile-helper';
 import { classifyMessageRequest } from '../features/messageRequestCategory';
 import { leaveGroupConversation } from '../features/leaveGroupConversation';
+import { publishChannelPost } from '../features/publishChannelPost';
 
 // Applies the gateway-owned category to a `message_requests` insert body when
 // the request is created (messages.md). The Gateway classifies because friends
@@ -301,6 +302,34 @@ v1.delete('/conversations/:conversationId/leave', async (req, res) => {
     res.status(204).send();
   } catch (error) {
     console.error(`[gateway] Leave group conversation ${conversationId} failed:`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+v1.post('/conversations/:conversationId/publish', async (req, res) => {
+  const { conversationId } = req.params;
+  const userId = req.user?.id;
+  if (!conversationId || !userId) {
+    res.status(400).json({ error: 'Conversation and authenticated user are required' });
+    return;
+  }
+  try {
+    const result = await publishChannelPost(conversationId, userId, req.body || {});
+    if (result.status === 'not_member') {
+      res.status(404).json({ error: 'You are not a participant of this conversation' });
+      return;
+    }
+    if (result.status === 'not_channel') {
+      res.status(400).json({ error: 'Only channel conversations can be published to' });
+      return;
+    }
+    if (result.status === 'not_publisher') {
+      res.status(403).json({ error: 'Only channel admins can publish posts' });
+      return;
+    }
+    res.status(201).json(result.message);
+  } catch (error) {
+    console.error(`[gateway] Publish channel post ${conversationId} failed:`, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
