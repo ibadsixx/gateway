@@ -85,14 +85,29 @@ class ProjectManager {
   getWritableProject(domain: string): CachedProject | null {
     const entries = this.cache.get(domain);
     if (!entries) return null;
+
+    // Hard capability gates: the project must be write-enabled, active, and not
+    // over capacity. `health_status` is deliberately NOT a hard gate here — it
+    // is a probe artifact that a single failed keep-alive request can leave
+    // 'offline' for a whole period (see src/project-health/index.ts). Treating
+    // it as a kill-switch strands a domain whose ONLY project carries a stale
+    // flag, e.g. the reported `No writable project for domain: conversations`
+    // where `convrsation-1` is live (HTTP 200) but flagged offline. It ranks
+    // candidates instead, so healthy projects win while a sole candidate still
+    // resolves.
     const candidates = entries.filter(e =>
       e.project.writeEnabled
         && e.project.status.toLowerCase() === 'active'
-        && e.project.healthStatus !== 'offline'
         && (e.project.capacity <= 0 || (e.project.usedSpace / e.project.capacity) * 100 < 90),
     );
     if (candidates.length === 0) return null;
-    return candidates.reduce((a, b) => a.project.priority <= b.project.priority ? a : b);
+    candidates.sort((a, b) => {
+      const healthA = a.project.healthStatus === 'offline' ? 1 : 0;
+      const healthB = b.project.healthStatus === 'offline' ? 1 : 0;
+      if (healthA !== healthB) return healthA - healthB;
+      return a.project.priority - b.project.priority;
+    });
+    return candidates[0];
   }
 
   getReadableProjects(domain: string): CachedProject[] {
