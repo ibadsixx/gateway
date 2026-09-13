@@ -547,14 +547,26 @@ async function enforceMessageWritePolicy(
       if (conv && (conv as { type?: string }).type === 'channel') {
         // `created_by` is the authoritative owner and always outranks the
         // participant row: a stale `follower` role must never demote them.
-        const isOwner = (conv as { created_by?: string | null }).created_by === userId;
-        const { data: participant } = await entry.client
-          .from('conversation_participants')
-          .select('role')
-          .eq('conversation_id', conversationId)
-          .eq('user_id', userId)
-          .maybeSingle();
-        if (isOwner) return null;
+        // If `created_by` is missing, the participant row with role='owner'
+        // pins the owner instead.
+        const createdBy = (conv as { created_by?: string | null }).created_by ?? null;
+        const isOwner = createdBy === userId;
+        const [{ data: participant }, { data: ownerRow }] = await Promise.all([
+          entry.client
+            .from('conversation_participants')
+            .select('role')
+            .eq('conversation_id', conversationId)
+            .eq('user_id', userId)
+            .maybeSingle(),
+          entry.client
+            .from('conversation_participants')
+            .select('user_id')
+            .eq('conversation_id', conversationId)
+            .eq('role', 'owner')
+            .maybeSingle(),
+        ]);
+        const ownerFromRow = (ownerRow as { user_id?: string } | null)?.user_id ?? null;
+        if (isOwner || (createdBy === null && ownerFromRow === userId)) return null;
         if (!participant) return 'You are not a participant of this conversation';
         if (!CHANNEL_POST_ROLES.has((participant as { role?: string }).role as string)) {
           return 'Only the channel owner or moderators can post';
@@ -657,13 +669,26 @@ async function resolveChannelUserRole(
       if (!conv) return null;
       const createdBy = (conv as { created_by?: string | null }).created_by ?? null;
       if (createdBy === userId) return 'owner';
-      const { data: participant } = await entry.client
-        .from('conversation_participants')
-        .select('role')
-        .eq('conversation_id', conversationId)
-        .eq('user_id', userId)
-        .maybeSingle();
-      const role = (participant as { role?: string | null } | null)?.role ?? null;
+      const [participant, ownerRow] = await Promise.all([
+        entry.client
+          .from('conversation_participants')
+          .select('role')
+          .eq('conversation_id', conversationId)
+          .eq('user_id', userId)
+          .maybeSingle(),
+        entry.client
+          .from('conversation_participants')
+          .select('user_id')
+          .eq('conversation_id', conversationId)
+          .eq('role', 'owner')
+          .maybeSingle(),
+      ]);
+      const role = (participant?.data as { role?: string | null } | null)?.role ?? null;
+      // When `created_by` is missing, the participant row with role='owner'
+      // pins the owner — it must map to 'owner' even if the caller's own row
+      // was overwritten to a stale `follower` role.
+      const ownerId = (ownerRow?.data as { user_id?: string } | null)?.user_id ?? null;
+      if (createdBy === null && ownerId === userId) return 'owner';
       return role === 'owner' || role === 'moderator' || role === 'follower' ? role : null;
     } catch {
       // Try the next readable project.

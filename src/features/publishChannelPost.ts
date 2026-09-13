@@ -44,14 +44,16 @@ export async function publishChannelPost(
   // owns the participant rows (same DB). `conversations.created_by` is the
   // authoritative owner and MUST win over a stored role: the owner can hold a
   // stale `follower` participant row (legacy follows upserted the role), which
-  // must never demote them to read-only.
+  // must never demote them to read-only. If `created_by` is missing on the
+  // conversation, the participant row with role='owner' pins the owner instead.
   let role: string | null = null;
   let createdBy: string | null = null;
+  let ownerId: string | null = null;
   let convType: string | null = null;
   let hostClient: SupabaseClient | null = null;
   for (const entry of participants) {
     try {
-      const [{ data: participant }, { data: conv }] = await Promise.all([
+      const [{ data: participant }, { data: conv }, { data: ownerRow }] = await Promise.all([
         entry.client
           .from('conversation_participants')
           .select('role')
@@ -63,6 +65,12 @@ export async function publishChannelPost(
           .select('type, created_by')
           .eq('id', conversationId)
           .maybeSingle(),
+        entry.client
+          .from('conversation_participants')
+          .select('user_id')
+          .eq('conversation_id', conversationId)
+          .eq('role', 'owner')
+          .maybeSingle(),
       ]);
       if (conv) {
         convType = (conv as { type?: string | null }).type ?? null;
@@ -71,6 +79,9 @@ export async function publishChannelPost(
       }
       if (participant) {
         role = (participant as { role?: string }).role ?? null;
+      }
+      if (ownerRow) {
+        ownerId = (ownerRow as { user_id?: string }).user_id ?? null;
       }
       if (convType !== null || createdBy !== null) break;
     } catch {
@@ -82,8 +93,8 @@ export async function publishChannelPost(
   // 2. Only the owner/moderator may publish; followers are read/reply-only.
   //    The creator is always a publisher even when their participant row is
   //    missing or a stale follower row.
-  const isOwner = createdBy === userId;
-  const isPublisher = isOwner || role === 'owner' || role === 'moderator';
+  const isOwner = createdBy === userId || (createdBy === null && ownerId === userId);
+  const isPublisher = isOwner || role === 'owner' || role === 'moderator' || (ownerId === userId && role !== null);
   if (!isOwner && !role) return { status: 'not_member' };
   if (!isPublisher) return { status: 'not_publisher' };
 
