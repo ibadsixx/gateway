@@ -102,12 +102,17 @@ export async function publishChannelPost(
   if (convType !== 'channel') return { status: 'not_channel' };
 
   // 4. Insert the post ONCE with the same classification the SPA uses for
-  //    direct/group sends.
+  //    direct/group sends. The select is intentionally left UNJOINED: the embed
+  //    `sender_profile:profiles!messages_sender_id_fkey(...)` cannot resolve on
+  //    the conversations host (that host does not host `profiles`), so a PostgREST
+  //    insert with it returns an error and the message is never written. The
+  //    sender's profile is attached afterwards from the users host, mirroring
+  //    how the SPA resolves it client-side for DM/group inserts.
   const urlPath = payload.mediaUrl ? payload.mediaUrl.split('?')[0] : '';
   const isVideo = !!payload.mediaUrl && /\.(mp4|webm|ogg|mov|avi|mkv|m4v)$/i.test(urlPath);
   const isImage = !isVideo && !!payload.imageUrl;
 
-  const { data, error } = await hostClient
+  const { data: inserted, error } = await hostClient
     .from('messages')
     .insert({
       conversation_id: conversationId,
@@ -120,24 +125,33 @@ export async function publishChannelPost(
       is_image: isImage,
       message_type: isVideo ? 'video' : isImage ? 'image' : 'text',
     })
-    .select(`
-      id,
-      conversation_id,
-      sender_id,
-      content,
-      encrypted_content,
-      encryption_iv,
-      attachment_url,
-      image_url,
-      media_url,
-      is_image,
-      message_type,
-      reply_to_id,
-      created_at,
-      sender_profile:profiles!messages_sender_id_fkey(username, display_name, profile_pic)
-    `)
+    .select()
     .single();
   if (error) throw new Error(`Failed to publish channel post: ${error.message}`);
 
-  return { status: 'ok', message: data as Record<string, unknown> };
+  const message = inserted as Record<string, unknown>;
+  message['sender_profile'] = await resolveSenderProfile(
+    typeof message['sender_id'] === 'string' ? message['sender_id'] : null
+  );
+
+  return { status: 'ok', message };
+}
+
+// Attach the sender's profile to the published row from the users host
+// (best-effort). The conversations host cannot join `profiles`, so the post
+// carries the sender id and the profile is filled in here.
+async function resolveSenderProfile(userId: string | null): Promise<Record<string, unknown> | null> {
+  if (!userId) return null;
+  const profiles = projectManager.getReadableProjects('profiles');
+  if (profiles.length === 0) return null;
+  try {
+    const { data } = await profiles[0].client
+      .from('profiles')
+      .select('username, display_name, profile_pic')
+      .eq('id', userId)
+      .maybeSingle();
+    return (data as Record<string, unknown> | null) ?? null;
+  } catch {
+    return null;
+  }
 }
