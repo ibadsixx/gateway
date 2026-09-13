@@ -697,6 +697,79 @@ async function resolveChannelUserRole(
   return null;
 }
 
+// The DB get_channel_members function uses auth.uid(), which is NULL on the
+// conversations host (it does not share the users JWT secret), so the proxied
+// call cannot resolve the caller's membership there and errors for every
+// requester. Following the resolveChannelUserRole precedent, compute the member
+// list gateway-side from conversation_participants (conversations host) and
+// enrich the profile fields from the users host, returning the exact response
+// shape the DB function produced. Returns null when the caller is not a member
+// of the channel (the DB RAISE case).
+async function resolveChannelMembers(
+  userId: string | undefined,
+  body: Record<string, unknown>
+): Promise<Array<Record<string, unknown>> | null> {
+  const conversationId = body && typeof body['p_conversation_id'] === 'string'
+    ? (body['p_conversation_id'] as string)
+    : null;
+  if (!conversationId || !userId) return null;
+  for (const entry of projectManager.getReadableProjects('conversations')) {
+    try {
+      const { data: conv } = await entry.client
+        .from('conversations')
+        .select('type, created_by')
+        .eq('id', conversationId)
+        .maybeSingle();
+      if (!conv) return [];
+      const { type, created_by } = conv as { type?: string | null; created_by?: string | null };
+      if (type !== 'channel') return [];
+      const { data: participants } = await entry.client
+        .from('conversation_participants')
+        .select('user_id, role, joined_at')
+        .eq('conversation_id', conversationId);
+      const memberRows = (participants as Array<Record<string, unknown>>) || [];
+      // Mirror the DB function's participant gate: the caller (or the channel
+      // creator) must be in the member list — otherwise the call is a 403.
+      const isOwner = created_by === userId;
+      const isParticipant = memberRows.some((r) => r['user_id'] === userId);
+      if (!isOwner && !isParticipant) return null;
+      const profiles = projectManager.getReadableProjects('profiles');
+      const profileClient = profiles[0]?.client;
+      const ids = memberRows
+        .map((r) => r['user_id'])
+        .filter((id): id is string => typeof id === 'string');
+      const byId = new Map<string, Record<string, unknown>>();
+      if (profileClient && ids.length > 0) {
+        const { data: profRows } = await profileClient
+          .from('profiles')
+          .select('id, username, display_name, profile_pic')
+          .in('id', ids);
+        for (const p of (profRows as Array<Record<string, unknown>>) || []) {
+          byId.set(String(p['id']), p);
+        }
+      }
+      const out = memberRows.map((r) => {
+        const uid = r['user_id'];
+        const p = typeof uid === 'string' ? byId.get(uid) : undefined;
+        return {
+          user_id: uid,
+          username: p?.username ?? null,
+          display_name: p?.display_name ?? 'Unknown',
+          profile_pic: p?.profile_pic ?? null,
+          role: r['role'] ?? null,
+          joined_at: r['joined_at'] ?? null,
+        };
+      });
+      const rank = (role: unknown): number => role === 'owner' ? 0 : role === 'moderator' ? 1 : role === 'follower' ? 2 : 3;
+      out.sort((a, b) => rank(a.role) - rank(b.role) || String(a.display_name).localeCompare(String(b.display_name)));
+      return out;
+    } catch {
+      // Try the next readable project.
+    }
+  }
+  return [];
+}
+
 // Channel RPCs run on the conversations host, which does not host `profiles`.
 // Fields that need profile data (owner_name in get_channel_stats, and the
 // member username/display_name/profile_pic in get_channel_members) are returned
@@ -814,6 +887,20 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
     // (the owner always reads as 'owner'), otherwise the participant role.
     if (rpcName === 'get_channel_user_role') {
       res.status(200).json(await resolveChannelUserRole(req.user?.id, body as Record<string, unknown>));
+      return;
+    }
+
+    // get_channel_members hits the same auth.uid() wall on the conversations
+    // host, so it is computed gateway-side too (see resolveChannelMembers):
+    // conversation_participants from the conversations host + profile
+    // enrichment from the users host, mirroring the DB function's response.
+    if (rpcName === 'get_channel_members') {
+      const members = await resolveChannelMembers(req.user?.id, body as Record<string, unknown>);
+      if (members === null) {
+        res.status(403).json({ error: 'You are not a participant of this conversation' });
+        return;
+      }
+      res.status(200).json(members);
       return;
     }
 
