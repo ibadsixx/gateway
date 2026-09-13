@@ -727,9 +727,12 @@ async function enrichChannelRpcResponse(functionName: string, payload: unknown):
     }
     if (functionName === 'get_channel_members') {
       const rows = payload as Array<Record<string, unknown>>;
+      // The conversations-host variant may return the member id under either
+      // `id` or `user_id`; normalize all rows to `user_id` so the client
+      // contract is stable regardless of which column the function emits.
       const ids = rows
-        .map((r) => r['user_id'])
-        .filter((id): id is string => typeof id === 'string');
+        .map((r) => (typeof r['user_id'] === 'string' ? r['user_id'] : r['id']))
+        .filter((uid): uid is string => typeof uid === 'string');
       if (ids.length === 0) return payload;
       const { data } = await profileClient
         .from('profiles')
@@ -740,7 +743,10 @@ async function enrichChannelRpcResponse(functionName: string, payload: unknown):
         byId.set(String(p['id']), p);
       }
       for (const row of rows) {
-        const p = byId.get(String(row['user_id']));
+        const uid = typeof row['user_id'] === 'string' ? row['user_id'] : row['id'];
+        if (typeof uid !== 'string') continue;
+        row['user_id'] = uid;
+        const p = byId.get(uid);
         row['username'] = p?.username ?? null;
         row['display_name'] = p?.display_name ?? 'Unknown';
         row['profile_pic'] = p?.profile_pic ?? null;
