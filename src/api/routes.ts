@@ -598,13 +598,93 @@ const RPC_DOMAIN_OVERRIDES: Record<string, string> = {
   // caller id into the RPC arguments instead (see RPC_INJECT_CALLER_ID).
   add_channel_follower: 'conversations',
   add_group_member: 'conversations',
+  // The channel RPCs originally ran on the (pre-split) users host, but they
+  // reference tables (conversations / conversation_participants) that now live
+  // on the conversations host — calling them there returns 42P01. Route them
+  // to the conversations project and inject the verified caller id. Fields
+  // that need `profiles` (not present on the conversations host) are returned
+  // as ids and enriched by the gateway afterwards (see enrichChannelRpcResponse).
+  follow_channel: 'conversations',
+  unfollow_channel: 'conversations',
+  get_channel_user_role: 'conversations',
+  get_channel_members: 'conversations',
+  get_channel_stats: 'conversations',
+  add_channel_moderator: 'conversations',
+  remove_channel_moderator: 'conversations',
 };
 
 // Conversation-domain RPCs are SECURITY DEFINER functions whose auth.uid()
 // check would see NULL on a cross-project anon call. The gateway replaces its
-// own verified caller id into the p_user_id argument before forwarding, so the
-// function's permission checks run against the real user.
-const RPC_INJECT_CALLER_ID = new Set(['add_channel_follower', 'add_group_member']);
+// own verified caller id into the function's caller argument before forwarding,
+// so the function's permission checks run against the real user. Some functions
+// call the actor `p_user_id`; the moderator helpers call it `p_caller_id` to
+// keep the existing `p_user_id` argument as the moderator being added/removed.
+const RPC_CALLER_ID_PARAM: Record<string, string> = {
+  add_channel_follower: 'p_user_id',
+  add_group_member: 'p_user_id',
+  follow_channel: 'p_user_id',
+  unfollow_channel: 'p_user_id',
+  get_channel_user_role: 'p_user_id',
+  get_channel_members: 'p_user_id',
+  add_channel_moderator: 'p_caller_id',
+  remove_channel_moderator: 'p_caller_id',
+};
+
+// Channel RPCs run on the conversations host, which does not host `profiles`.
+// Fields that need profile data (owner_name in get_channel_stats, and the
+// member username/display_name/profile_pic in get_channel_members) are returned
+// as ids and filled in here from the users host, preserving the exact response
+// shape the client expects. Best-effort: on failure the ids are returned as-is.
+async function enrichChannelRpcResponse(functionName: string, payload: unknown): Promise<unknown> {
+  if (!payload || !Array.isArray(payload) || payload.length === 0) return payload;
+  const profiles = projectManager.getReadableProjects('profiles');
+  const profileClient = profiles[0]?.client;
+  if (!profileClient) return payload;
+  try {
+    if (functionName === 'get_channel_stats') {
+      for (const row of payload as Array<Record<string, unknown>>) {
+        const ownerId = typeof row['owner_id'] === 'string' ? row['owner_id'] : null;
+        if (!ownerId) {
+          row['owner_name'] = 'Unknown';
+          continue;
+        }
+        const { data } = await profileClient
+          .from('profiles')
+          .select('username, display_name')
+          .eq('id', ownerId)
+          .maybeSingle();
+        const profile = data as { username?: string | null; display_name?: string | null } | null;
+        row['owner_name'] = profile?.display_name || profile?.username || 'Unknown';
+      }
+      return payload;
+    }
+    if (functionName === 'get_channel_members') {
+      const rows = payload as Array<Record<string, unknown>>;
+      const ids = rows
+        .map((r) => r['user_id'])
+        .filter((id): id is string => typeof id === 'string');
+      if (ids.length === 0) return payload;
+      const { data } = await profileClient
+        .from('profiles')
+        .select('id, username, display_name, profile_pic')
+        .in('id', ids);
+      const byId = new Map<string, Record<string, unknown>>();
+      for (const p of (data as Array<Record<string, unknown>>) || []) {
+        byId.set(String(p['id']), p);
+      }
+      for (const row of rows) {
+        const p = byId.get(String(row['user_id']));
+        row['username'] = p?.username ?? null;
+        row['display_name'] = p?.display_name ?? 'Unknown';
+        row['profile_pic'] = p?.profile_pic ?? null;
+      }
+      return payload;
+    }
+  } catch (error) {
+    console.warn(`[Gateway] Channel RPC enrichment failed for ${functionName}:`, error);
+  }
+  return payload;
+}
 
 rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
   try {
@@ -646,10 +726,11 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
     // never from the client body.
     const rpcName = req.params.function;
     let body = req.body || {};
-    if (RPC_INJECT_CALLER_ID.has(rpcName)) {
+    const callerIdParam = RPC_CALLER_ID_PARAM[rpcName];
+    if (callerIdParam) {
       body = { ...(body as Record<string, unknown>) };
       if (req.user?.id) {
-        (body as Record<string, unknown>)['p_user_id'] = req.user.id;
+        (body as Record<string, unknown>)[callerIdParam] = req.user.id;
       }
     }
 
@@ -689,7 +770,7 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
       return;
     }
 
-    res.status(200).json(payload);
+    res.status(200).json(await enrichChannelRpcResponse(rpcName, payload));
   } catch (error) {
     console.error('[Gateway] RPC proxy error:', error);
     res.status(502).json({ error: 'RPC proxy failed' });
