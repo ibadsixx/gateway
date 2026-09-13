@@ -541,16 +541,20 @@ async function enforceMessageWritePolicy(
     try {
       const { data: conv } = await entry.client
         .from('conversations')
-        .select('type')
+        .select('type, created_by')
         .eq('id', conversationId)
         .maybeSingle();
       if (conv && (conv as { type?: string }).type === 'channel') {
+        // `created_by` is the authoritative owner and always outranks the
+        // participant row: a stale `follower` role must never demote them.
+        const isOwner = (conv as { created_by?: string | null }).created_by === userId;
         const { data: participant } = await entry.client
           .from('conversation_participants')
           .select('role')
           .eq('conversation_id', conversationId)
           .eq('user_id', userId)
           .maybeSingle();
+        if (isOwner) return null;
         if (!participant) return 'You are not a participant of this conversation';
         if (!CHANNEL_POST_ROLES.has((participant as { role?: string }).role as string)) {
           return 'Only the channel owner or moderators can post';
@@ -629,6 +633,44 @@ const RPC_CALLER_ID_PARAM: Record<string, string> = {
   add_channel_moderator: 'p_caller_id',
   remove_channel_moderator: 'p_caller_id',
 };
+
+// Equivalent of the DB `get_channel_user_role` computed gateway-side. The DB
+// function reads auth.uid(), which is NULL on the conversations host, so the
+// proxied function resolves to no role for every caller. `conversations.created_by`
+// is authoritative (the owner always wins, even with a stale `follower` row),
+// otherwise the caller's participant row role is returned.
+async function resolveChannelUserRole(
+  userId: string | undefined,
+  body: Record<string, unknown>
+): Promise<string | null> {
+  const conversationId = body && typeof body['p_conversation_id'] === 'string'
+    ? (body['p_conversation_id'] as string)
+    : null;
+  if (!conversationId || !userId) return null;
+  for (const entry of projectManager.getReadableProjects('conversations')) {
+    try {
+      const { data: conv } = await entry.client
+        .from('conversations')
+        .select('created_by')
+        .eq('id', conversationId)
+        .maybeSingle();
+      if (!conv) return null;
+      const createdBy = (conv as { created_by?: string | null }).created_by ?? null;
+      if (createdBy === userId) return 'owner';
+      const { data: participant } = await entry.client
+        .from('conversation_participants')
+        .select('role')
+        .eq('conversation_id', conversationId)
+        .eq('user_id', userId)
+        .maybeSingle();
+      const role = (participant as { role?: string | null } | null)?.role ?? null;
+      return role === 'owner' || role === 'moderator' || role === 'follower' ? role : null;
+    } catch {
+      // Try the next readable project.
+    }
+  }
+  return null;
+}
 
 // Channel RPCs run on the conversations host, which does not host `profiles`.
 // Fields that need profile data (owner_name in get_channel_stats, and the
@@ -732,6 +774,16 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
       if (req.user?.id) {
         (body as Record<string, unknown>)[callerIdParam] = req.user.id;
       }
+    }
+
+    // get_channel_user_role reads auth.uid(), which is NULL on the conversations
+    // host (it does not share the users JWT secret) — the proxied function would
+    // resolve to no role for every caller. Compute it here instead, using the
+    // same tables as publish approval: conversations.created_by is authoritative
+    // (the owner always reads as 'owner'), otherwise the participant role.
+    if (rpcName === 'get_channel_user_role') {
+      res.status(200).json(await resolveChannelUserRole(req.user?.id, body as Record<string, unknown>));
+      return;
     }
 
     const url = `${credentials.project_url}/rest/v1/rpc/${encodeURIComponent(rpcName)}`;

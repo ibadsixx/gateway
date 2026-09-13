@@ -39,44 +39,56 @@ export async function publishChannelPost(
   const participants = projectManager.getReadableProjects('conversation_participants');
   if (participants.length === 0) return { status: 'not_member' };
 
-  // 1. Locate the caller's role. Sharded hosts are tried in order; the first
-  // host that owns the row also owns the `conversations` row (same DB).
+  // 1. Locate the caller's participant row and the conversation row. Sharded
+  // hosts are tried in order; the first host that owns the conversation also
+  // owns the participant rows (same DB). `conversations.created_by` is the
+  // authoritative owner and MUST win over a stored role: the owner can hold a
+  // stale `follower` participant row (legacy follows upserted the role), which
+  // must never demote them to read-only.
   let role: string | null = null;
+  let createdBy: string | null = null;
+  let convType: string | null = null;
   let hostClient: SupabaseClient | null = null;
   for (const entry of participants) {
     try {
-      const { data } = await entry.client
-        .from('conversation_participants')
-        .select('role')
-        .eq('conversation_id', conversationId)
-        .eq('user_id', userId)
-        .maybeSingle();
-      if (data) {
-        role = data.role as string;
-        hostClient = entry.client;
-        break;
+      const [{ data: participant }, { data: conv }] = await Promise.all([
+        entry.client
+          .from('conversation_participants')
+          .select('role')
+          .eq('conversation_id', conversationId)
+          .eq('user_id', userId)
+          .maybeSingle(),
+        entry.client
+          .from('conversations')
+          .select('type, created_by')
+          .eq('id', conversationId)
+          .maybeSingle(),
+      ]);
+      if (conv) {
+        convType = (conv as { type?: string | null }).type ?? null;
+        createdBy = (conv as { created_by?: string | null }).created_by ?? null;
+        if (!hostClient) hostClient = entry.client;
       }
+      if (participant) {
+        role = (participant as { role?: string }).role ?? null;
+      }
+      if (convType !== null || createdBy !== null) break;
     } catch {
       // Try the next readable host.
     }
   }
-  if (!role || !hostClient) return { status: 'not_member' };
+  if (!hostClient || !convType) return { status: 'not_member' };
 
-  // 2. Only owner/moderator may publish; followers are read/reply-only.
-  const isPublisher = role === 'owner' || role === 'moderator';
+  // 2. Only the owner/moderator may publish; followers are read/reply-only.
+  //    The creator is always a publisher even when their participant row is
+  //    missing or a stale follower row.
+  const isOwner = createdBy === userId;
+  const isPublisher = isOwner || role === 'owner' || role === 'moderator';
+  if (!isOwner && !role) return { status: 'not_member' };
   if (!isPublisher) return { status: 'not_publisher' };
 
   // 3. Only channels can be published to.
-  try {
-    const { data: conv } = await hostClient
-      .from('conversations')
-      .select('type')
-      .eq('id', conversationId)
-      .maybeSingle();
-    if (!conv || conv.type !== 'channel') return { status: 'not_channel' };
-  } catch {
-    return { status: 'not_channel' };
-  }
+  if (convType !== 'channel') return { status: 'not_channel' };
 
   // 4. Insert the post ONCE with the same classification the SPA uses for
   //    direct/group sends.
