@@ -18,6 +18,8 @@ import { addChannelFollower } from './addChannelFollower';
 import { evaluateChannelMessageGate } from './channelMessageGate';
 import { evaluatePinPolicy, evaluatePinDeletePolicy } from './channelPinGate';
 import { removeChannelMember } from './removeChannelMember';
+import { computeChannelStats } from './channelStats';
+import type { ChannelContext } from './channelContext';
 
 type Row = Record<string, unknown>;
 type Db = Record<string, Row[]>;
@@ -362,6 +364,59 @@ async function main() {
   await run('REMOVE: group conversation refused -> not_channel', async () => {
     const r = await removeChannelMember(GROUP, FOL, OWNER, projects6);
     assert.equal(r.status, 'not_channel');
+  });
+
+  // ---------- channel stats (owner excluded from follower count) ----------
+  const makeCtx = (db: Db, createdBy: string | null, ownerId: string | null): ChannelContext => ({
+    client: makeClient(db),
+    conversationId: CHANNEL,
+    type: 'channel',
+    createdBy,
+    ownerId,
+    callerRole: 'owner',
+  });
+
+  const db7 = makeDb();
+  await run('STATS: counts match the real membership rows', async () => {
+    const [stats] = await computeChannelStats(makeCtx(db7, OWNER, OWNER), projectsFor(db7));
+    assert.equal(stats.follower_count, 2);   // FOL, OTHER
+    assert.equal(stats.moderator_count, 2);  // MOD, MOD2
+    assert.equal(stats.owner_id, OWNER);
+    assert.equal(stats.owner_name, 'owner');
+  });
+
+  const db8 = makeDb();
+  (db8.conversation_participants as Row[]).forEach((p) => {
+    if (p.conversation_id === CHANNEL && p.user_id === OWNER) p.role = 'follower';
+  });
+  await run('STATS: owner with a stale follower row is excluded from the follower count', async () => {
+    // A legacy follow_channel upsert left the owner with role='follower'; the
+    // gateway must still resolve them via conversations.created_by and not count
+    // them as a follower (the old DB function inflated the count and hid the name).
+    const [stats] = await computeChannelStats(makeCtx(db8, OWNER, null), projectsFor(db8));
+    assert.equal(stats.follower_count, 2);   // FOL, OTHER — NEVER the owner
+    assert.equal(stats.moderator_count, 2);  // MOD, MOD2
+    assert.equal(stats.owner_id, OWNER);
+    assert.equal(stats.owner_name, 'owner');
+  });
+
+  const db9 = makeDb();
+  (db9.conversation_participants as Row[]).forEach((p) => {
+    if (p.conversation_id === CHANNEL && p.user_id === OWNER) p.role = 'moderator';
+  });
+  await run('STATS: owner explicitly stored as moderator is counted in moderator_count', async () => {
+    const [stats] = await computeChannelStats(makeCtx(db9, OWNER, null), projectsFor(db9));
+    assert.equal(stats.moderator_count, 3);  // MOD, MOD2 + owner (explicit row)
+    assert.equal(stats.owner_id, OWNER);
+  });
+
+  await run('STATS: a channel with no participants reports zeroes', async () => {
+    const dbEmpty = makeDb();
+    dbEmpty.conversation_participants = [];
+    const [stats] = await computeChannelStats(makeCtx(dbEmpty, OWNER, null), projectsFor(dbEmpty));
+    assert.equal(stats.follower_count, 0);
+    assert.equal(stats.moderator_count, 0);
+    assert.equal(stats.owner_id, OWNER);
   });
 
   console.log(`\n${count} channel-module test groups passed.`);

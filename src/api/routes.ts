@@ -36,6 +36,7 @@ import {
 } from '../features/channelMessageGate';
 import { evaluatePinPolicy, evaluatePinDeletePolicy } from '../features/channelPinGate';
 import { resolveChannelContext, isChannel, isOwnerOf, isModeratorOf } from '../features/channelContext';
+import { computeChannelStats } from '../features/channelStats';
 
 // Applies the gateway-owned category to a `message_requests` insert body when
 // the request is created (messages.md). The Gateway classifies because friends
@@ -1300,9 +1301,10 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
     }
 
     // get_channel_stats is a moderator-scoped read (messages.md): a follower
-    // must NOT be able to view channel statistics. The allowed owner/moderator
-    // call falls through to the proxied DB function and the profiles-host
-    // enrichment below.
+    // must NOT be able to view channel statistics. The owner/moderator call is
+    // answered gateway-side from conversation_participants (matching the Members
+    // list) instead of proxying the conversations-host DB function, which counts
+    // a stale owner `follower` row and cannot resolve owner_name cross-host.
     if (rpcName === 'get_channel_stats') {
       const rpcBody = body as Record<string, unknown>;
       const conversationId = typeof rpcBody['p_conversation_id'] === 'string' ? rpcBody['p_conversation_id'] as string : null;
@@ -1319,6 +1321,8 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
         res.status(403).json({ error: 'Only the channel owner or moderators can view channel statistics' });
         return;
       }
+      res.status(200).json(await computeChannelStats(statsCtx));
+      return;
     }
 
     const url = `${credentials.project_url}/rest/v1/rpc/${encodeURIComponent(rpcName)}`;
