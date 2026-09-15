@@ -26,6 +26,7 @@ import { ensureUserProfile } from '../profile-helper';
 import { classifyMessageRequest } from '../features/messageRequestCategory';
 import { leaveGroupConversation } from '../features/leaveGroupConversation';
 import { publishChannelPost } from '../features/publishChannelPost';
+import { removeChannelMember } from '../features/removeChannelMember';
 
 // Applies the gateway-owned category to a `message_requests` insert body when
 // the request is created (messages.md). The Gateway classifies because friends
@@ -335,6 +336,49 @@ v1.post('/conversations/:conversationId/publish', async (req, res) => {
     res.status(201).json(result.message);
   } catch (error) {
     console.error(`[gateway] Publish channel post ${conversationId} failed:`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Remove a channel member — gateway-owned (messages.md).
+// Only the channel owner may remove followers/moderators. The Gateway verifies
+// the caller is the channel owner (conversations.created_by) before deleting
+// the target's participant row. The owner and the caller cannot be removed.
+// Self-removal must use the Leave channel (unfollow_channel) path instead.
+v1.delete('/conversations/:conversationId/members/:memberId', async (req, res) => {
+  const { conversationId, memberId } = req.params;
+  const userId = req.user?.id;
+  if (!conversationId || !memberId || !userId) {
+    res.status(400).json({ error: 'Conversation, member, and authenticated user are required' });
+    return;
+  }
+  try {
+    const result = await removeChannelMember(conversationId, memberId, userId);
+    switch (result.status) {
+      case 'ok':
+        res.status(204).send();
+        return;
+      case 'not_member':
+        res.status(404).json({ error: 'You are not a participant of this conversation' });
+        return;
+      case 'not_channel':
+        res.status(400).json({ error: 'Only channel members can be managed this way' });
+        return;
+      case 'not_owner':
+        res.status(403).json({ error: 'Only the channel owner can remove members' });
+        return;
+      case 'owner_protected':
+        res.status(403).json({ error: 'The channel owner cannot be removed' });
+        return;
+      case 'self_removal':
+        res.status(400).json({ error: 'You cannot remove yourself; use Leave channel instead' });
+        return;
+      case 'member_not_found':
+        res.status(404).json({ error: 'Member is not a participant of this channel' });
+        return;
+    }
+  } catch (error) {
+    console.error(`[gateway] Remove channel member ${conversationId}/${memberId} failed:`, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
