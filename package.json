@@ -7,6 +7,7 @@
     "build": "tsc",
     "start": "node dist/src/dev.js",
     "dev": "ts-node src/dev.ts",
+    "test:channel-moderator": "ts-node src/features/channelModeratorTest.ts",
     "verify:message-requests": "ts-node src/features/verifyMessageRequestCategory.ts"
   },
   "dependencies": {

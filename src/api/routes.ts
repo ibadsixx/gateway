@@ -27,6 +27,7 @@ import { classifyMessageRequest } from '../features/messageRequestCategory';
 import { leaveGroupConversation } from '../features/leaveGroupConversation';
 import { publishChannelPost } from '../features/publishChannelPost';
 import { removeChannelMember } from '../features/removeChannelMember';
+import { addChannelModerator, removeChannelModerator } from '../features/channelModerator';
 
 // Applies the gateway-owned category to a `message_requests` insert body when
 // the request is created (messages.md). The Gateway classifies because friends
@@ -946,6 +947,56 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
       }
       res.status(200).json(members);
       return;
+    }
+
+    // add/remove_channel_moderator hit the same auth.uid() wall as the RPCs
+    // above: the conversations host does not share the users JWT secret, so the
+    // SECURITY DEFINER functions resolve auth.uid() = NULL — every promotion and
+    // demotion failed, owner included. The gateway also injects p_caller_id,
+    // which those functions do not accept, and the SPA names the target
+    // p_moderator_id while the repo signature expects p_user_id. Promotions and
+    // demotions are therefore applied gateway-side against conversation_participants
+    // on the conversations host (see features/channelModerator.ts), so the result
+    // no longer depends on what is deployed at the DB function.
+    if (rpcName === 'add_channel_moderator' || rpcName === 'remove_channel_moderator') {
+      const rpcBody = body as Record<string, unknown>;
+      const conversationId = typeof rpcBody['p_conversation_id'] === 'string' ? rpcBody['p_conversation_id'] as string : null;
+      const targetUserId = typeof rpcBody['p_moderator_id'] === 'string'
+        ? rpcBody['p_moderator_id'] as string
+        : typeof rpcBody['p_user_id'] === 'string' ? rpcBody['p_user_id'] as string : null;
+      const addVerb = rpcName === 'add_channel_moderator';
+      const result = addVerb
+        ? await addChannelModerator(conversationId, targetUserId, req.user?.id)
+        : await removeChannelModerator(conversationId, targetUserId, req.user?.id);
+      switch (result.status) {
+        case 'ok':
+          res.status(200).json(null);
+          return;
+        case 'not_authenticated':
+          res.status(401).json({ error: 'Not authenticated' });
+          return;
+        case 'target_required':
+          res.status(400).json({ error: 'Moderator target is required' });
+          return;
+        case 'conversation_not_found':
+          res.status(404).json({ error: 'Conversation not found' });
+          return;
+        case 'not_channel':
+          res.status(400).json({ error: 'Not a channel conversation' });
+          return;
+        case 'not_owner':
+          res.status(403).json({ error: addVerb ? 'Only the channel owner can add moderators' : 'Only the channel owner can remove moderators' });
+          return;
+        case 'owner_protected':
+          res.status(403).json({ error: 'The channel owner cannot be promoted or demoted' });
+          return;
+        case 'target_not_member':
+          res.status(400).json({ error: 'User is not a participant of this channel' });
+          return;
+        case 'target_not_moderator':
+          res.status(400).json({ error: 'User is not a moderator' });
+          return;
+      }
     }
 
     const url = `${credentials.project_url}/rest/v1/rpc/${encodeURIComponent(rpcName)}`;
