@@ -8,7 +8,9 @@
     "start": "node dist/src/dev.js",
     "dev": "ts-node src/dev.ts",
     "test:channel-moderator": "ts-node src/features/channelModeratorTest.ts",
-    "verify:message-requests": "ts-node src/features/verifyMessageRequestCategory.ts"
+    "verify:message-requests": "ts-node src/features/verifyMessageRequestCategory.ts",
+    "test:channel-permissions": "ts-node src/features/channelPermissionsTest.ts",
+    "test:all-channel": "npm run test:channel-moderator && npm run test:channel-permissions"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.0",

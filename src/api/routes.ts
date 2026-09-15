@@ -28,6 +28,14 @@ import { leaveGroupConversation } from '../features/leaveGroupConversation';
 import { publishChannelPost } from '../features/publishChannelPost';
 import { removeChannelMember } from '../features/removeChannelMember';
 import { addChannelModerator, removeChannelModerator } from '../features/channelModerator';
+import { deleteChannel } from '../features/deleteChannel';
+import { addChannelFollower } from '../features/addChannelFollower';
+import {
+  evaluateChannelMessageGate,
+  stripNonEditable,
+} from '../features/channelMessageGate';
+import { evaluatePinPolicy, evaluatePinDeletePolicy } from '../features/channelPinGate';
+import { resolveChannelContext, isChannel, isOwnerOf, isModeratorOf } from '../features/channelContext';
 
 // Applies the gateway-owned category to a `message_requests` insert body when
 // the request is created (messages.md). The Gateway classifies because friends
@@ -163,6 +171,161 @@ v1.use((req, res, next) => {
   return auth.authenticate(req, res, next);
 });
 
+// Rename / re-describe a channel — moderator permission (messages.md). The
+// generic PUT /:domain/:id route ran with a service-key client that ignores
+// RLS, so a follower could rewrite the channel name/description by calling the
+// gateway directly. Owner/moderators pass; other channel callers are denied;
+// non-channel conversations keep the generic behaviour.
+v1.put('/conversations/:conversationId', async (req, res) => {
+  const { conversationId } = req.params;
+  const userId = req.user?.id;
+  if (!featureFlags.isEnabled('conversations')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  if (!conversationId || !userId) {
+    res.status(400).json({ error: 'Conversation and authenticated user are required' });
+    return;
+  }
+  const ctx = await resolveChannelContext(conversationId, userId);
+  if (!ctx) {
+    res.status(404).json({ error: 'Conversation not found' });
+    return;
+  }
+  if (!isChannel(ctx)) {
+    const result = await database.update('conversations', conversationId, req.body);
+    res.json(result);
+    return;
+  }
+  if (!isOwnerOf(ctx, userId) && !isModeratorOf(ctx, userId)) {
+    res.status(403).json({ error: 'Only the channel owner or moderators can edit the channel' });
+    return;
+  }
+  const clean: Record<string, unknown> = {};
+  if (req.body && typeof req.body === 'object') {
+    const body = req.body as Record<string, unknown>;
+    if (typeof body['name'] === 'string') clean['name'] = body['name'];
+    if ('description' in body) clean['description'] = body['description'] ?? null;
+  }
+  if (!('name' in clean) && !('description' in clean)) {
+    res.status(400).json({ error: 'No editable channel fields provided' });
+    return;
+  }
+  try {
+    await database.update('conversations', conversationId, clean);
+    res.status(204).send();
+  } catch (error) {
+    console.error(`[gateway] Update channel ${conversationId} failed:`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete a channel — owner only (messages.md). Non-channel conversations fall
+// through to the existing generic delete behaviour.
+v1.delete('/conversations/:conversationId', async (req, res) => {
+  const { conversationId } = req.params;
+  const userId = req.user?.id;
+  if (!featureFlags.isEnabled('conversations')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  if (!conversationId || !userId) {
+    res.status(400).json({ error: 'Conversation and authenticated user are required' });
+    return;
+  }
+  const permanent = req.query.permanent === 'true';
+  try {
+    const result = await deleteChannel(conversationId, userId);
+    switch (result.status) {
+      case 'ok':
+        res.status(204).send();
+        return;
+      case 'not_authenticated':
+        res.status(401).json({ error: 'Not authenticated' });
+        return;
+      case 'conversation_not_found':
+        res.status(404).json({ error: 'Conversation not found' });
+        return;
+      case 'not_channel':
+        await database.delete('conversations', conversationId, permanent);
+        res.status(204).send();
+        return;
+      case 'not_owner':
+        res.status(403).json({ error: 'Only the channel owner can delete this channel' });
+        return;
+    }
+  } catch (error) {
+    console.error(`[gateway] Delete conversation ${conversationId} failed:`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Edit a channel post — moderator permission (messages.md). Non-channel
+// message edits keep the existing generic behaviour.
+v1.put('/messages/:messageId', async (req, res) => {
+  const { messageId } = req.params;
+  const userId = req.user?.id;
+  if (!messageId || !userId) {
+    res.status(400).json({ error: 'Message and authenticated user are required' });
+    return;
+  }
+  try {
+    const gate = await evaluateChannelMessageGate(messageId, userId);
+    if (gate.status === 'message_not_found') {
+      res.status(404).json({ error: 'Message not found' });
+      return;
+    }
+    if (gate.status === 'not_authorized') {
+      res.status(403).json({ error: 'Only the channel owner or moderators can edit channel posts' });
+      return;
+    }
+    if (gate.channel) {
+      const clean = stripNonEditable((req.body as Record<string, unknown>) ?? {});
+      if (Object.keys(clean).length === 0) {
+        res.status(400).json({ error: 'No editable channel post fields provided' });
+        return;
+      }
+      const result = await database.update('messages', messageId, clean);
+      res.status(200).json(result);
+      return;
+    }
+    const result = await database.update('messages', messageId, req.body);
+    res.status(200).json(result);
+  } catch (error) {
+    console.error(`[gateway] PUT /api/v1/messages/${messageId} failed:`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete a channel post — moderator permission (messages.md); the post author
+// keeps the right to delete their own post. Non-channel messages keep the
+// existing generic behaviour.
+v1.delete('/messages/:messageId', async (req, res) => {
+  const { messageId } = req.params;
+  const userId = req.user?.id;
+  if (!messageId || !userId) {
+    res.status(400).json({ error: 'Message and authenticated user are required' });
+    return;
+  }
+  const permanent = req.query.permanent === 'true';
+  try {
+    const gate = await evaluateChannelMessageGate(messageId, userId);
+    if (gate.status === 'message_not_found') {
+      res.status(404).json({ error: 'Message not found' });
+      return;
+    }
+    if (gate.status === 'not_authorized') {
+      res.status(403).json({ error: 'Only the channel owner or moderators can delete channel posts' });
+      return;
+    }
+    await database.delete('messages', messageId, permanent);
+    res.status(204).send();
+  } catch (error) {
+    console.error(`[gateway] DELETE /api/v1/messages/${messageId} failed:`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 v1.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
   const { domain } = req.params;
   if (!featureFlags.isEnabled(domain)) {
@@ -174,6 +337,11 @@ v1.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
     const denied = await enforceMessageWritePolicy(domain, req.user?.id, req.body);
     if (denied) {
       res.status(403).json({ error: denied });
+      return;
+    }
+    const pinDenied = await enforcePinWritePolicy(domain, req.user?.id, req.body);
+    if (pinDenied) {
+      res.status(403).json({ error: pinDenied });
       return;
     }
     const result = await database.write(domain, req.body);
@@ -233,6 +401,15 @@ v1.delete('/:domain/:id', validation.validateDomainMiddleware, async (req, res) 
     res.status(404).json({ error: 'Not found' });
     return;
   }
+  // Unpinning is a moderator permission in channels (messages.md) — a follower
+  // must not be able to remove a pinned channel post by id.
+  if (domain === 'pinned_messages') {
+    const pinGate = await evaluatePinDeletePolicy(req.user?.id, { id });
+    if (pinGate.status === 'not_authorized') {
+      res.status(403).json({ error: 'Only the channel owner or moderators can unpin messages' });
+      return;
+    }
+  }
   const permanent = req.query.permanent === 'true';
   try {
     await database.delete(domain, id, permanent);
@@ -253,6 +430,32 @@ v1.delete('/:domain', validation.validateDomainMiddleware, async (req, res) => {
   if (!filters) {
     res.status(400).json({ error: 'No filters provided' });
     return;
+  }
+  // Bulk unpin is the same moderator-scoped action: a follower must not be able
+  // to remove pinned channel posts through the filter delete route.
+  if (domain === 'pinned_messages') {
+    const rendered = filters as string[];
+    const kv = (col: string): string | undefined => {
+      for (const f of rendered) {
+        const eqIdx = f.indexOf('=');
+        if (eqIdx === -1) continue;
+        if (f.slice(0, eqIdx) !== col) continue;
+        const rest = f.slice(eqIdx + 1);
+        const dotIdx = rest.indexOf('.');
+        if (dotIdx === -1) continue;
+        return rest.slice(dotIdx + 1);
+      }
+      return undefined;
+    };
+    const pinGate = await evaluatePinDeletePolicy(req.user?.id, {
+      conversationId: kv('conversation_id'),
+      messageId: kv('message_id'),
+      id: kv('id'),
+    });
+    if (pinGate.status === 'not_authorized') {
+      res.status(403).json({ error: 'Only the channel owner or moderators can unpin messages' });
+      return;
+    }
   }
   try {
     const readableProjects = projectManager.getReadableProjects(domain);
@@ -367,6 +570,9 @@ v1.delete('/conversations/:conversationId/members/:memberId', async (req, res) =
         return;
       case 'not_owner':
         res.status(403).json({ error: 'Only the channel owner can remove members' });
+        return;
+      case 'target_is_moderator':
+        res.status(403).json({ error: 'Only the channel owner can remove moderators' });
         return;
       case 'owner_protected':
         res.status(403).json({ error: 'The channel owner cannot be removed' });
@@ -623,6 +829,33 @@ async function enforceMessageWritePolicy(
     }
   }
   return 'Conversation not found';
+}
+
+// Pin/unpin is a moderator permission in channels (messages.md). The generic
+// `pinned_messages` insert route ran with a service-key client that ignores
+// RLS, so a follower could pin any channel post by calling the gateway
+// directly. The pinned_by field is always taken from the verified token, never
+// from the client body. Pins in DM/group conversations keep the generic
+// behaviour.
+async function enforcePinWritePolicy(
+  domain: string,
+  userId: string | undefined,
+  body: unknown
+): Promise<string | null> {
+  if (domain !== 'pinned_messages' || !userId) return null;
+  const rows = (Array.isArray(body) ? body : [body]) as Array<Record<string, unknown>>;
+  if (rows.length === 0) return null;
+  for (const row of rows) {
+    if ('pinned_by' in row && row['pinned_by'] !== userId) {
+      return 'pinned_by does not match authenticated user';
+    }
+    row['pinned_by'] = userId;
+  }
+  const conversationId = rows[0]['conversation_id'];
+  if (typeof conversationId !== 'string') return null;
+  const gate = await evaluatePinPolicy(conversationId, userId);
+  if (gate.status === 'not_authorized') return 'Only the channel owner or moderators can pin messages';
+  return null;
 }
 
 const rpcRouter = Router();
@@ -999,6 +1232,95 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
       }
     }
 
+    // delete_channel: the deployed DB function reads auth.uid(), which is NULL
+    // on the conversations host (it does not share the users JWT secret) and
+    // would raise 'Not authenticated' for every caller. Computed gateway-side
+    // against conversation_participants (see features/deleteChannel.ts); ONLY
+    // the channel owner may delete.
+    if (rpcName === 'delete_channel') {
+      const rpcBody = body as Record<string, unknown>;
+      const conversationId = typeof rpcBody['p_conversation_id'] === 'string' ? rpcBody['p_conversation_id'] as string : null;
+      const result = await deleteChannel(conversationId, req.user?.id);
+      switch (result.status) {
+        case 'ok':
+          res.status(200).json(null);
+          return;
+        case 'not_authenticated':
+          res.status(401).json({ error: 'Not authenticated' });
+          return;
+        case 'conversation_not_found':
+          res.status(404).json({ error: 'Conversation not found' });
+          return;
+        case 'not_channel':
+          res.status(400).json({ error: 'Not a channel conversation' });
+          return;
+        case 'not_owner':
+          res.status(403).json({ error: 'Only the channel owner can delete the channel' });
+          return;
+      }
+    }
+
+    // add_channel_follower: same auth.uid() wall on the conversations host, and
+    // the SPA sends p_new_follower_id while the repo signature names it
+    // p_new_follower_id yet the gateway injected p_user_id (which the function
+    // does not accept). Computed gateway-side (see
+    // features/addChannelFollower.ts); only the owner/moderators may add
+    // followers, and adding an existing member never downgrades them.
+    if (rpcName === 'add_channel_follower') {
+      const rpcBody = body as Record<string, unknown>;
+      const conversationId = typeof rpcBody['p_conversation_id'] === 'string' ? rpcBody['p_conversation_id'] as string : null;
+      const targetUserId = typeof rpcBody['p_new_follower_id'] === 'string' ? rpcBody['p_new_follower_id'] as string : null;
+      const result = await addChannelFollower(conversationId, targetUserId, req.user?.id);
+      switch (result.status) {
+        case 'ok':
+          res.status(200).json(null);
+          return;
+        case 'not_authenticated':
+          res.status(401).json({ error: 'Not authenticated' });
+          return;
+        case 'target_required':
+          res.status(400).json({ error: 'Follower target is required' });
+          return;
+        case 'conversation_not_found':
+          res.status(404).json({ error: 'Conversation not found' });
+          return;
+        case 'not_channel':
+          res.status(400).json({ error: 'Can only add followers to channel conversations' });
+          return;
+        case 'not_member':
+          res.status(403).json({ error: 'You are not a participant of this conversation' });
+          return;
+        case 'not_authorized':
+          res.status(403).json({ error: 'Only the channel owner or moderators can add followers' });
+          return;
+        case 'target_not_found':
+          res.status(400).json({ error: 'User does not exist' });
+          return;
+      }
+    }
+
+    // get_channel_stats is a moderator-scoped read (messages.md): a follower
+    // must NOT be able to view channel statistics. The allowed owner/moderator
+    // call falls through to the proxied DB function and the profiles-host
+    // enrichment below.
+    if (rpcName === 'get_channel_stats') {
+      const rpcBody = body as Record<string, unknown>;
+      const conversationId = typeof rpcBody['p_conversation_id'] === 'string' ? rpcBody['p_conversation_id'] as string : null;
+      const statsCtx = await resolveChannelContext(conversationId, req.user?.id);
+      if (!statsCtx) {
+        res.status(404).json({ error: 'Conversation not found' });
+        return;
+      }
+      if (!isChannel(statsCtx)) {
+        res.status(400).json({ error: 'Not a channel conversation' });
+        return;
+      }
+      if (!isOwnerOf(statsCtx, req.user?.id) && !isModeratorOf(statsCtx, req.user?.id)) {
+        res.status(403).json({ error: 'Only the channel owner or moderators can view channel statistics' });
+        return;
+      }
+    }
+
     const url = `${credentials.project_url}/rest/v1/rpc/${encodeURIComponent(rpcName)}`;
     const upstream = await fetch(url, {
       method: 'POST',
@@ -1150,6 +1472,11 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
     const denied = await enforceMessageWritePolicy(domain, req.user?.id, req.body);
     if (denied) {
       res.status(403).json({ error: denied });
+      return;
+    }
+    const pinDenied = await enforcePinWritePolicy(domain, req.user?.id, req.body);
+    if (pinDenied) {
+      res.status(403).json({ error: pinDenied });
       return;
     }
     const result = await database.write(domain, req.body);
