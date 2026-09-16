@@ -37,6 +37,7 @@ import {
 import { evaluatePinPolicy, evaluatePinDeletePolicy } from '../features/channelPinGate';
 import { resolveChannelContext, isChannel, isOwnerOf, isModeratorOf } from '../features/channelContext';
 import { computeChannelStats } from '../features/channelStats';
+import { computePeopleYouMayKnow } from '../features/peopleYouMayKnow';
 
 // Applies the gateway-owned category to a `message_requests` insert body when
 // the request is created (messages.md). The Gateway classifies because friends
@@ -1322,6 +1323,20 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
         return;
       }
       res.status(200).json(await computeChannelStats(statsCtx));
+      return;
+    }
+
+    // get_people_you_may_know: the historical DB function joins `profiles`
+    // (profiles host) with `blocks` (blocking host), which the RPC proxy cannot
+    // satisfy (it proxies to one project). Computed gateway-side instead (see
+    // features/peopleYouMayKnow.ts): candidate generation, privacy/block
+    // filtering, deterministic scoring, diversity and the response shape are
+    // all owned here, with the authenticated caller id (never the client body).
+    if (rpcName === 'get_people_you_may_know') {
+      const rpcBody = body as Record<string, unknown>;
+      const requestedLimit = typeof rpcBody['p_limit'] === 'number' ? (rpcBody['p_limit'] as number) : undefined;
+      const rows = await computePeopleYouMayKnow(req.user?.id, { limit: requestedLimit });
+      res.status(200).json(rows);
       return;
     }
 
