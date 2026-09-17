@@ -215,10 +215,29 @@ function sendGroupRulesResult(res: Response, result: GroupRulesResult): void {
   }
 }
 
+// Express 4 does not forward rejected promises from async handlers to the error
+// middleware. A failed Group write therefore used to leave the request open
+// until the platform timeout (the client saw a hung request and the rules
+// toggle never settled). Every Group route is wrapped so a storage failure
+// becomes a real error response instead of an unanswered request.
+type GroupRouteHandler = (req: Request, res: Response) => Promise<void>;
+function groupRoute(handler: GroupRouteHandler) {
+  return async (req: Request, res: Response): Promise<void> => {
+    try {
+      await handler(req, res);
+    } catch (error) {
+      console.error(`[groups] ${req.method} ${req.originalUrl} failed:`, (error as Error).message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Group operation failed' });
+      }
+    }
+  };
+}
+
 // Create a group. The Gateway (never the client) validates name/privacy and
 // stamps created_by with the authenticated user, then creates the owner
 // membership row atomically.
-v1.post('/groups', async (req, res) => {
+v1.post('/groups', groupRoute(async (req, res) => {
   if (!featureFlags.isEnabled('groups')) {
     res.status(404).json({ error: 'Not found' });
     return;
@@ -243,10 +262,10 @@ v1.post('/groups', async (req, res) => {
       res.status(503).json({ error: 'Group storage unavailable' });
       return;
   }
-});
+}));
 
 // Update Group Name (required), Description (optional) and Privacy (required).
-v1.put('/groups/:groupId/settings', async (req, res) => {
+v1.put('/groups/:groupId/settings', groupRoute(async (req, res) => {
   if (!featureFlags.isEnabled('groups')) {
     res.status(404).json({ error: 'Not found' });
     return;
@@ -274,11 +293,11 @@ v1.put('/groups/:groupId/settings', async (req, res) => {
       res.status(400).json({ error: result.message });
       return;
   }
-});
+}));
 
 // Update the group cover image (owner only). Replaces the previously
 // unauthenticated generic PUT /:domain/:id path for `groups`.
-v1.put('/groups/:groupId/cover', async (req, res) => {
+v1.put('/groups/:groupId/cover', groupRoute(async (req, res) => {
   if (!featureFlags.isEnabled('groups')) {
     res.status(404).json({ error: 'Not found' });
     return;
@@ -302,10 +321,11 @@ v1.put('/groups/:groupId/cover', async (req, res) => {
       res.status(400).json({ error: result.message });
       return;
   }
-});
+}));
 
 // Enable/disable the optional Group Rules feature (owner only).
-v1.put('/groups/:groupId/rules-enabled', async (req, res) => {  if (!featureFlags.isEnabled('groups')) {
+v1.put('/groups/:groupId/rules-enabled', groupRoute(async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
     res.status(404).json({ error: 'Not found' });
     return;
   }
@@ -328,40 +348,40 @@ v1.put('/groups/:groupId/rules-enabled', async (req, res) => {  if (!featureFlag
       res.status(400).json({ error: result.message });
       return;
   }
-});
+}));
 
 // List rules (owner, members, and — for public groups — any authenticated user).
-v1.get('/groups/:groupId/rules', async (req, res) => {
+v1.get('/groups/:groupId/rules', groupRoute(async (req, res) => {
   if (!featureFlags.isEnabled('groups')) {
     res.status(404).json({ error: 'Not found' });
     return;
   }
   sendGroupRulesResult(res, await listGroupRules(req.params.groupId, req.user?.id));
-});
+}));
 
 // Add a rule (owner only).
-v1.post('/groups/:groupId/rules', async (req, res) => {
+v1.post('/groups/:groupId/rules', groupRoute(async (req, res) => {
   if (!featureFlags.isEnabled('groups')) {
     res.status(404).json({ error: 'Not found' });
     return;
   }
   const ruleText = (req.body as Record<string, unknown> | undefined)?.['rule_text'];
   sendGroupRulesResult(res, await addGroupRule(req.params.groupId, req.user?.id, ruleText));
-});
+}));
 
 // Reorder rules (owner only). Registered before the /rules/:ruleId route so
 // "reorder" is never captured as a rule id.
-v1.put('/groups/:groupId/rules/reorder', async (req, res) => {
+v1.put('/groups/:groupId/rules/reorder', groupRoute(async (req, res) => {
   if (!featureFlags.isEnabled('groups')) {
     res.status(404).json({ error: 'Not found' });
     return;
   }
   const orderedIds = (req.body as Record<string, unknown> | undefined)?.['ordered_ids'];
   sendGroupRulesResult(res, await reorderGroupRules(req.params.groupId, req.user?.id, orderedIds));
-});
+}));
 
 // Edit a rule (owner only).
-v1.put('/groups/:groupId/rules/:ruleId', async (req, res) => {
+v1.put('/groups/:groupId/rules/:ruleId', groupRoute(async (req, res) => {
   if (!featureFlags.isEnabled('groups')) {
     res.status(404).json({ error: 'Not found' });
     return;
@@ -371,10 +391,10 @@ v1.put('/groups/:groupId/rules/:ruleId', async (req, res) => {
     res,
     await updateGroupRule(req.params.groupId, req.user?.id, req.params.ruleId, ruleText)
   );
-});
+}));
 
 // Delete a rule (owner only).
-v1.delete('/groups/:groupId/rules/:ruleId', async (req, res) => {
+v1.delete('/groups/:groupId/rules/:ruleId', groupRoute(async (req, res) => {
   if (!featureFlags.isEnabled('groups')) {
     res.status(404).json({ error: 'Not found' });
     return;
@@ -383,7 +403,7 @@ v1.delete('/groups/:groupId/rules/:ruleId', async (req, res) => {
     res,
     await deleteGroupRule(req.params.groupId, req.user?.id, req.params.ruleId)
   );
-});
+}));
 
 // Rename / re-describe a channel — moderator permission (messages.md). The
 // generic PUT /:domain/:id route ran with a service-key client that ignores
