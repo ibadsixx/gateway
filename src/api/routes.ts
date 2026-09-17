@@ -31,6 +31,18 @@ import { addChannelModerator, removeChannelModerator } from '../features/channel
 import { deleteChannel } from '../features/deleteChannel';
 import { addChannelFollower } from '../features/addChannelFollower';
 import {
+  createGroup,
+  updateGroupSettings,
+  updateGroupCover,
+  setGroupRulesEnabled,
+  listGroupRules,
+  addGroupRule,
+  updateGroupRule,
+  deleteGroupRule,
+  reorderGroupRules,
+  type GroupRulesResult,
+} from '../features/groupSettings';
+import {
   evaluateChannelMessageGate,
   stripNonEditable,
 } from '../features/channelMessageGate';
@@ -171,6 +183,206 @@ v1.use((req, res, next) => {
     return next();
   }
   return auth.authenticate(req, res, next);
+});
+
+// Group settings + "Group Rules" (message.md). These are registered BEFORE the
+// generic /:domain routes below so the generic service-role routes (which do no
+// authorization) can never be used to modify group settings or rules. Every
+// identity and permission is resolved from the database in the feature module.
+function sendGroupRulesResult(res: Response, result: GroupRulesResult): void {
+  switch (result.status) {
+    case 'ok':
+      res.json(result.rules);
+      return;
+    case 'not_authenticated':
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    case 'group_not_found':
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    case 'not_owner':
+      res.status(403).json({ error: 'Only the group owner can manage group rules' });
+      return;
+    case 'forbidden':
+      res.status(403).json({ error: 'You do not have access to this group' });
+      return;
+    case 'rule_not_found':
+      res.status(404).json({ error: 'Rule not found' });
+      return;
+    case 'invalid':
+      res.status(400).json({ error: result.message });
+      return;
+  }
+}
+
+// Create a group. The Gateway (never the client) validates name/privacy and
+// stamps created_by with the authenticated user, then creates the owner
+// membership row atomically.
+v1.post('/groups', async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const body = (req.body || {}) as Record<string, unknown>;
+  const result = await createGroup(req.user?.id, {
+    name: body['name'],
+    description: body['description'],
+    privacy: body['privacy'],
+  });
+  switch (result.status) {
+    case 'ok':
+      res.status(201).json(result.group);
+      return;
+    case 'not_authenticated':
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    case 'invalid':
+      res.status(400).json({ error: result.message });
+      return;
+    case 'unavailable':
+      res.status(503).json({ error: 'Group storage unavailable' });
+      return;
+  }
+});
+
+// Update Group Name (required), Description (optional) and Privacy (required).
+v1.put('/groups/:groupId/settings', async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const body = (req.body || {}) as Record<string, unknown>;
+  const result = await updateGroupSettings(req.params.groupId, req.user?.id, {
+    name: body['name'],
+    description: body['description'],
+    privacy: body['privacy'],
+  });
+  switch (result.status) {
+    case 'ok':
+      res.json(result.group);
+      return;
+    case 'not_authenticated':
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    case 'group_not_found':
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    case 'not_owner':
+      res.status(403).json({ error: 'Only the group owner can edit group settings' });
+      return;
+    case 'invalid':
+      res.status(400).json({ error: result.message });
+      return;
+  }
+});
+
+// Update the group cover image (owner only). Replaces the previously
+// unauthenticated generic PUT /:domain/:id path for `groups`.
+v1.put('/groups/:groupId/cover', async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const coverImage = (req.body as Record<string, unknown> | undefined)?.['cover_image'];
+  const result = await updateGroupCover(req.params.groupId, req.user?.id, coverImage);
+  switch (result.status) {
+    case 'ok':
+      res.json(result.group);
+      return;
+    case 'not_authenticated':
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    case 'group_not_found':
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    case 'not_owner':
+      res.status(403).json({ error: 'Only the group owner can edit group settings' });
+      return;
+    case 'invalid':
+      res.status(400).json({ error: result.message });
+      return;
+  }
+});
+
+// Enable/disable the optional Group Rules feature (owner only).
+v1.put('/groups/:groupId/rules-enabled', async (req, res) => {  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const enabled = (req.body as Record<string, unknown> | undefined)?.['rules_enabled'];
+  const result = await setGroupRulesEnabled(req.params.groupId, req.user?.id, enabled);
+  switch (result.status) {
+    case 'ok':
+      res.json(result.group);
+      return;
+    case 'not_authenticated':
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    case 'group_not_found':
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    case 'not_owner':
+      res.status(403).json({ error: 'Only the group owner can change this setting' });
+      return;
+    case 'invalid':
+      res.status(400).json({ error: result.message });
+      return;
+  }
+});
+
+// List rules (owner, members, and — for public groups — any authenticated user).
+v1.get('/groups/:groupId/rules', async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  sendGroupRulesResult(res, await listGroupRules(req.params.groupId, req.user?.id));
+});
+
+// Add a rule (owner only).
+v1.post('/groups/:groupId/rules', async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const ruleText = (req.body as Record<string, unknown> | undefined)?.['rule_text'];
+  sendGroupRulesResult(res, await addGroupRule(req.params.groupId, req.user?.id, ruleText));
+});
+
+// Reorder rules (owner only). Registered before the /rules/:ruleId route so
+// "reorder" is never captured as a rule id.
+v1.put('/groups/:groupId/rules/reorder', async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const orderedIds = (req.body as Record<string, unknown> | undefined)?.['ordered_ids'];
+  sendGroupRulesResult(res, await reorderGroupRules(req.params.groupId, req.user?.id, orderedIds));
+});
+
+// Edit a rule (owner only).
+v1.put('/groups/:groupId/rules/:ruleId', async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const ruleText = (req.body as Record<string, unknown> | undefined)?.['rule_text'];
+  sendGroupRulesResult(
+    res,
+    await updateGroupRule(req.params.groupId, req.user?.id, req.params.ruleId, ruleText)
+  );
+});
+
+// Delete a rule (owner only).
+v1.delete('/groups/:groupId/rules/:ruleId', async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  sendGroupRulesResult(
+    res,
+    await deleteGroupRule(req.params.groupId, req.user?.id, req.params.ruleId)
+  );
 });
 
 // Rename / re-describe a channel — moderator permission (messages.md). The
@@ -379,6 +591,13 @@ v1.put('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => 
   const { domain, id } = req.params;
   if (!featureFlags.isEnabled(domain)) {
     res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  // Group settings/rules/cover are owner-authorized by the dedicated /groups
+  // routes above. The generic service-role update performs no authorization, so
+  // it is refused for `groups` to prevent bypassing that check.
+  if (domain === 'groups') {
+    res.status(403).json({ error: 'Group settings must be updated via the authorized /api/v1/groups endpoints' });
     return;
   }
   try {
@@ -1484,6 +1703,12 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
   const { domain } = req.params;
   if (!featureFlags.isEnabled(domain)) {
     res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  // Group creation must go through POST /api/v1/groups so the Gateway validates
+  // name/privacy and stamps the owner itself; the generic insert skips both.
+  if (domain === 'groups') {
+    res.status(403).json({ error: 'Group creation must use POST /api/v1/groups' });
     return;
   }
   try {

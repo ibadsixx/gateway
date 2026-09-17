@@ -8,6 +8,7 @@
     "start": "node dist/src/dev.js",
     "dev": "ts-node src/dev.ts",
     "test:channel-moderator": "ts-node src/features/channelModeratorTest.ts",
+    "test:group-settings": "ts-node src/features/groupSettingsTest.ts",
     "verify:message-requests": "ts-node src/features/verifyMessageRequestCategory.ts",
     "test:channel-permissions": "ts-node src/features/channelPermissionsTest.ts",
     "test:people-you-may-know": "ts-node src/features/peopleYouMayKnowTest.ts",
