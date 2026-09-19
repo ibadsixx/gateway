@@ -66,14 +66,16 @@ class Query {
   order(_c: string, _o?: unknown): Query { return this; }
   limit(_n: number): Query { return this; }
   maybeSingle(): Promise<{ data: Row | null; error: null }> {
-    const matched = this.db[this.table].filter((r) => this.filters.every(([c, v]) => String(r[c]) === String(v)));
+    const rows = this.db[this.table] ?? [];
+    const matched = rows.filter((r) => this.filters.every(([c, v]) => String(r[c]) === String(v)));
     return Promise.resolve({ data: matched[0] ? { ...matched[0] } : null, error: null });
   }
   then(resolve: (v: { data: unknown; error: null }) => void): void {
     Promise.resolve(this.execute()).then(resolve as (v: unknown) => void);
   }
   private execute(): { data: Row[]; error: null } {
-    return { data: this.db[this.table].map((r) => ({ ...r })), error: null };
+    const rows = this.db[this.table] ?? [];
+    return { data: rows.map((r) => ({ ...r })), error: null };
   }
 }
 
@@ -98,7 +100,10 @@ function installLiveRegistry(): void {
     return client;
   };
   projectManager.getReadClient = ((table: string) => ({ client: domainClient(table), project: {} as any })) as any;
-  projectManager.getWritableProject = ((table: string) => ({ client: domainClient(table), project: {} as any })) as any;
+  projectManager.getWritableProject = ((table: string) => {
+    const client = clients[table];
+    return client ? { client, project: {} as any } : null;
+  }) as any;
   projectManager.getReadableProjects = ((table: string) => {
     const client = clients[table];
     return client ? [{ client, project: {} as any }] : [];
@@ -134,8 +139,9 @@ async function main(): Promise<void> {
   await capture('member shares post (shareGroupPost)', () => shareGroupPost(G1, MEMBER, { post_id: 'post-1' }));
   await capture('createGroup (owner membership insert via group_members)', () => createGroup(OWNER, { name: 'New', privacy: 'private' }));
 
-  console.log('\nIF the original error is "No readable/writable project ..." then the registry is missing the GROUP domain rows');
-  console.log('(the 5 tables not in /api/keep-alive). If the error names a table/column, the schema or domain mapping differs.');
+  console.log('\nWith routing fixed (dedicated domain first, groups-host fallback for the FK-co-located');
+  console.log('rules/moderation tables), every operation must RESOLVE and none may throw the original');
+  console.log('"No readable projects for domain: ..." error in this same live registry state.');
 }
 
 main().catch((err) => {
