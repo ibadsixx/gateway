@@ -326,6 +326,22 @@ async function ruleBelongsToGroup(ctx: HostContext, groupId: string, ruleId: str
 
 // --- List members + active restrictions + (admin) bans & moderation history ---
 
+async function bestEffortModeration<T>(
+  ctx: HostContext,
+  table: string,
+  fetchRows: (ctx: HostContext) => Promise<T>,
+  fallback: T
+): Promise<T> {
+  try {
+    return await fetchRows(ctx);
+  } catch (error) {
+    console.error(
+      `[groupMembers] moderation enrichment for '${table}' unavailable — returning empty list (original error: ${(error as Error).message})`
+    );
+    return fallback;
+  }
+}
+
 export async function listGroupMembers(
   groupId: string | null | undefined,
   callerUserId: string | undefined,
@@ -341,11 +357,20 @@ export async function listGroupMembers(
 
   const isModerator = yourAccess === 'owner' || yourAccess === 'moderator';
 
+  // The member roster + profiles MUST load even when a moderation table's
+  // dedicated domain is not registered yet. Moderation enrichment is
+  // best-effort: a failed resolution degrades to an empty list instead of
+  // failing the whole Members request. The original error is logged so it is
+  // preserved (pro.md §14), never silently dropped.
   const [members, bans, restrictions, moderation] = await Promise.all([
     fetchMembers(ctx),
-    isModerator ? fetchBans(ctx) : Promise.resolve([] as GroupBanRow[]),
-    fetchRestrictions(ctx),
-    isModerator ? fetchModeration(ctx) : Promise.resolve([] as GroupModerationActionRow[]),
+    isModerator
+      ? bestEffortModeration(ctx, 'group_member_bans', fetchBans, [] as GroupBanRow[])
+      : Promise.resolve([] as GroupBanRow[]),
+    bestEffortModeration(ctx, 'group_member_restrictions', fetchRestrictions, [] as GroupRestrictionRow[]),
+    isModerator
+      ? bestEffortModeration(ctx, 'group_moderation_actions', fetchModeration, [] as GroupModerationActionRow[])
+      : Promise.resolve([] as GroupModerationActionRow[]),
   ]);
 
   const profiles = await fetchProfiles(members.map((m) => m.user_id));

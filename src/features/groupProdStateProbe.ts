@@ -122,11 +122,19 @@ function capture(name: string, fn: () => Promise<unknown>): void {
 }
 
 async function main(): Promise<void> {
-  console.log('Production registry state probed (only groups/group_members/group_posts/group_pins/group_follows registered).');
-  console.log('For every group operation, this is the ORIGINAL error the gateway logs today behind GROUP_OPERATION_FAILED:\n');
+  console.log('Production registry state probed: only groups/group_members/group_posts/group_pins/group_follows registered');
+  console.log('(group_rules, group_member_bans, group_member_restrictions, group_moderation_actions, group_reports have NO domain rows).');
+  console.log('\nTASK (pro.md): the Members LIST must load real group_members (via group-members domain) — never groups-1.');
+  console.log('Management actions are out of scope (§12) and must keep preserving their ORIGINAL error (§14).\n');
   installLiveRegistry();
 
   await capture('open Members tab (listGroupMembers -> fetches members+bans+restrictions+moderation)', () => listGroupMembers(G1, OWNER));
+  const roster = await listGroupMembers(G1, OWNER);
+  if (roster.status === 'ok') {
+    console.log(`  members requested: ${roster.members.length} real group_members row(s) -> ${roster.members.map((m) => `${m.user_id}=${m.role}`).join(', ')}`);
+  } else {
+    console.log(`  members requested: FAILED -> ${roster.status}`);
+  }
   await capture('Group Rules ON (setGroupRulesEnabled)', () => updateGroupSettings(G1, OWNER, { name: 'Live Group', privacy: 'public' }));
   await capture('open Group Rules list (listGroupRules -> group_rules)', () => listGroupRules(G1, OWNER));
   await capture('add a Group Rule (addGroupRule -> group_rules)', () => addGroupRule(G1, OWNER, 'Be reasonable.'));
@@ -139,9 +147,9 @@ async function main(): Promise<void> {
   await capture('member shares post (shareGroupPost)', () => shareGroupPost(G1, MEMBER, { post_id: 'post-1' }));
   await capture('createGroup (owner membership insert via group_members)', () => createGroup(OWNER, { name: 'New', privacy: 'private' }));
 
-  console.log('\nWith routing fixed (dedicated domain first, groups-host fallback for the FK-co-located');
-  console.log('rules/moderation tables), every operation must RESOLVE and none may throw the original');
-  console.log('"No readable projects for domain: ..." error in this same live registry state.');
+  console.log('\nEXPECTATION: "open Members tab" (and settings/createGroup that touch only registered domains) must RESOLVE.');
+  console.log('Management actions (add rule / remove / report / restrict / ban / unban / share) are deferred (§12): they must');
+  console.log('faithfully report the ORIGINAL "No readable projects for domain: ..." error — proving it is preserved, not hidden.');
 }
 
 main().catch((err) => {
