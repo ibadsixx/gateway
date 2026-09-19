@@ -43,6 +43,19 @@ import {
   type GroupRulesResult,
 } from '../features/groupSettings';
 import {
+  listGroupMembers,
+  addGroupMembers,
+  removeGroupMember,
+  reportGroupMember,
+  restrictGroupMember,
+  unrestrictGroupMember,
+  banGroupMember,
+  unbanGroupMember,
+  shareGroupPost,
+  type MembersListResult,
+  type MemberActionResult,
+} from '../features/groupMembers';
+import {
   evaluateChannelMessageGate,
   stripNonEditable,
 } from '../features/channelMessageGate';
@@ -205,6 +218,51 @@ function sendGroupRulesResult(res: Response, result: GroupRulesResult): void {
       return;
     case 'forbidden':
       res.status(403).json({ error: 'You do not have access to this group' });
+      return;
+    case 'rule_not_found':
+      res.status(404).json({ error: 'Rule not found' });
+      return;
+    case 'invalid':
+      res.status(400).json({ error: result.message });
+      return;
+  }
+}
+
+// Group member management + moderation (message.md). Results use the same
+// status vocabulary as the rules routes so the two senders stay consistent.
+function sendMembersListResult(res: Response, result: MembersListResult): void {
+  switch (result.status) {
+    case 'ok':
+      res.json(result);
+      return;
+    case 'not_authenticated':
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    case 'group_not_found':
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    case 'forbidden':
+      res.status(403).json({ error: 'You do not have access to this group' });
+      return;
+  }
+}
+
+function sendMemberActionResult(res: Response, result: MemberActionResult): void {
+  switch (result.status) {
+    case 'ok':
+      res.json(result);
+      return;
+    case 'not_authenticated':
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    case 'group_not_found':
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    case 'not_allowed':
+      res.status(403).json({ error: result.message });
+      return;
+    case 'target_not_found':
+      res.status(404).json({ error: 'Member not found' });
       return;
     case 'rule_not_found':
       res.status(404).json({ error: 'Rule not found' });
@@ -405,6 +463,153 @@ v1.delete('/groups/:groupId/rules/:ruleId', groupRoute(async (req, res) => {
   );
 }));
 
+// --- Group member management + moderation (message.md) ---
+//
+// These are registered BEFORE the generic /:domain routes so the generic
+// service-role routes (which do no authorization) can never add/remove members,
+// ban/restrict/remove another member, or share posts on someone's behalf. Every
+// identity and permission is resolved from the database in the feature module.
+
+// Members list (roster + active restriction status; banned members & moderation
+// history are included for the owner/moderators only).
+v1.get('/groups/:groupId/members', groupRoute(async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  sendMembersListResult(res, await listGroupMembers(req.params.groupId, req.user?.id));
+}));
+
+// Join (self) or invite members (owner/moderator adds others, banned users are
+// refused). Body: { user_id } | { user_ids: [...] }.
+v1.post('/groups/:groupId/members', groupRoute(async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const body = (req.body || {}) as Record<string, unknown>;
+  sendMemberActionResult(
+    res,
+    await addGroupMembers(req.params.groupId, req.user?.id, {
+      user_id: body['user_id'],
+      user_ids: body['user_ids'],
+    })
+  );
+}));
+
+// Leave (self) or remove a member (owner/moderator with hierarchy checks).
+// Body: { reason? } (used for moderator removals).
+v1.delete('/groups/:groupId/members/:memberId', groupRoute(async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const body = (req.body || {}) as Record<string, unknown>;
+  sendMemberActionResult(
+    res,
+    await removeGroupMember(req.params.groupId, req.user?.id, req.params.memberId, {
+      reason: body['reason'],
+    })
+  );
+}));
+
+// Report a group member (any member may report; mirrors profile_reports).
+v1.post('/groups/:groupId/members/:memberId/report', groupRoute(async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const body = (req.body || {}) as Record<string, unknown>;
+  sendMemberActionResult(
+    res,
+    await reportGroupMember(req.params.groupId, req.user?.id, req.params.memberId, {
+      reason: body['reason'],
+      description: body['description'],
+    })
+  );
+}));
+
+// Restrict a member: { restriction_type: 'posting' | 'all', ends_at?, reason?,
+// rule_id? } (ties into Group Rules when the caller picks an existing rule).
+v1.post('/groups/:groupId/members/:memberId/restrict', groupRoute(async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const body = (req.body || {}) as Record<string, unknown>;
+  sendMemberActionResult(
+    res,
+    await restrictGroupMember(req.params.groupId, req.user?.id, req.params.memberId, {
+      restriction_type: body['restriction_type'],
+      ends_at: body['ends_at'],
+      reason: body['reason'],
+      rule_id: body['rule_id'],
+    })
+  );
+}));
+
+// Lift an active restriction. Body: { restriction_type? } to target one type.
+v1.post('/groups/:groupId/members/:memberId/unrestrict', groupRoute(async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const body = (req.body || {}) as Record<string, unknown>;
+  sendMemberActionResult(
+    res,
+    await unrestrictGroupMember(req.params.groupId, req.user?.id, req.params.memberId, {
+      restriction_type: body['restriction_type'],
+    })
+  );
+}));
+
+// Ban a member: { ends_at?, reason?, rule_id? }. Bans the member, removes their
+// membership (they cannot rejoin while active), and revokes active restrictions.
+v1.post('/groups/:groupId/members/:memberId/ban', groupRoute(async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const body = (req.body || {}) as Record<string, unknown>;
+  sendMemberActionResult(
+    res,
+    await banGroupMember(req.params.groupId, req.user?.id, req.params.memberId, {
+      ends_at: body['ends_at'],
+      reason: body['reason'],
+      rule_id: body['rule_id'],
+    })
+  );
+}));
+
+// Unban a member (revokes the active ban; they rejoin via the normal flow).
+v1.post('/groups/:groupId/members/:memberId/unban', groupRoute(async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  sendMemberActionResult(
+    res,
+    await unbanGroupMember(req.params.groupId, req.user?.id, req.params.memberId)
+  );
+}));
+
+// Share a post into a group (author is always the caller; restricted members
+// are blocked). Body: { post_id, message? }.
+v1.post('/groups/:groupId/posts', groupRoute(async (req, res) => {
+  if (!featureFlags.isEnabled('groups')) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const body = (req.body || {}) as Record<string, unknown>;
+  sendMemberActionResult(
+    res,
+    await shareGroupPost(req.params.groupId, req.user?.id, {
+      post_id: body['post_id'],
+      message: body['message'],
+    })
+  );
+}));
+
 // Rename / re-describe a channel — moderator permission (messages.md). The
 // generic PUT /:domain/:id route ran with a service-key client that ignores
 // RLS, so a follower could rewrite the channel name/description by calling the
@@ -566,6 +771,11 @@ v1.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
     res.status(404).json({ error: 'Not found' });
     return;
   }
+  const groupMemberDenied = groupMemberWriteDenied(domain);
+  if (groupMemberDenied) {
+    res.status(403).json({ error: groupMemberDenied });
+    return;
+  }
   try {
     await maybeClassifyMessageRequest(domain, req.body);
     const denied = await enforceMessageWritePolicy(domain, req.user?.id, req.body);
@@ -620,6 +830,11 @@ v1.put('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => 
     res.status(403).json({ error: 'Group settings must be updated via the authorized /api/v1/groups endpoints' });
     return;
   }
+  const groupMemberUpdateDenied = groupMemberWriteDenied(domain);
+  if (groupMemberUpdateDenied) {
+    res.status(403).json({ error: groupMemberUpdateDenied });
+    return;
+  }
   try {
     console.log(`[gateway] PUT /api/v1/${domain}/${id}`, { body: req.body });
     // The category is fixed when the first Message Request is created and must
@@ -651,6 +866,13 @@ v1.delete('/:domain/:id', validation.validateDomainMiddleware, async (req, res) 
       return;
     }
   }
+  // A member could otherwise delete another member's membership/share row
+  // directly through the service-role delete (RLS is bypassed).
+  const groupMemberDeleteDenied = groupMemberWriteDenied(domain);
+  if (groupMemberDeleteDenied) {
+    res.status(403).json({ error: groupMemberDeleteDenied });
+    return;
+  }
   const permanent = req.query.permanent === 'true';
   try {
     await database.delete(domain, id, permanent);
@@ -664,6 +886,13 @@ v1.delete('/:domain', validation.validateDomainMiddleware, async (req, res) => {
   const { domain } = req.params;
   if (!featureFlags.isEnabled(domain)) {
     res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  // Bulk deletes bypass RLS with the service role, so member/share rows could
+  // otherwise be removed without any member-moderation authorization.
+  const groupMemberBulkDeleteDenied = groupMemberWriteDenied(domain);
+  if (groupMemberBulkDeleteDenied) {
+    res.status(403).json({ error: groupMemberBulkDeleteDenied });
     return;
   }
   const filters = req.query.filter as string[] | string | undefined;
@@ -1006,6 +1235,26 @@ system.post('/reload-registry', async (_req, res) => {
 // channel as if it were a group chat. This helper closes that bypass for every
 // messages insert path (composer fallback, forward, cross-post).
 const CHANNEL_POST_ROLES = new Set(['owner', 'moderator']);
+
+// Standalone-Group member management is authorization-enforced by the dedicated
+// /api/v1/groups/:groupId/... routes above. The generic service-role write
+// routes perform no authorization, so they are refused for the tables dominated
+// by those routes to prevent bypassing the member/moderation checks (e.g. a
+// banned user re-adding themselves, a random user sharing posts into a group
+// they do not belong to, or a member deleting someone else's membership row).
+const GROUP_MEMBER_WRITE_DOMAINS = new Set([
+  'group_members',
+  'group_posts',
+  'group_member_bans',
+  'group_member_restrictions',
+  'group_moderation_actions',
+  'group_reports',
+]);
+
+function groupMemberWriteDenied(domain: string): string | null {
+  if (!GROUP_MEMBER_WRITE_DOMAINS.has(domain)) return null;
+  return 'Group members must be managed via the authorized /api/v1/groups/:groupId endpoints';
+}
 
 async function enforceMessageWritePolicy(
   domain: string,
@@ -1729,6 +1978,11 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
   // name/privacy and stamps the owner itself; the generic insert skips both.
   if (domain === 'groups') {
     res.status(403).json({ error: 'Group creation must use POST /api/v1/groups' });
+    return;
+  }
+  const groupMemberCreateDenied = groupMemberWriteDenied(domain);
+  if (groupMemberCreateDenied) {
+    res.status(403).json({ error: groupMemberCreateDenied });
     return;
   }
   try {
