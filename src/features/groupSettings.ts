@@ -22,6 +22,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { randomUUID } from 'node:crypto';
 import { projectManager } from '../project-manager';
+import { groupReadClient, groupWriteClient, type GroupProjects } from './groupHosts';
 
 export const GROUP_PRIVACY_VALUES = ['public', 'private', 'closed'] as const;
 export type GroupPrivacy = (typeof GROUP_PRIVACY_VALUES)[number];
@@ -70,8 +71,6 @@ export type GroupRulesResult =
   | { status: 'rule_not_found' }
   | { status: 'invalid'; message: string };
 
-type GroupProjects = Array<{ client: SupabaseClient }>;
-
 // --- Validation (shared shape with the frontend, enforced again here) ---
 
 export function normalizeGroupName(value: unknown): string | null {
@@ -98,7 +97,10 @@ export function isValidPrivacy(value: unknown): value is GroupPrivacy {
 
 // --- Host + access resolution ---
 
-type HostContext = { client: SupabaseClient; group: GroupRecord };
+// `client` is the client that owns the `groups` table. Every OTHER group table
+// (group_members, group_rules, ...) lives on its OWN project in the deployed
+// registry and is resolved per-domain — see groupReadClient / groupWriteClient.
+type HostContext = { client: SupabaseClient; group: GroupRecord; projects?: GroupProjects | null };
 
 async function resolveGroupHost(
   groupId: string | null | undefined,
@@ -113,7 +115,7 @@ async function resolveGroupHost(
         .select('*')
         .eq('id', groupId)
         .maybeSingle();
-      if (data) return { client: entry.client, group: data as GroupRecord };
+      if (data) return { client: entry.client, group: data as GroupRecord, projects: projects ?? null };
     } catch {
       // Try the next readable host (sharded deployments).
     }
@@ -122,18 +124,15 @@ async function resolveGroupHost(
 }
 
 // Resolve the caller's relationship to a group from the database alone.
-export async function resolveGroupAccess(
-  client: SupabaseClient,
-  groupId: string,
-  group: Pick<GroupRecord, 'created_by'>,
-  userId: string
-): Promise<GroupAccess> {
+export async function resolveGroupAccess(ctx: HostContext, userId: string): Promise<GroupAccess> {
+  const group = ctx.group;
   if (group.created_by && group.created_by === userId) return 'owner';
   try {
+    const client = groupReadClient('group_members', group.id, ctx.projects);
     const { data } = await client
       .from('group_members')
       .select('role')
-      .eq('group_id', groupId)
+      .eq('group_id', group.id)
       .eq('user_id', userId)
       .maybeSingle();
     const role = (data as { role?: string | null } | null)?.role ?? null;
@@ -145,8 +144,9 @@ export async function resolveGroupAccess(
   }
 }
 
-async function fetchRules(client: SupabaseClient, groupId: string): Promise<GroupRuleRecord[]> {
-  const { data, error } = await client.from('group_rules').select('*').eq('group_id', groupId);
+async function fetchRules(ctx: HostContext): Promise<GroupRuleRecord[]> {
+  const client = groupReadClient('group_rules', ctx.group.id, ctx.projects);
+  const { data, error } = await client.from('group_rules').select('*').eq('group_id', ctx.group.id);
   if (error) throw new Error(`Failed to load group rules: ${error.message}`);
   const rules = ((data as GroupRuleRecord[] | null) || []).slice();
   rules.sort(
@@ -196,8 +196,9 @@ export async function createGroup(
   });
   if (error) throw new Error(`Failed to create group: ${error.message}`);
 
-  // The creator becomes the group owner via the existing membership table.
-  const { error: memberError } = await host.client
+  // The creator becomes the group owner via the existing membership table,
+  // which lives on its own project.
+  const { error: memberError } = await groupWriteClient('group_members', projects)
     .from('group_members')
     .insert({ group_id: group.id, user_id: callerUserId, role: 'admin' });
   if (memberError) throw new Error(`Failed to create group owner membership: ${memberError.message}`);
@@ -225,7 +226,7 @@ export async function updateGroupSettings(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const access = await resolveGroupAccess(ctx.client, ctx.group.id, ctx.group, callerUserId);
+  const access = await resolveGroupAccess(ctx, callerUserId);
   if (access !== 'owner') return { status: 'not_owner' };
 
   const { error } = await ctx.client
@@ -253,7 +254,7 @@ export async function updateGroupCover(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const access = await resolveGroupAccess(ctx.client, ctx.group.id, ctx.group, callerUserId);
+  const access = await resolveGroupAccess(ctx, callerUserId);
   if (access !== 'owner') return { status: 'not_owner' };
 
   const { error } = await ctx.client
@@ -280,7 +281,7 @@ export async function setGroupRulesEnabled(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const access = await resolveGroupAccess(ctx.client, ctx.group.id, ctx.group, callerUserId);
+  const access = await resolveGroupAccess(ctx, callerUserId);
   if (access !== 'owner') return { status: 'not_owner' };
 
   const { error } = await ctx.client
@@ -304,10 +305,10 @@ export async function listGroupRules(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const access = await resolveGroupAccess(ctx.client, ctx.group.id, ctx.group, callerUserId);
+  const access = await resolveGroupAccess(ctx, callerUserId);
   if (access === 'none' && ctx.group.privacy !== 'public') return { status: 'forbidden' };
 
-  const rules = await fetchRules(ctx.client, ctx.group.id);
+  const rules = await fetchRules(ctx);
   return { status: 'ok', rules };
 }
 
@@ -325,13 +326,13 @@ export async function addGroupRule(
 
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
-  const access = await resolveGroupAccess(ctx.client, ctx.group.id, ctx.group, callerUserId);
+  const access = await resolveGroupAccess(ctx, callerUserId);
   if (access !== 'owner') return { status: 'not_owner' };
 
-  const current = await fetchRules(ctx.client, ctx.group.id);
+  const current = await fetchRules(ctx);
   const nextPosition = current.length > 0 ? Math.max(...current.map((r) => r.position ?? 0)) + 1 : 0;
 
-  const { error } = await ctx.client.from('group_rules').insert({
+  const { error } = await groupWriteClient('group_rules', ctx.projects).from('group_rules').insert({
     id: randomUUID(),
     group_id: ctx.group.id,
     rule_text: text,
@@ -339,7 +340,7 @@ export async function addGroupRule(
   });
   if (error) throw new Error(`Failed to add group rule: ${error.message}`);
 
-  return { status: 'ok', rules: await fetchRules(ctx.client, ctx.group.id) };
+  return { status: 'ok', rules: await fetchRules(ctx) };
 }
 
 // --- Edit a rule, owner only ---
@@ -358,10 +359,10 @@ export async function updateGroupRule(
 
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
-  const access = await resolveGroupAccess(ctx.client, ctx.group.id, ctx.group, callerUserId);
+  const access = await resolveGroupAccess(ctx, callerUserId);
   if (access !== 'owner') return { status: 'not_owner' };
 
-  const { data: existing } = await ctx.client
+  const { data: existing } = await groupReadClient('group_rules', ctx.group.id, ctx.projects)
     .from('group_rules')
     .select('id')
     .eq('id', ruleId)
@@ -369,14 +370,14 @@ export async function updateGroupRule(
     .maybeSingle();
   if (!existing) return { status: 'rule_not_found' };
 
-  const { error } = await ctx.client
+  const { error } = await groupWriteClient('group_rules', ctx.projects)
     .from('group_rules')
     .update({ rule_text: text, updated_at: new Date().toISOString() })
     .eq('id', ruleId)
     .eq('group_id', ctx.group.id);
   if (error) throw new Error(`Failed to update group rule: ${error.message}`);
 
-  return { status: 'ok', rules: await fetchRules(ctx.client, ctx.group.id) };
+  return { status: 'ok', rules: await fetchRules(ctx) };
 }
 
 // --- Delete a rule, owner only (positions are compacted) ---
@@ -392,10 +393,10 @@ export async function deleteGroupRule(
 
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
-  const access = await resolveGroupAccess(ctx.client, ctx.group.id, ctx.group, callerUserId);
+  const access = await resolveGroupAccess(ctx, callerUserId);
   if (access !== 'owner') return { status: 'not_owner' };
 
-  const { data: existing } = await ctx.client
+  const { data: existing } = await groupReadClient('group_rules', ctx.group.id, ctx.projects)
     .from('group_rules')
     .select('id')
     .eq('id', ruleId)
@@ -403,21 +404,24 @@ export async function deleteGroupRule(
     .maybeSingle();
   if (!existing) return { status: 'rule_not_found' };
 
-  const { error } = await ctx.client
+  const { error } = await groupWriteClient('group_rules', ctx.projects)
     .from('group_rules')
     .delete()
     .eq('id', ruleId)
     .eq('group_id', ctx.group.id);
   if (error) throw new Error(`Failed to delete group rule: ${error.message}`);
 
-  const remaining = await fetchRules(ctx.client, ctx.group.id);
+  const remaining = await fetchRules(ctx);
   for (let i = 0; i < remaining.length; i++) {
     if ((remaining[i].position ?? 0) !== i) {
-      await ctx.client.from('group_rules').update({ position: i }).eq('id', remaining[i].id);
+      await groupWriteClient('group_rules', ctx.projects)
+        .from('group_rules')
+        .update({ position: i })
+        .eq('id', remaining[i].id);
     }
   }
 
-  return { status: 'ok', rules: await fetchRules(ctx.client, ctx.group.id) };
+  return { status: 'ok', rules: await fetchRules(ctx) };
 }
 
 // --- Reorder rules, owner only ---
@@ -435,10 +439,10 @@ export async function reorderGroupRules(
 
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
-  const access = await resolveGroupAccess(ctx.client, ctx.group.id, ctx.group, callerUserId);
+  const access = await resolveGroupAccess(ctx, callerUserId);
   if (access !== 'owner') return { status: 'not_owner' };
 
-  const current = await fetchRules(ctx.client, ctx.group.id);
+  const current = await fetchRules(ctx);
   const existingIds = new Set(current.map((r) => r.id));
   const ids = orderedIds as string[];
   const seen = new Set<string>();
@@ -453,7 +457,7 @@ export async function reorderGroupRules(
   }
 
   for (let i = 0; i < ids.length; i++) {
-    const { error } = await ctx.client
+    const { error } = await groupWriteClient('group_rules', ctx.projects)
       .from('group_rules')
       .update({ position: i, updated_at: new Date().toISOString() })
       .eq('id', ids[i])
@@ -461,5 +465,5 @@ export async function reorderGroupRules(
     if (error) throw new Error(`Failed to reorder group rules: ${error.message}`);
   }
 
-  return { status: 'ok', rules: await fetchRules(ctx.client, ctx.group.id) };
+  return { status: 'ok', rules: await fetchRules(ctx) };
 }

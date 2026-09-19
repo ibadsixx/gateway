@@ -36,6 +36,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { randomUUID } from 'node:crypto';
 import { projectManager } from '../project-manager';
+import { groupReadClient, groupWriteClient, type GroupProjects } from './groupHosts';
 
 export const GROUP_RESTRICTION_TYPES = ['posting', 'all'] as const;
 export type GroupRestrictionType = (typeof GROUP_RESTRICTION_TYPES)[number];
@@ -143,19 +144,24 @@ export type MemberActionResult =
   | { status: 'rule_not_found' }
   | { status: 'invalid'; message: string };
 
-type GroupProjects = Array<{ client: SupabaseClient }>;
+type GroupProjectEntry = { client: SupabaseClient };
 const GROUP_MODERATION_ACTIONS = new Set(['remove', 'ban', 'unban', 'restrict', 'unrestrict', 'post_removed']);
 
 // --- Host + access resolution (identities come from rows, never the body) ---
 
-type HostContext = { client: SupabaseClient; group: GroupRecord };
+// `client` is the client that owns the `groups` table. Every OTHER group table
+// (group_members, group_posts, group_rules, group_member_bans,
+// group_member_restrictions, group_moderation_actions, group_reports) lives on
+// its OWN project in the deployed registry and is resolved per-domain — see
+// groupReadClient / groupWriteClient.
+type HostContext = { client: SupabaseClient; group: GroupRecord; projects?: GroupProjects | null };
 
 async function resolveGroupHost(
   groupId: string | null | undefined,
   projects?: GroupProjects | null
 ): Promise<HostContext | null> {
   if (!groupId) return null;
-  const hosts = projects ?? projectManager.getReadableProjects('groups');
+  const hosts: GroupProjectEntry[] = projects ?? projectManager.getReadableProjects('groups');
   for (const entry of hosts) {
     try {
       const { data } = await entry.client
@@ -163,7 +169,7 @@ async function resolveGroupHost(
         .select('*')
         .eq('id', groupId)
         .maybeSingle();
-      if (data) return { client: entry.client, group: data as GroupRecord };
+      if (data) return { client: entry.client, group: data as GroupRecord, projects: projects ?? null };
     } catch {
       // Try the next readable host (sharded deployments).
     }
@@ -171,13 +177,15 @@ async function resolveGroupHost(
   return null;
 }
 
+// The caller's role comes from `group_members`, which lives on its own project.
 async function resolveModeratorAccess(
-  client: SupabaseClient,
+  ctx: HostContext,
   group: Pick<GroupRecord, 'id' | 'created_by'>,
   userId: string
 ): Promise<ModeratorAccess> {
   if (group.created_by && group.created_by === userId) return 'owner';
   try {
+    const client = groupReadClient('group_members', group.id, ctx.projects);
     const { data } = await client
       .from('group_members')
       .select('role')
@@ -217,28 +225,32 @@ function isBanActive(row: GroupBanRow, now = Date.now()): boolean {
   return row.status === 'active' && (!row.expires_at || new Date(row.expires_at).getTime() > now);
 }
 
-// --- Shared reads on the group host ---
+// --- Shared reads on the group tables (each table lives on its own project) ---
 
-async function fetchMembers(client: SupabaseClient, groupId: string): Promise<GroupMemberRow[]> {
-  const { data, error } = await client.from('group_members').select('*').eq('group_id', groupId).order('created_at', { ascending: true });
+async function fetchMembers(ctx: HostContext): Promise<GroupMemberRow[]> {
+  const client = groupReadClient('group_members', ctx.group.id, ctx.projects);
+  const { data, error } = await client.from('group_members').select('*').eq('group_id', ctx.group.id).order('created_at', { ascending: true });
   if (error) throw new Error(`Failed to load group members: ${error.message}`);
   return ((data as GroupMemberRow[] | null) || []).slice();
 }
 
-async function fetchBans(client: SupabaseClient, groupId: string): Promise<GroupBanRow[]> {
-  const { data, error } = await client.from('group_member_bans').select('*').eq('group_id', groupId).order('created_at', { ascending: false });
+async function fetchBans(ctx: HostContext): Promise<GroupBanRow[]> {
+  const client = groupReadClient('group_member_bans', ctx.group.id, ctx.projects);
+  const { data, error } = await client.from('group_member_bans').select('*').eq('group_id', ctx.group.id).order('created_at', { ascending: false });
   if (error) throw new Error(`Failed to load group bans: ${error.message}`);
   return ((data as GroupBanRow[] | null) || []).slice();
 }
 
-async function fetchRestrictions(client: SupabaseClient, groupId: string): Promise<GroupRestrictionRow[]> {
-  const { data, error } = await client.from('group_member_restrictions').select('*').eq('group_id', groupId).order('created_at', { ascending: false });
+async function fetchRestrictions(ctx: HostContext): Promise<GroupRestrictionRow[]> {
+  const client = groupReadClient('group_member_restrictions', ctx.group.id, ctx.projects);
+  const { data, error } = await client.from('group_member_restrictions').select('*').eq('group_id', ctx.group.id).order('created_at', { ascending: false });
   if (error) throw new Error(`Failed to load group restrictions: ${error.message}`);
   return ((data as GroupRestrictionRow[] | null) || []).slice();
 }
 
-async function fetchModeration(client: SupabaseClient, groupId: string, limit = 50): Promise<GroupModerationActionRow[]> {
-  const { data, error } = await client.from('group_moderation_actions').select('*').eq('group_id', groupId).order('created_at', { ascending: false }).limit(limit);
+async function fetchModeration(ctx: HostContext, limit = 50): Promise<GroupModerationActionRow[]> {
+  const client = groupReadClient('group_moderation_actions', ctx.group.id, ctx.projects);
+  const { data, error } = await client.from('group_moderation_actions').select('*').eq('group_id', ctx.group.id).order('created_at', { ascending: false }).limit(limit);
   if (error) throw new Error(`Failed to load group moderation history: ${error.message}`);
   return ((data as GroupModerationActionRow[] | null) || []).slice();
 }
@@ -300,7 +312,8 @@ function isValidRuleId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
 
-async function ruleBelongsToGroup(client: SupabaseClient, groupId: string, ruleId: string): Promise<boolean> {
+async function ruleBelongsToGroup(ctx: HostContext, groupId: string, ruleId: string): Promise<boolean> {
+  const client = groupReadClient('group_rules', groupId, ctx.projects);
   const { data, error } = await client
     .from('group_rules')
     .select('id')
@@ -323,16 +336,16 @@ export async function listGroupMembers(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const yourAccess = await resolveModeratorAccess(ctx.client, ctx.group, callerUserId);
+  const yourAccess = await resolveModeratorAccess(ctx, ctx.group, callerUserId);
   if (yourAccess === 'none' && ctx.group.privacy !== 'public') return { status: 'forbidden' };
 
   const isModerator = yourAccess === 'owner' || yourAccess === 'moderator';
 
   const [members, bans, restrictions, moderation] = await Promise.all([
-    fetchMembers(ctx.client, ctx.group.id),
-    isModerator ? fetchBans(ctx.client, ctx.group.id) : Promise.resolve([] as GroupBanRow[]),
-    fetchRestrictions(ctx.client, ctx.group.id),
-    isModerator ? fetchModeration(ctx.client, ctx.group.id) : Promise.resolve([] as GroupModerationActionRow[]),
+    fetchMembers(ctx),
+    isModerator ? fetchBans(ctx) : Promise.resolve([] as GroupBanRow[]),
+    fetchRestrictions(ctx),
+    isModerator ? fetchModeration(ctx) : Promise.resolve([] as GroupModerationActionRow[]),
   ]);
 
   const profiles = await fetchProfiles(members.map((m) => m.user_id));
@@ -407,7 +420,7 @@ export async function addGroupMembers(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const yourAccess = await resolveModeratorAccess(ctx.client, ctx.group, callerUserId);
+  const yourAccess = await resolveModeratorAccess(ctx, ctx.group, callerUserId);
   // Anyone may join themselves (the existing app allows any authenticated user
   // to join); only the owner/moderator may add others.
   const isModerator = yourAccess === 'owner' || yourAccess === 'moderator';
@@ -416,9 +429,9 @@ export async function addGroupMembers(
     return { status: 'not_allowed', message: 'Only the group owner or moderators can add members.' };
   }
 
-  const existing = await fetchMembers(ctx.client, ctx.group.id);
+  const existing = await fetchMembers(ctx);
   const existingSet = new Set(existing.map((m) => m.user_id));
-  const bans = await fetchBans(ctx.client, ctx.group.id);
+  const bans = await fetchBans(ctx);
 
   // A banned user must not rejoin — enforced here and by the DB trigger.
   const banned = bans.find((b) => ids.includes(b.user_id) && isBanActive(b));
@@ -426,10 +439,11 @@ export async function addGroupMembers(
     return { status: 'not_allowed', message: 'This user is banned from the group and cannot be added.' };
   }
 
+  const membersClient = groupWriteClient('group_members', ctx.projects);
   const toInsert = ids.filter((id) => !existingSet.has(id));
   let added = 0;
   for (const id of toInsert) {
-    const { error } = await ctx.client.from('group_members').insert({
+    const { error } = await membersClient.from('group_members').insert({
       group_id: ctx.group.id,
       user_id: id,
       role: 'member',
@@ -459,18 +473,19 @@ export async function removeGroupMember(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const yourAccess = await resolveModeratorAccess(ctx.client, ctx.group, callerUserId);
+  const yourAccess = await resolveModeratorAccess(ctx, ctx.group, callerUserId);
+  const membersClient = groupWriteClient('group_members', ctx.projects);
 
   // Self-removal = leave. Any authenticated member may leave at any time.
   if (targetUserId === callerUserId) {
-    const exists = await ctx.client
+    const exists = await membersClient
       .from('group_members')
       .select('user_id')
       .eq('group_id', ctx.group.id)
       .eq('user_id', callerUserId)
       .maybeSingle();
     if (!exists.data) return { status: 'invalid', message: 'You are not a member of this group.' };
-    const { error } = await ctx.client
+    const { error } = await membersClient
       .from('group_members')
       .delete()
       .eq('group_id', ctx.group.id)
@@ -480,7 +495,7 @@ export async function removeGroupMember(
   }
 
   // Removing someone else requires owner/moderator.
-  const target = await ctx.client
+  const target = await groupReadClient('group_members', ctx.group.id, ctx.projects)
     .from('group_members')
     .select('*')
     .eq('group_id', ctx.group.id)
@@ -498,14 +513,14 @@ export async function removeGroupMember(
 
   const reason = normalizeOptionalText(options?.reason) ?? null;
 
-  const { error } = await ctx.client
+  const { error } = await membersClient
     .from('group_members')
     .delete()
     .eq('group_id', ctx.group.id)
     .eq('user_id', targetUserId);
   if (error) throw new Error(`Failed to remove group member: ${error.message}`);
 
-  await recordModerationAction(ctx.client, ctx.group.id, {
+  await recordModerationAction(ctx, ctx.group.id, {
     action: 'remove',
     target_user_id: targetUserId,
     actor_id: callerUserId,
@@ -550,12 +565,12 @@ export async function reportGroupMember(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const yourAccess = await resolveModeratorAccess(ctx.client, ctx.group, callerUserId);
+  const yourAccess = await resolveModeratorAccess(ctx, ctx.group, callerUserId);
   if (yourAccess === 'none') {
     return { status: 'not_allowed', message: 'You must be a group member to report another member.' };
   }
 
-  const target = await ctx.client
+  const target = await groupReadClient('group_members', ctx.group.id, ctx.projects)
     .from('group_members')
     .select('user_id')
     .eq('group_id', ctx.group.id)
@@ -563,7 +578,7 @@ export async function reportGroupMember(
     .maybeSingle();
   if (!target.data) return { status: 'target_not_found' };
 
-  const { error } = await ctx.client.from('group_reports').insert({
+  const { error } = await groupWriteClient('group_reports', ctx.projects).from('group_reports').insert({
     group_id: ctx.group.id,
     reported_user_id: targetUserId,
     reporter_user_id: callerUserId,
@@ -601,7 +616,7 @@ export async function restrictGroupMember(
   if (isValidRuleId(input?.rule_id)) {
     const ctxCheck = await resolveGroupHost(groupId, projects);
     if (!ctxCheck) return { status: 'group_not_found' };
-    if (!(await ruleBelongsToGroup(ctxCheck.client, ctxCheck.group.id, input.rule_id))) {
+    if (!(await ruleBelongsToGroup(ctxCheck, ctxCheck.group.id, input.rule_id))) {
       return { status: 'rule_not_found' };
     }
     ruleId = input.rule_id;
@@ -610,12 +625,12 @@ export async function restrictGroupMember(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const yourAccess = await resolveModeratorAccess(ctx.client, ctx.group, callerUserId);
+  const yourAccess = await resolveModeratorAccess(ctx, ctx.group, callerUserId);
   if (yourAccess !== 'owner' && yourAccess !== 'moderator') {
     return { status: 'not_allowed', message: 'Only the group owner or moderators can restrict members.' };
   }
 
-  const target = await ctx.client
+  const target = await groupReadClient('group_members', ctx.group.id, ctx.projects)
     .from('group_members')
     .select('*')
     .eq('group_id', ctx.group.id)
@@ -628,7 +643,7 @@ export async function restrictGroupMember(
     return { status: 'not_allowed', message: 'You cannot restrict this member.' };
   }
 
-  const restrictions = await fetchRestrictions(ctx.client, ctx.group.id);
+  const restrictions = await fetchRestrictions(ctx);
   const alreadyActive = restrictions.some(
     (r) => r.user_id === targetUserId && r.restriction_type === restrictionType && isRestrictionActive(r)
   );
@@ -637,7 +652,7 @@ export async function restrictGroupMember(
   }
   if (reason === undefined) reason = null;
 
-  const { error } = await ctx.client.from('group_member_restrictions').insert({
+  const { error } = await groupWriteClient('group_member_restrictions', ctx.projects).from('group_member_restrictions').insert({
     id: randomUUID(),
     group_id: ctx.group.id,
     user_id: targetUserId,
@@ -650,7 +665,7 @@ export async function restrictGroupMember(
   });
   if (error) throw new Error(`Failed to restrict group member: ${error.message}`);
 
-  await recordModerationAction(ctx.client, ctx.group.id, {
+  await recordModerationAction(ctx, ctx.group.id, {
     action: 'restrict',
     target_user_id: targetUserId,
     actor_id: callerUserId,
@@ -687,12 +702,12 @@ export async function unrestrictGroupMember(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const yourAccess = await resolveModeratorAccess(ctx.client, ctx.group, callerUserId);
+  const yourAccess = await resolveModeratorAccess(ctx, ctx.group, callerUserId);
   if (yourAccess !== 'owner' && yourAccess !== 'moderator') {
     return { status: 'not_allowed', message: 'Only the group owner or moderators can lift restrictions.' };
   }
 
-  const restrictions = await fetchRestrictions(ctx.client, ctx.group.id);
+  const restrictions = await fetchRestrictions(ctx);
   const active = restrictions.filter(
     (r) =>
       r.user_id === targetUserId &&
@@ -705,16 +720,17 @@ export async function unrestrictGroupMember(
     return { status: 'invalid', message: 'This member has no active restriction to lift.' };
   }
 
+  const restrictionsClient = groupWriteClient('group_member_restrictions', ctx.projects);
   const now = new Date().toISOString();
   for (const r of active) {
-    const { error } = await ctx.client
+    const { error } = await restrictionsClient
       .from('group_member_restrictions')
       .update({ status: 'revoked', updated_at: now })
       .eq('id', r.id);
     if (error) throw new Error(`Failed to lift group restriction: ${error.message}`);
   }
 
-  await recordModerationAction(ctx.client, ctx.group.id, {
+  await recordModerationAction(ctx, ctx.group.id, {
     action: 'unrestrict',
     target_user_id: targetUserId,
     actor_id: callerUserId,
@@ -757,7 +773,7 @@ export async function banGroupMember(
   if (isValidRuleId(input?.rule_id)) {
     const ctxCheck = await resolveGroupHost(groupId, projects);
     if (!ctxCheck) return { status: 'group_not_found' };
-    if (!(await ruleBelongsToGroup(ctxCheck.client, ctxCheck.group.id, input.rule_id))) {
+    if (!(await ruleBelongsToGroup(ctxCheck, ctxCheck.group.id, input.rule_id))) {
       return { status: 'rule_not_found' };
     }
     ruleId = input.rule_id;
@@ -766,12 +782,12 @@ export async function banGroupMember(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const yourAccess = await resolveModeratorAccess(ctx.client, ctx.group, callerUserId);
+  const yourAccess = await resolveModeratorAccess(ctx, ctx.group, callerUserId);
   if (yourAccess !== 'owner' && yourAccess !== 'moderator') {
     return { status: 'not_allowed', message: 'Only the group owner or moderators can ban members.' };
   }
 
-  const target = await ctx.client
+  const target = await groupReadClient('group_members', ctx.group.id, ctx.projects)
     .from('group_members')
     .select('*')
     .eq('group_id', ctx.group.id)
@@ -784,14 +800,14 @@ export async function banGroupMember(
     }
   }
 
-  const bans = await fetchBans(ctx.client, ctx.group.id);
+  const bans = await fetchBans(ctx);
   if (bans.some((b) => b.user_id === targetUserId && isBanActive(b))) {
     return { status: 'invalid', message: 'This user is already banned from the group.' };
   }
   if (reason === undefined) reason = null;
 
   const now = new Date().toISOString();
-  const { error } = await ctx.client.from('group_member_bans').insert({
+  const { error } = await groupWriteClient('group_member_bans', ctx.projects).from('group_member_bans').insert({
     id: randomUUID(),
     group_id: ctx.group.id,
     user_id: targetUserId,
@@ -804,23 +820,25 @@ export async function banGroupMember(
 
   // Bans supersede membership: drop the membership row if present and revoke
   // any active restrictions.
+  const membersClient = groupWriteClient('group_members', ctx.projects);
   if (target.data) {
-    const { error: delErr } = await ctx.client
+    const { error: delErr } = await membersClient
       .from('group_members')
       .delete()
       .eq('group_id', ctx.group.id)
       .eq('user_id', targetUserId);
     if (delErr) throw new Error(`Failed to remove banned member: ${delErr.message}`);
   }
-  const restrictions = await fetchRestrictions(ctx.client, ctx.group.id);
+  const restrictions = await fetchRestrictions(ctx);
+  const restrictionsClient = groupWriteClient('group_member_restrictions', ctx.projects);
   for (const r of restrictions.filter((r) => r.user_id === targetUserId && isRestrictionActive(r))) {
-    await ctx.client
+    await restrictionsClient
       .from('group_member_restrictions')
       .update({ status: 'revoked', updated_at: now })
       .eq('id', r.id);
   }
 
-  await recordModerationAction(ctx.client, ctx.group.id, {
+  await recordModerationAction(ctx, ctx.group.id, {
     action: 'ban',
     target_user_id: targetUserId,
     actor_id: callerUserId,
@@ -853,25 +871,25 @@ export async function unbanGroupMember(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const yourAccess = await resolveModeratorAccess(ctx.client, ctx.group, callerUserId);
+  const yourAccess = await resolveModeratorAccess(ctx, ctx.group, callerUserId);
   if (yourAccess !== 'owner' && yourAccess !== 'moderator') {
     return { status: 'not_allowed', message: 'Only the group owner or moderators can unban members.' };
   }
 
-  const bans = await fetchBans(ctx.client, ctx.group.id);
+  const bans = await fetchBans(ctx);
   const active = bans.find((b) => b.user_id === targetUserId && isBanActive(b));
   if (!active) {
     return { status: 'invalid', message: 'This user has no active ban to lift.' };
   }
 
   const now = new Date().toISOString();
-  const { error } = await ctx.client
+  const { error } = await groupWriteClient('group_member_bans', ctx.projects)
     .from('group_member_bans')
     .update({ status: 'revoked', updated_at: now })
     .eq('id', active.id);
   if (error) throw new Error(`Failed to unban group member: ${error.message}`);
 
-  await recordModerationAction(ctx.client, ctx.group.id, {
+  await recordModerationAction(ctx, ctx.group.id, {
     action: 'unban',
     target_user_id: targetUserId,
     actor_id: callerUserId,
@@ -907,12 +925,12 @@ export async function shareGroupPost(
   const ctx = await resolveGroupHost(groupId, projects);
   if (!ctx) return { status: 'group_not_found' };
 
-  const yourAccess = await resolveModeratorAccess(ctx.client, ctx.group, callerUserId);
+  const yourAccess = await resolveModeratorAccess(ctx, ctx.group, callerUserId);
   if (yourAccess === 'none') {
     return { status: 'not_allowed', message: 'You must be a group member to share a post.' };
   }
 
-  const restrictions = await fetchRestrictions(ctx.client, ctx.group.id);
+  const restrictions = await fetchRestrictions(ctx);
   const barred = restrictions.some(
     (r) =>
       r.user_id === callerUserId &&
@@ -923,7 +941,8 @@ export async function shareGroupPost(
     return { status: 'not_allowed', message: 'You are restricted from posting in this group.' };
   }
 
-  const existing = await ctx.client
+  const postsClient = groupWriteClient('group_posts', ctx.projects);
+  const existing = await postsClient
     .from('group_posts')
     .select('*')
     .eq('group_id', ctx.group.id)
@@ -932,7 +951,7 @@ export async function shareGroupPost(
     .maybeSingle();
   if (existing.data) return { status: 'ok', affected: 'already_shared' };
 
-  const { error } = await ctx.client.from('group_posts').insert({
+  const { error } = await postsClient.from('group_posts').insert({
     group_id: ctx.group.id,
     post_id: input.post_id,
     shared_by: callerUserId,
@@ -951,7 +970,7 @@ export async function shareGroupPost(
 // --- Shared helpers ---
 
 async function recordModerationAction(
-  client: SupabaseClient,
+  ctx: HostContext,
   groupId: string,
   action: {
     action: string;
@@ -964,7 +983,7 @@ async function recordModerationAction(
   }
 ): Promise<void> {
   if (!GROUP_MODERATION_ACTIONS.has(action.action)) return;
-  const { error } = await client.from('group_moderation_actions').insert({
+  const { error } = await groupWriteClient('group_moderation_actions', ctx.projects).from('group_moderation_actions').insert({
     id: randomUUID(),
     group_id: groupId,
     action: action.action,

@@ -284,9 +284,21 @@ function groupRoute(handler: GroupRouteHandler) {
     try {
       await handler(req, res);
     } catch (error) {
-      console.error(`[groups] ${req.method} ${req.originalUrl} failed:`, (error as Error).message);
+      // Log the REAL failure with operation context (pro.md: the original DB
+      // error must never be masked) but respond with a structured error that
+      // does not leak database internals.
+      console.error(
+        `[groups] ${req.method} ${req.originalUrl} failed:`,
+        JSON.stringify({
+          errorMessage: (error as Error).message,
+          status: 500,
+          groupId: typeof req.params?.groupId === 'string' ? req.params.groupId : null,
+          memberId: typeof req.params?.memberId === 'string' ? req.params.memberId : null,
+          userId: req.user?.id ?? null,
+        })
+      );
       if (!res.headersSent) {
-        res.status(500).json({ error: 'Group operation failed' });
+        res.status(500).json({ error: 'GROUP_OPERATION_FAILED', message: 'Group operation failed' });
       }
     }
   };
