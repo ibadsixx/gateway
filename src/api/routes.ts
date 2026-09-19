@@ -26,6 +26,7 @@ import { ensureUserProfile } from '../profile-helper';
 import { classifyMessageRequest } from '../features/messageRequestCategory';
 import { leaveGroupConversation } from '../features/leaveGroupConversation';
 import { publishChannelPost } from '../features/publishChannelPost';
+import { filterScheduledPosts, isForeignScheduledPost } from '../features/scheduledPostPrivacy';
 import { removeChannelMember } from '../features/removeChannelMember';
 import { addChannelModerator, removeChannelModerator } from '../features/channelModerator';
 import { deleteChannel } from '../features/deleteChannel';
@@ -856,6 +857,11 @@ v1.get('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => 
   try {
     const result = await database.read(domain, id);
     if (!result) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    // Scheduled posts are private to their author (see scheduledPostPrivacy).
+    if (domain === 'posts' && isForeignScheduledPost(result, req.user?.id)) {
       res.status(404).json({ error: 'Not found' });
       return;
     }
@@ -2130,7 +2136,7 @@ router.get('/:domain', auth.authenticate.bind(auth), validation.validateDomainMi
         }
       })
     );
-    res.json(results.flat());
+    res.json(domain === 'posts' ? filterScheduledPosts(results.flat(), requesterId) : results.flat());
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -2204,6 +2210,13 @@ router.get('/:domain/:id', auth.authenticate.bind(auth), validation.validateDoma
   try {
     const result = await database.read(domain, id);
     if (!result) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    // A scheduled post belongs to its author alone; resolve any other user's
+    // scheduled post the same way as a missing row so a single-row read
+    // cannot leak it.
+    if (domain === 'posts' && isForeignScheduledPost(result, req.user?.id)) {
       res.status(404).json({ error: 'Not found' });
       return;
     }

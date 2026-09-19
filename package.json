@@ -12,6 +12,7 @@
     "test:group-members": "ts-node src/features/groupMembersTest.ts",
     "verify:message-requests": "ts-node src/features/verifyMessageRequestCategory.ts",
     "test:channel-permissions": "ts-node src/features/channelPermissionsTest.ts",
+    "test:scheduled-privacy": "ts-node src/features/scheduledPostPrivacyTest.ts",
     "test:people-you-may-know": "ts-node src/features/peopleYouMayKnowTest.ts",
     "test:all-channel": "npm run test:channel-moderator && npm run test:channel-permissions"
   },
