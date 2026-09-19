@@ -95,6 +95,8 @@ export interface GroupModerationActionRow {
   rule_id: string | null;
   ends_at: string | null;
   created_at: string;
+  actor_profile?: GroupProfile | null;
+  target_profile?: GroupProfile | null;
 }
 
 export interface GroupProfile {
@@ -366,7 +368,20 @@ export async function listGroupMembers(
     const bannedProfiles = await fetchProfiles(bans.map((b) => b.user_id));
     // Attach profiles onto the returned ban rows for the banned-members list.
     const banned = bans.map((b) => ({ ...b, profiles: bannedProfiles.get(b.user_id) ?? null }));
-    return { status: 'ok', your_access: yourAccess, members: enriched, banned, moderation };
+    // Attach actor/target profiles onto the moderation history so the UI can
+    // render "By: <moderator>" without extra lookups.
+    const involved = Array.from(
+      new Set(
+        moderation.flatMap((a) => [a.target_user_id, a.actor_id].filter((id): id is string => !!id))
+      )
+    );
+    const moderationProfiles = await fetchProfiles(involved);
+    const enrichedModeration = moderation.map((a) => ({
+      ...a,
+      actor_profile: a.actor_id ? moderationProfiles.get(a.actor_id) ?? null : null,
+      target_profile: moderationProfiles.get(a.target_user_id) ?? null,
+    }));
+    return { status: 'ok', your_access: yourAccess, members: enriched, banned, moderation: enrichedModeration };
   }
 
   return { status: 'ok', your_access: yourAccess, members: enriched, banned: [], moderation: [] };

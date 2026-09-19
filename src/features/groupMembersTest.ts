@@ -310,6 +310,23 @@ async function main() {
       assert.equal(r.status, 'target_not_found');
     });
     count++;
+
+    await run('TEST 18b: moderation history exposes actor/target profile slots', async () => {
+      db.group_members.push({ group_id: G1, user_id: STRANGER, role: 'member', created_at: '2026-01-01T00:00:00Z' });
+      const rm = await removeGroupMember(G1, OWNER, STRANGER, { reason: 'spam' }, projects);
+      assert.equal(rm.status, 'ok');
+      const r = await listGroupMembers(G1, OWNER, projects);
+      assert.equal(r.status, 'ok');
+      if (r.status !== 'ok') return;
+      const row = r.moderation.find((a) => a.action === 'remove' && a.target_user_id === STRANGER);
+      assert.ok(row, 'moderation history includes the remove');
+      // Offline harness has no profiles host, so enrichment resolves to null but
+      // must still populate the keys the Members UI renders against.
+      assert.ok('actor_profile' in (row as any), 'actor_profile populated');
+      assert.ok('target_profile' in (row as any), 'target_profile populated');
+      assert.equal((row as any).target_profile, null);
+    });
+    count++;
   }
 
   // --- Report ---
