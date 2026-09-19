@@ -279,18 +279,41 @@ function sendMemberActionResult(res: Response, result: MemberActionResult): void
 // toggle never settled). Every Group route is wrapped so a storage failure
 // becomes a real error response instead of an unanswered request.
 type GroupRouteHandler = (req: Request, res: Response) => Promise<void>;
+
+// Classify the ORIGINAL backend error so developer logs (and, when enabled,
+// developer responses) surface the precise root cause instead of only the
+// generic GROUP_OPERATION_FAILED wrapper. No database internals or secrets
+// are placed in the production response body.
+function classifyGroupError(error: unknown): {
+  code: string;
+  message: string;
+  domain?: string;
+} {
+  const message = error instanceof Error ? error.message : String(error);
+  const readable = message.match(/No readable projects for domain: (\S+)/);
+  if (readable) return { code: 'DOMAIN_NOT_REGISTERED', message, domain: readable[1] };
+  const writable = message.match(/No writable project registered for group table '(\S+)'/);
+  if (writable) return { code: 'GROUP_WRITABLE_PROJECT_MISSING', message, domain: writable[1] };
+  const relation = message.match(/relation "public\.(\w+)" does not exist/);
+  if (relation) return { code: 'GROUP_TABLE_MISSING', message, domain: relation[1] };
+  return { code: 'GROUP_HANDLER_ERROR', message };
+}
+
 function groupRoute(handler: GroupRouteHandler) {
   return async (req: Request, res: Response): Promise<void> => {
     try {
       await handler(req, res);
     } catch (error) {
-      // Log the REAL failure with operation context (pro.md: the original DB
-      // error must never be masked) but respond with a structured error that
-      // does not leak database internals.
+      // Log the REAL failure with operation context (pro.md: the original
+      // error must never be masked). Includes the classified code and the
+      // target domain/table involved when the error names one.
+      const classified = classifyGroupError(error);
       console.error(
         `[groups] ${req.method} ${req.originalUrl} failed:`,
         JSON.stringify({
-          errorMessage: (error as Error).message,
+          code: classified.code,
+          errorMessage: classified.message,
+          ...(classified.domain ? { domain: classified.domain } : {}),
           status: 500,
           groupId: typeof req.params?.groupId === 'string' ? req.params.groupId : null,
           memberId: typeof req.params?.memberId === 'string' ? req.params.memberId : null,
@@ -298,7 +321,20 @@ function groupRoute(handler: GroupRouteHandler) {
         })
       );
       if (!res.headersSent) {
-        res.status(500).json({ error: 'GROUP_OPERATION_FAILED', message: 'Group operation failed' });
+        // Default production payload: structured, no DB internals.
+        const payload: Record<string, string> = {
+          error: 'GROUP_OPERATION_FAILED',
+          message: 'Group operation failed',
+        };
+        // Debug (+GROUP_DEBUG_RESPONSE=1) intentionally surfaces the original
+        // error so a developer can capture the real cause in the response body
+        // without Vercel log access. Off by default; never on in production.
+        if (process.env.GROUP_DEBUG_RESPONSE === '1') {
+          payload.originalError = classified.message;
+          payload.code = classified.code;
+          if (classified.domain) payload.domain = classified.domain;
+        }
+        res.status(500).json(payload);
       }
     }
   };
