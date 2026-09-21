@@ -101,6 +101,27 @@ class StorageLayer {
     await provider.delete(id);
   }
 
+  // Issue a Cloudinary signed-upload so the browser can POST the file bytes
+  // straight to Cloudinary (see CloudinaryProvider.createSignedUploadParams for
+  // why). Must use a Cloudinary account matching the one resolvePublicUrl would
+  // reconstruct, so the returned CDN URL stays consistent with stored URLs.
+  async createSignedUpload(params: {
+    bucket: string;
+    path: string;
+  }): Promise<import('../../providers/storage/cloudinaryProvider').SignedUploadParams> {
+    const { path } = params;
+    const account = await storageRegistry.getActiveAccount();
+    if (!account || !account.cloudName) {
+      throw new Error('No active storage account');
+    }
+    const provider = getStorageProvider('cloudinary') as import('../../providers/storage/cloudinaryProvider').CloudinaryProvider;
+    return provider.createSignedUploadParams(path, {
+      cloudName: account.cloudName,
+      apiKey: account.apiKey,
+      apiSecret: account.apiSecret,
+    });
+  }
+
   // Resolve a stored `/api/storage/:bucket/:path` URL (the client's
   // getPublicUrl fallback and any legacy profile_pic / cover_pic / media_url
   // values that hold the dead gateway path form) to the actual Cloudinary CDN

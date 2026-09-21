@@ -1936,6 +1936,26 @@ router.get('/health', (_req, res) => {
 });
 
 // Apply auth middleware to non-v1 domain routes
+// Cloudinary signed-upload handoff: Vercel caps serverless request bodies
+// (~4.5MB on Hobby) at the platform layer before the function runs, so a
+// proxied multipart video upload aborts mid-stream and the browser surfaces
+// TypeError: Failed to fetch. Instead the client asks the gateway for a signed
+// Cloudinary upload URL, then POSTs the file straight to Cloudinary.
+router.post('/storage/sign', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
+  const { bucket, path } = req.body || {};
+  if (!bucket || !path) {
+    res.status(400).json({ error: 'bucket and path are required' });
+    return;
+  }
+  try {
+    const signed = await storage.createSignedUpload({ bucket, path });
+    res.status(200).json(signed);
+  } catch (error) {
+    console.error('[Gateway] Storage signing failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to sign upload' });
+  }
+});
+
 router.post('/storage/:bucket/*', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
   const { bucket } = req.params;
   const path = req.params[0];
