@@ -1977,6 +1977,9 @@ router.post('/storage/:bucket/*', auth.authenticate.bind(auth), async (req: Requ
 // fallback and any legacy profile_pic / cover_pic / media_url values stored in
 // that dead form). The gateway has no file server; redirect to the Cloudinary
 // CDN asset so stored avatar/cover/photo URLs render as <img> without auth.
+// `?format=mp3` (etc.) adds a Cloudinary on-delivery format conversion to the
+// redirect target — the voice-message client uses it to play legacy WebM/Opus
+// recordings in browsers without a WebM decoder (Safari/iOS).
 router.get('/storage/:bucket/*', async (req: Request, res: Response) => {
   const { bucket } = req.params;
   const path = req.params[0];
@@ -1984,8 +1987,9 @@ router.get('/storage/:bucket/*', async (req: Request, res: Response) => {
     res.status(400).json({ error: 'bucket and path are required' });
     return;
   }
+  const format = typeof req.query.format === 'string' ? req.query.format : undefined;
   try {
-    const resolved = await storage.resolvePublicUrl(path);
+    const resolved = await storage.resolvePublicUrl(path, format);
     if (!resolved) {
       res.status(404).json({ error: 'Storage not configured' });
       return;

@@ -127,12 +127,21 @@ class StorageLayer {
   // values that hold the dead gateway path form) to the actual Cloudinary CDN
   // asset. The gateway stores every upload under the `tone` folder with the
   // bucket-stripped path as public_id, so the CDN URL can be reconstructed.
-  async resolvePublicUrl(path: string): Promise<{ url: string } | null> {
+  //
+  // `format` optionally requests an on-delivery Cloudinary format conversion
+  // (e.g. `mp3` -> `f_mp3`) of the same asset. The voice-message client uses
+  // this for messages whose row has no persisted CDN URL (legacy rows): those
+  // play through the gateway fallback URL, and a browser that cannot decode the
+  // recorded container (WebM/Opus in Safari/iOS) gets an MP3 stream instead of
+  // a NotSupportedError. Restricted to plain alphanumeric format names.
+  async resolvePublicUrl(path: string, format?: string): Promise<{ url: string } | null> {
     const account = await storageRegistry.getActiveAccount();
     if (!account || !account.cloudName) return null;
     const resourceType = inferResourceType(path);
+    const transformation =
+      format && /^[a-z0-9]+$/i.test(format) ? `f_${format}/` : '';
     return {
-      url: `https://res.cloudinary.com/${account.cloudName}/${resourceType}/upload/v1/tone/${path}`,
+      url: `https://res.cloudinary.com/${account.cloudName}/${resourceType}/upload/${transformation}v1/tone/${path}`,
     };
   }
 
