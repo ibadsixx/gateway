@@ -46,10 +46,10 @@ function fakeClient(rows: GuestReadableRow[]) {
 
 async function main(): Promise<void> {
   // --- domain allowlist ---
-  for (const domain of ['posts', 'profiles', 'groups', 'pages', 'hashtags', 'page_posts', 'group_posts', 'group_members', 'likes', 'comments', 'post_tags', 'hashtag_links']) {
+  for (const domain of ['posts', 'profiles', 'groups', 'pages', 'hashtags', 'page_posts', 'group_posts', 'group_members', 'likes', 'comments', 'post_tags', 'hashtag_links', 'profile_details', 'other_names', 'life_events', 'family_relationships', 'companies', 'colleges', 'high_schools']) {
     assert.equal(isGuestReadableDomain(domain), true, `guest may read ${domain}`);
   }
-  assert.equal(GUEST_READ_DOMAINS.size, 12, 'exactly the public-surface domains are guest-readable');
+  assert.equal(GUEST_READ_DOMAINS.size, 19, 'exactly the public-surface domains are guest-readable');
   for (const denied of ['stories', 'story_views', 'story_reactions', 'story_highlights', 'message_requests', 'messages', 'conversations', 'friends', 'followers', 'notifications', 'privacy_settings', 'hidden_content', 'saved_posts', 'group_follows', 'group_pins', 'post_shares', 'blocks']) {
     assert.equal(isGuestReadableDomain(denied), false, `guest is denied ${denied}`);
   }
@@ -137,6 +137,8 @@ async function main(): Promise<void> {
     birth_date_visibility: null,
     websites_social_links: ['x'],
     websites_visibility: 'public',
+    relationship_status: 'married',
+    relationship_visibility: 'friends',
     vault_pin: '1234',
     vault_recovery_code: 'secret',
     preview_mode: true,
@@ -147,6 +149,8 @@ async function main(): Promise<void> {
   assert.equal(redacted.phone_number, null, 'phone with friends visibility is stripped');
   assert.equal(redacted.birth_date, '1990-01-01', 'birth_date with null visibility (public default) is kept');
   assert.deepEqual(redacted.websites_social_links, ['x'], 'public websites are kept');
+  assert.equal(redacted.relationship_status, null, 'relationship_status with friends visibility is stripped');
+  assert.equal((redacted as GuestReadableRow).relationship_visibility, 'friends', 'relationship visibility flag stays intact');
   assert.equal(redacted.vault_pin, null, 'vault_pin is always stripped');
   assert.equal(redacted.vault_recovery_code, null, 'vault_recovery_code is always stripped');
   assert.equal(redacted.preview_mode, null, 'preview_mode is always stripped');
@@ -215,6 +219,38 @@ async function main(): Promise<void> {
   const unknownPolicy = await applyGuestReadPolicy('stories', [{ id: 's1' }], publicPostClient);
   assert.equal(unknownPolicy.length, 0, 'non-allowlisted domain yields no rows');
 
+  // --- profile About content domains (do.md: guests see ALL public info) ---
+  const otherNames = await applyGuestReadPolicy('other_names', [
+    { id: 'on1', user_id: 'u1', type: 'nickname', name: 'Ali', visibility: 'public' },
+    { id: 'on2', user_id: 'u1', type: 'nickname', name: 'Ali2', visibility: 'friends' },
+    { id: 'on3', user_id: 'u1', type: 'nickname', name: 'Ali3', visibility: 'private' },
+  ], publicPostClient);
+  assert.deepEqual(otherNames.map((r) => r.id), ['on1'], 'other_names keeps public rows only');
+
+  const lifeEvents = await applyGuestReadPolicy('life_events', [
+    { id: 'le1', user_id: 'u1', category: 'Travel & Living', title: 'Moved to Paris', visibility: 'public' },
+    { id: 'le2', user_id: 'u1', category: 'Work & Education', title: 'Grad school', visibility: 'friends' },
+  ], publicPostClient);
+  assert.deepEqual(lifeEvents.map((r) => r.id), ['le1'], 'life_events keeps public rows only');
+
+  const familyRelationships = await applyGuestReadPolicy('family_relationships', [
+    { id: 'fr1', user_id: 'u1', member_id: 'u2', relation_type: 'sister', visibility: 'public' },
+    { id: 'fr2', user_id: 'u1', member_id: 'u3', relation_type: 'brother', visibility: 'friends' },
+  ], publicPostClient);
+  assert.deepEqual(familyRelationships.map((r) => r.id), ['fr1'], 'family_relationships keeps public rows only');
+
+  const profileDetails = await applyGuestReadPolicy('profile_details', [
+    { id: 'pd1', profile_id: 'u1', section: 'places', field_name: 'current_city', field_value: 'Paris' },
+  ], publicPostClient);
+  assert.equal(profileDetails.length, 1, 'profile_details passes through (no per-row visibility)');
+
+  const companies = await applyGuestReadPolicy('companies', [{ id: 'c1', name: 'Acme' }], publicPostClient);
+  assert.equal(companies.length, 1, 'companies reference table passes through');
+  const colleges = await applyGuestReadPolicy('colleges', [{ id: 'cl1', name: 'MIT' }], publicPostClient);
+  assert.equal(colleges.length, 1, 'colleges reference table passes through');
+  const highSchools = await applyGuestReadPolicy('high_schools', [{ id: 'hs1', name: 'Lincoln HS' }], publicPostClient);
+  assert.equal(highSchools.length, 1, 'high_schools reference table passes through');
+
   // --- single-row gates ---
   assert.equal(
     await isGuestSingleRowVisible('posts', PUBLISHED_PUBLIC_POST, publicPostClient),
@@ -255,6 +291,36 @@ async function main(): Promise<void> {
     await isGuestSingleRowVisible('stories', { id: 's1' }, publicPostClient),
     false,
     'stories single-row is not guest-visible'
+  );
+  assert.equal(
+    await isGuestSingleRowVisible('life_events', { id: 'le1', visibility: 'public' }, publicPostClient),
+    true,
+    'public life event single-row is visible'
+  );
+  assert.equal(
+    await isGuestSingleRowVisible('life_events', { id: 'le1', visibility: 'friends' }, publicPostClient),
+    false,
+    'friends life event single-row is hidden'
+  );
+  assert.equal(
+    await isGuestSingleRowVisible('family_relationships', { id: 'fr1', visibility: 'public' }, publicPostClient),
+    true,
+    'public family relationship single-row is visible'
+  );
+  assert.equal(
+    await isGuestSingleRowVisible('other_names', { id: 'on3', visibility: 'private' }, publicPostClient),
+    false,
+    'private other name single-row is hidden'
+  );
+  assert.equal(
+    await isGuestSingleRowVisible('profile_details', { id: 'pd1' }, publicPostClient),
+    true,
+    'profile_details single-row is visible'
+  );
+  assert.equal(
+    await isGuestSingleRowVisible('companies', { id: 'c1' }, publicPostClient),
+    true,
+    'companies single-row is visible'
   );
   assert.equal(
     stripGuestSingleRowRead('profiles', profile).email,

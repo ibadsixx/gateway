@@ -13,6 +13,11 @@ export type GuestReadableRow = Record<string, unknown>;
 // Domains public surfaces READ from while logged out (posts/profiles/groups/
 // pages/hashtags plus the join tables those surfaces resolve client-side:
 // likes, comments, post_tags, group_posts, group_members, page_posts).
+// Profile pages additionally read the About/profile content domains —
+// profile_details, other_names, life_events and family_relationships — which
+// apply per-row visibility filtering below, plus the public reference tables
+// companies/colleges/high_schools that the About UI resolves Work/Education
+// joins against (RLS "viewable by everyone"; no per-row privacy concept).
 // Anything else — stories, story_views, message_requests, friends, followers,
 // notifications, privacy_settings, hidden_content, saved_posts, group_follows,
 // group_pins, vault/security tables, … — is denied for guests with 403 at the
@@ -30,7 +35,23 @@ export const GUEST_READ_DOMAINS: ReadonlySet<string> = new Set([
   'comments',
   'post_tags',
   'hashtag_links',
+  'profile_details',
+  'other_names',
+  'life_events',
+  'family_relationships',
+  'companies',
+  'colleges',
+  'high_schools',
 ]);
+
+// A profile-adjacent row (other_names / life_events / family_relationships) is
+// public to a guest only when its explicit `visibility` column is exactly
+// 'public'. All three tables default to 'friends' and constrain values to
+// ('public','friends','private'), so strict equality is correct and mirrors the
+// tables' own RLS ("WHEN visibility = 'public' THEN true").
+export function isGuestRowPublicVisibility(row: GuestReadableRow | null | undefined): boolean {
+  return !!row && typeof row === 'object' && row['visibility'] === 'public';
+}
 
 export function isGuestReadableDomain(domain: string): boolean {
   return GUEST_READ_DOMAINS.has(domain);
@@ -86,7 +107,7 @@ const PROFILE_VISIBILITY_PAIRS: ReadonlyArray<[field: string, visibilityCol: str
   ['function', 'function_visibility'],
   ['high_school', 'high_school_visibility'],
   ['high_school_id', 'high_school_visibility'],
-  ['relationship', 'relationship_visibility'],
+  ['relationship_status', 'relationship_visibility'],
   ['websites_social_links', 'websites_visibility'],
   ['name_pronunciation', 'name_pronunciation_visibility'],
 ];
@@ -194,6 +215,19 @@ export async function applyGuestReadPolicy(
     case 'page_posts':
       // Pages, hashtags and page_posts are public-by-design entities.
       return rows;
+    case 'profile_details':
+    case 'companies':
+    case 'colleges':
+    case 'high_schools':
+      // Public-by-design records with no per-row privacy: profile_details rows
+      // carry no visibility column (RLS "viewable by everyone"; About/Places),
+      // and companies/colleges/high_schools are public reference dictionaries.
+      return rows;
+    case 'other_names':
+    case 'life_events':
+    case 'family_relationships':
+      // Explicit per-row visibility: only 'public' rows are guest-readable.
+      return rows.filter(isGuestRowPublicVisibility);
     case 'group_posts':
     case 'group_members':
       return filterGuestGroupScopedRows(rows, client);
@@ -226,6 +260,15 @@ export async function isGuestSingleRowVisible(
     case 'hashtags':
     case 'page_posts':
       return true;
+    case 'profile_details':
+    case 'companies':
+    case 'colleges':
+    case 'high_schools':
+      return true;
+    case 'other_names':
+    case 'life_events':
+    case 'family_relationships':
+      return isGuestRowPublicVisibility(row);
     case 'group_posts':
     case 'group_members': {
       const visible = await loadVisibleGroupIds(client, [ROW_PROP(row, 'group_id')]);
