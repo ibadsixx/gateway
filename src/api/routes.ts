@@ -40,6 +40,12 @@ import {
 } from '../features/storyPrivacy';
 import { highlightItemWriteDenied } from '../features/highlightPrivacy';
 import {
+  isGuestReadableDomain,
+  applyGuestReadPolicy,
+  isGuestSingleRowVisible,
+  stripGuestSingleRowRead,
+} from '../features/guestAccess';
+import {
   createGroup,
   updateGroupSettings,
   updateGroupCover,
@@ -2235,10 +2241,19 @@ router.get('/users', auth.authenticate.bind(auth), async (_req, res) => {
   }
 });
 
-router.get('/:domain', auth.authenticate.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
+router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain } = req.params;
   if (!featureFlags.isEnabled(domain)) {
     res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  // Guest (logged-out) access: only public content domains may be read, and
+  // every row is filtered to published public content below. Authenticated
+  // requesters are unaffected (requesterId set, guest branch skipped).
+  const requesterId = req.user?.id;
+  const isGuest = !requesterId;
+  if (isGuest && !isGuestReadableDomain(domain)) {
+    res.status(403).json({ error: 'Authentication required to view this content' });
     return;
   }
   try {
@@ -2248,7 +2263,6 @@ router.get('/:domain', auth.authenticate.bind(auth), validation.validateDomainMi
       return;
     }
     const filters = req.query.filter as string[] | string | undefined;
-    const requesterId = req.user?.id;
     const results = await Promise.all(
       readableProjects.map(async (entry) => {
         try {
@@ -2257,6 +2271,13 @@ router.get('/:domain', auth.authenticate.bind(auth), validation.validateDomainMi
           const { data, error } = await query;
           if (error) return [];
           let rows = (data as any[]) || [];
+          // Guest read policy: published public content only; private profile
+          // fields are stripped; child rows (likes/comments/tags, group
+          // posts/members) are gated by their parent's visibility.
+          if (isGuest) {
+            rows = await applyGuestReadPolicy(domain, rows, entry.client);
+            return rows;
+          }
           // Story privacy (do.md): the generic service-role read bypasses RLS,
           // so per-row restrictions run here so a non-owner viewer receives
           // ONLY their own reaction state (story_reactions), Story views are
@@ -2354,16 +2375,36 @@ async function redactPendingRequestPresence(
   });
 }
 
-router.get('/:domain/:id', auth.authenticate.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
+router.get('/:domain/:id', auth.authenticateOptional.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain, id } = req.params;
   if (!featureFlags.isEnabled(domain)) {
     res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const requesterId = req.user?.id;
+  const isGuest = !requesterId;
+  // Guests may resolve single rows only for public content domains.
+  if (isGuest && !isGuestReadableDomain(domain)) {
+    res.status(403).json({ error: 'Authentication required to view this content' });
     return;
   }
   try {
     const result = await database.read(domain, id);
     if (!result) {
       res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    // Guest single-row read: hide non-public rows exactly like a missing row
+    // (404) and redact private profile fields before handing the row out.
+    if (isGuest) {
+      const entries = projectManager.getReadableProjects(domain);
+      const client = entries[0]?.client;
+      const visible = client ? await isGuestSingleRowVisible(domain, result, client) : false;
+      if (!visible) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
+      res.json(stripGuestSingleRowRead(domain, result));
       return;
     }
     // A scheduled post belongs to its author alone; resolve any other user's
