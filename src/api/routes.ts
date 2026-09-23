@@ -38,6 +38,7 @@ import {
   storyReactionWriteDenied,
   bumpStoryViewsCount,
 } from '../features/storyPrivacy';
+import { highlightItemWriteDenied } from '../features/highlightPrivacy';
 import {
   createGroup,
   updateGroupSettings,
@@ -2151,6 +2152,28 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
     }
     if (domain === 'story_views' && req.user?.id && req.body && typeof req.body === 'object') {
       (req.body as Record<string, unknown>).viewer_id = req.user.id;
+    }
+    // Highlight authorization (do.md "Add to Highlight"): a user may only add
+    // THEIR OWN Story to THEIR OWN Highlight. The Story owner id and the
+    // Highlight owner id are resolved server-side and compared with the
+    // authenticated caller, so a direct API/Gateway request from anyone else
+    // is rejected (403).
+    if (domain === 'story_highlight_items') {
+      const highlightDenied = await highlightItemWriteDenied(
+        req.body,
+        projectManager.getReadableProjects('story_highlights').map((p) => p.client),
+        projectManager.getReadableProjects('stories').map((p) => p.client),
+        req.user?.id
+      );
+      if (highlightDenied) {
+        res.status(403).json({ error: highlightDenied });
+        return;
+      }
+    }
+    // A highlight group can only ever be created under the authenticated
+    // caller's own user_id, never attributed to another user.
+    if (domain === 'story_highlights' && req.user?.id && req.body && typeof req.body === 'object') {
+      (req.body as Record<string, unknown>).user_id = req.user.id;
     }
     // Re-recording an already recorded view (unique story_id + viewer_id) is
     // not an error: the view simply stays counted once.
