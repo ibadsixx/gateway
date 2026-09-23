@@ -18,10 +18,17 @@ export type GuestReadableRow = Record<string, unknown>;
 // apply per-row visibility filtering below, plus the public reference tables
 // companies/colleges/high_schools that the About UI resolves Work/Education
 // joins against (RLS "viewable by everyone"; no per-row privacy concept).
-// Anything else — stories, story_views, message_requests, friends, followers,
-// notifications, privacy_settings, hidden_content, saved_posts, group_follows,
-// group_pins, vault/security tables, … — is denied for guests with 403 at the
-// route boundary before any row processing.
+// The profile list tables friends/followers are also guest-readable, but ONLY
+// as far as the profile owner's own per-list visibility allows: a guest sees a
+// friends row only when the profile being viewed has
+// friends_visibility='public', and a following/followers row only when the
+// viewed profile's following_visibility is true (the app's single follow-graph
+// visibility toggle — there is no separate followers setting in the schema or
+// UI). See filterGuestProfileListRows below.
+// Anything else — stories, story_views, message_requests, notifications,
+// privacy_settings, hidden_content, saved_posts, group_follows, group_pins,
+// vault/security tables, … — is denied for guests with 403 at the route
+// boundary before any row processing.
 export const GUEST_READ_DOMAINS: ReadonlySet<string> = new Set([
   'posts',
   'profiles',
@@ -42,6 +49,8 @@ export const GUEST_READ_DOMAINS: ReadonlySet<string> = new Set([
   'companies',
   'colleges',
   'high_schools',
+  'friends',
+  'followers',
 ]);
 
 // A profile-adjacent row (other_names / life_events / family_relationships) is
@@ -140,6 +149,119 @@ export function stripPrivateProfileFields(row: GuestReadableRow): GuestReadableR
   return redacted;
 }
 
+// --- profile lists (friends/following/followers) ---
+// A guest may read a list row for the profile whose list they are viewing ONLY
+// when that profile owner made the list public:
+//   friends    -> profiles.friends_visibility === 'public'
+//   followers  -> profiles.following_visibility !== false
+//                 (the app has no separate followers visibility column/setting;
+//                  following_visibility is its single follow-graph toggle with
+//                  a default of true = public)
+// The generic read path first applies the client's query filters server-side
+// (`or=(requester_id.eq.X,receiver_id.eq.X)` for friends,
+// `follower_id=eq.X` for following, `following_id=eq.X` for followers), so
+// every returned row is guaranteed to involve the viewed profile. We re-parse
+// those same filters to recover the viewed profile ("subject"), check that
+// profile's visibility, and drop the whole batch when it is not public — the
+// gateway must never hand restricted list data to a guest.
+
+// Split a PostgREST filter expression into its top-level comma-separated terms
+// (respects nested parens, e.g. or=(and(a),and(b))).
+function splitFilterTerms(input: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of input) {
+    if (ch === '(') depth++;
+    if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) {
+      if (current.trim()) parts.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+// Walk a filter expression and collect every id pinned by `eq` on one of the
+// given columns. Accepts top-level `col=eq.val` filters and `or=(...)` /
+// `and=(...)` groups whose terms use PostgREST dot notation (`col.eq.val`).
+function collectEqPins(expr: string, cols: ReadonlySet<string>, out: Set<string>): void {
+  const e = expr.trim();
+  if (e.startsWith('or=') || e.startsWith('and=')) {
+    for (const term of splitFilterTerms(e.slice(3).replace(/^\(|\)$/g, ''))) {
+      collectEqPins(term, cols, out);
+    }
+    return;
+  }
+  const unwrapped = e.replace(/^\(|\)$/g, '');
+  const group = unwrapped.match(/^(and|or)\(/);
+  if (group) {
+    for (const term of splitFilterTerms(unwrapped.slice(unwrapped.indexOf('(') + 1, -1))) {
+      collectEqPins(term, cols, out);
+    }
+    return;
+  }
+  const m = unwrapped.match(/^([A-Za-z_][A-Za-z0-9_]*)(?:=|\.)eq\.(.+)$/);
+  if (!m) return;
+  if (!cols.has(m[1])) return;
+  const val = m[2].replace(/^\(|\)$/g, '').replace(/^['"]|['"]$/g, '');
+  if (val && val !== 'null' && val !== 'true' && val !== 'false') out.add(val);
+}
+
+interface ProfileListSpec {
+  subjectCols: ReadonlyArray<string>;
+  // A subject profile permits guest reads of this list when allow(profile) is
+  // true. Absent visibility columns default to public (matches the app).
+  allow: (profile: GuestReadableRow) => boolean;
+}
+
+const PROFILE_LIST_SPECS: Record<string, ProfileListSpec> = {
+  friends: {
+    subjectCols: ['requester_id', 'receiver_id'],
+    allow: (p) => p['friends_visibility'] == null || p['friends_visibility'] === 'public',
+  },
+  followers: {
+    subjectCols: ['follower_id', 'following_id'],
+    allow: (p) => p['following_visibility'] !== false,
+  },
+};
+
+export async function filterGuestProfileListRows(
+  domain: 'friends' | 'followers',
+  rows: GuestReadableRow[],
+  client: GuestClient,
+  filters?: string | string[] | undefined
+): Promise<GuestReadableRow[]> {
+  const spec = PROFILE_LIST_SPECS[domain];
+  const subjects = new Set<string>();
+  const filterList = Array.isArray(filters) ? filters : filters ? [filters] : [];
+  for (const f of filterList) collectEqPins(f, new Set(spec.subjectCols), subjects);
+  if (subjects.size === 0) {
+    // No subject pinned by the query — treat every profile involved in the
+    // rows as a subject. Over-restrictive, but it can never leak a row whose
+    // owner kept their list restricted.
+    for (const r of rows) {
+      for (const col of spec.subjectCols) {
+        const id = ROW_PROP(r, col);
+        if (id) subjects.add(id);
+      }
+    }
+  }
+  if (subjects.size === 0) return rows;
+  const ids = [...subjects];
+  const { data } = await client.from('profiles').select('*').in('id', ids);
+  const byId = new Map<string, GuestReadableRow>();
+  for (const p of (data as GuestReadableRow[]) || []) byId.set(String(p['id']), p);
+  for (const id of ids) {
+    const profile = byId.get(id);
+    if (!profile || !spec.allow(profile)) return [];
+  }
+  return rows;
+}
+
 // --- parent-scoped rows (likes/comments/post_tags on posts, group_posts/
 // group_members in groups) ---
 // A guest may only read a child row when its parent is itself guest-visible —
@@ -197,11 +319,13 @@ export async function filterGuestGroupScopedRows(
 }
 
 // Full per-domain guest filtering for a list read. `domain` is guaranteed to
-// be in GUEST_READ_DOMAINS by the caller.
+// be in GUEST_READ_DOMAINS by the caller. `filters` carries the client's query
+// filters (needed only by the profile-list domains to recover the viewed owner).
 export async function applyGuestReadPolicy(
   domain: string,
   rows: GuestReadableRow[],
-  client: GuestClient
+  client: GuestClient,
+  filters?: string | string[] | undefined
 ): Promise<GuestReadableRow[]> {
   switch (domain) {
     case 'posts':
@@ -228,6 +352,11 @@ export async function applyGuestReadPolicy(
     case 'family_relationships':
       // Explicit per-row visibility: only 'public' rows are guest-readable.
       return rows.filter(isGuestRowPublicVisibility);
+    case 'friends':
+    case 'followers':
+      // Per-list owner visibility: the viewed profile must have made the list
+      // public (friends_visibility == 'public'; following_visibility true).
+      return filterGuestProfileListRows(domain, rows, client, filters);
     case 'group_posts':
     case 'group_members':
       return filterGuestGroupScopedRows(rows, client);
@@ -269,6 +398,12 @@ export async function isGuestSingleRowVisible(
     case 'life_events':
     case 'family_relationships':
       return isGuestRowPublicVisibility(row);
+    case 'friends':
+    case 'followers':
+      // List rows are read via list queries keyed to the viewed profile; a
+      // single-row id read has no subject to gate against, so it is never
+      // served to a guest.
+      return false;
     case 'group_posts':
     case 'group_members': {
       const visible = await loadVisibleGroupIds(client, [ROW_PROP(row, 'group_id')]);

@@ -46,11 +46,11 @@ function fakeClient(rows: GuestReadableRow[]) {
 
 async function main(): Promise<void> {
   // --- domain allowlist ---
-  for (const domain of ['posts', 'profiles', 'groups', 'pages', 'hashtags', 'page_posts', 'group_posts', 'group_members', 'likes', 'comments', 'post_tags', 'hashtag_links', 'profile_details', 'other_names', 'life_events', 'family_relationships', 'companies', 'colleges', 'high_schools']) {
+  for (const domain of ['posts', 'profiles', 'groups', 'pages', 'hashtags', 'page_posts', 'group_posts', 'group_members', 'likes', 'comments', 'post_tags', 'hashtag_links', 'profile_details', 'other_names', 'life_events', 'family_relationships', 'companies', 'colleges', 'high_schools', 'friends', 'followers']) {
     assert.equal(isGuestReadableDomain(domain), true, `guest may read ${domain}`);
   }
-  assert.equal(GUEST_READ_DOMAINS.size, 19, 'exactly the public-surface domains are guest-readable');
-  for (const denied of ['stories', 'story_views', 'story_reactions', 'story_highlights', 'message_requests', 'messages', 'conversations', 'friends', 'followers', 'notifications', 'privacy_settings', 'hidden_content', 'saved_posts', 'group_follows', 'group_pins', 'post_shares', 'blocks']) {
+  assert.equal(GUEST_READ_DOMAINS.size, 21, 'exactly the public-surface domains are guest-readable');
+  for (const denied of ['stories', 'story_views', 'story_reactions', 'story_highlights', 'message_requests', 'messages', 'conversations', 'notifications', 'privacy_settings', 'hidden_content', 'saved_posts', 'group_follows', 'group_pins', 'post_shares', 'blocks']) {
     assert.equal(isGuestReadableDomain(denied), false, `guest is denied ${denied}`);
   }
 
@@ -251,6 +251,48 @@ async function main(): Promise<void> {
   const highSchools = await applyGuestReadPolicy('high_schools', [{ id: 'hs1', name: 'Lincoln HS' }], publicPostClient);
   assert.equal(highSchools.length, 1, 'high_schools reference table passes through');
 
+  // --- profile lists (do.md): friends / following / followers, gated by the
+  // --- viewed profile owner's per-list visibility ---
+  const friendsPublicClient = fakeClient([{ id: 'x1', friends_visibility: 'public' }]);
+  const friendsHiddenClient = fakeClient([{ id: 'x1', friends_visibility: 'friends' }]);
+  const friendsRows = [
+    { id: 'f1', requester_id: 'x1', receiver_id: 'y1', status: 'accepted' },
+    { id: 'f2', requester_id: 'z1', receiver_id: 'x1', status: 'accepted' },
+  ];
+  const friendsListFilters = ['or=(requester_id.eq.x1,receiver_id.eq.x1)', 'status=eq.accepted'];
+
+  const friendsPublic = await applyGuestReadPolicy('friends', friendsRows, friendsPublicClient, friendsListFilters);
+  assert.equal(friendsPublic.length, 2, 'friends list rows are guest-readable when friends_visibility is public');
+
+  const friendsHidden = await applyGuestReadPolicy('friends', friendsRows, friendsHiddenClient, friendsListFilters);
+  assert.equal(friendsHidden.length, 0, 'friends list rows are hidden when friends_visibility is not public');
+
+  const followingPublicClient = fakeClient([{ id: 'x1', following_visibility: true }]);
+  const followingHiddenClient = fakeClient([{ id: 'x1', following_visibility: false }]);
+  const followingNullClient = fakeClient([{ id: 'x1' }]);
+
+  const followingRows = [{ id: 'fl1', follower_id: 'x1', following_id: 'y1' }];
+  const followingOk = await applyGuestReadPolicy('followers', followingRows, followingPublicClient, ['follower_id=eq.x1']);
+  assert.equal(followingOk.length, 1, 'following list (follower_id pin) is guest-readable when following_visibility is true');
+  const followingBlocked = await applyGuestReadPolicy('followers', followingRows, followingHiddenClient, ['follower_id=eq.x1']);
+  assert.equal(followingBlocked.length, 0, 'following list is hidden when following_visibility is false');
+
+  const followersRows = [{ id: 'fs1', follower_id: 'y1', following_id: 'x1' }];
+  const followersOk = await applyGuestReadPolicy('followers', followersRows, followingPublicClient, ['following_id=eq.x1']);
+  assert.equal(followersOk.length, 1, 'followers list (following_id pin) is guest-readable when following_visibility is true');
+  const followersBlocked = await applyGuestReadPolicy('followers', followersRows, followingHiddenClient, ['following_id=eq.x1']);
+  assert.equal(followersBlocked.length, 0, 'followers list is hidden when following_visibility is false');
+  const followersDefault = await applyGuestReadPolicy('followers', followersRows, followingNullClient, ['following_id=eq.x1']);
+  assert.equal(followersDefault.length, 1, 'absent following_visibility defaults to public (matches app default)');
+
+  // No filters pinned -> every involved profile must be public (never leaks).
+  const mixedListClient = fakeClient([
+    { id: 'x1', friends_visibility: 'public' },
+    { id: 'y1', friends_visibility: 'friends' },
+  ]);
+  const friendsNoFilter = await applyGuestReadPolicy('friends', friendsRows, mixedListClient, undefined);
+  assert.equal(friendsNoFilter.length, 0, 'no-pin friends read falls back to all involved profiles public');
+
   // --- single-row gates ---
   assert.equal(
     await isGuestSingleRowVisible('posts', PUBLISHED_PUBLIC_POST, publicPostClient),
@@ -316,6 +358,16 @@ async function main(): Promise<void> {
     await isGuestSingleRowVisible('profile_details', { id: 'pd1' }, publicPostClient),
     true,
     'profile_details single-row is visible'
+  );
+  assert.equal(
+    await isGuestSingleRowVisible('friends', { id: 'f1', requester_id: 'x1' }, friendsPublicClient),
+    false,
+    'friends single-row read is never guest-visible (lists are batch reads keyed to the viewed profile)'
+  );
+  assert.equal(
+    await isGuestSingleRowVisible('followers', { id: 'fs1', following_id: 'x1' }, followingPublicClient),
+    false,
+    'followers single-row read is never guest-visible'
   );
   assert.equal(
     await isGuestSingleRowVisible('companies', { id: 'c1' }, publicPostClient),

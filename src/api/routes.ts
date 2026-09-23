@@ -2273,9 +2273,11 @@ router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validate
           let rows = (data as any[]) || [];
           // Guest read policy: published public content only; private profile
           // fields are stripped; child rows (likes/comments/tags, group
-          // posts/members) are gated by their parent's visibility.
+          // posts/members) are gated by their parent's visibility; profile
+          // lists (friends/following/followers) are gated by the viewed
+          // owner's per-list visibility.
           if (isGuest) {
-            rows = await applyGuestReadPolicy(domain, rows, entry.client);
+            rows = await applyGuestReadPolicy(domain, rows, entry.client, filters);
             return rows;
           }
           // Story privacy (do.md): the generic service-role read bypasses RLS,
