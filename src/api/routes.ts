@@ -32,6 +32,13 @@ import { addChannelModerator, removeChannelModerator } from '../features/channel
 import { deleteChannel } from '../features/deleteChannel';
 import { addChannelFollower } from '../features/addChannelFollower';
 import {
+  restrictStoryReactionsRead,
+  restrictStoryViewsRead,
+  restrictStoryRowsRead,
+  storyReactionWriteDenied,
+  bumpStoryViewsCount,
+} from '../features/storyPrivacy';
+import {
   createGroup,
   updateGroupSettings,
   updateGroupCover,
@@ -927,6 +934,12 @@ v1.delete('/:domain/:id', validation.validateDomainMiddleware, async (req, res) 
     res.status(403).json({ error: groupMemberDeleteDenied });
     return;
   }
+  // A viewer must never remove another user's story reaction/view row through
+  // the generic service-role delete (do.md privacy).
+  if ((domain === 'story_reactions' || domain === 'story_views') && !(await isOwnedDeletableStoryRow(domain, id, req.user?.id))) {
+    res.status(403).json({ error: 'You can only delete your own story reaction or view rows' });
+    return;
+  }
   const permanent = req.query.permanent === 'true';
   try {
     await database.delete(domain, id, permanent);
@@ -989,7 +1002,19 @@ v1.delete('/:domain', validation.validateDomainMiddleware, async (req, res) => {
         query = applySupabaseFilters(query, filters);
         const { data } = await query;
         if (data && (data as any[]).length > 0) {
-          for (const row of data as any[]) {
+          // Story reaction/view rows may only be deleted by their author; the
+          // generic service-role bulk delete bypasses RLS, so unowned rows are
+          // dropped before deletion (do.md privacy).
+          let deletable = data as any[];
+          if (domain === 'story_reactions' || domain === 'story_views') {
+            const requesterId = req.user?.id;
+            if (!requesterId) {
+              res.status(403).json({ error: 'You can only delete your own story reaction or view rows' });
+              return;
+            }
+            deletable = deletable.filter((row) => (row?.user_id || row?.viewer_id) === requesterId);
+          }
+          for (const row of deletable) {
             if (row.id) {
               await entry.client.from(domain).delete().eq('id', row.id);
             } else {
@@ -1308,6 +1333,23 @@ const GROUP_MEMBER_WRITE_DOMAINS = new Set([
 function groupMemberWriteDenied(domain: string): string | null {
   if (!GROUP_MEMBER_WRITE_DOMAINS.has(domain)) return null;
   return 'Group members must be managed via the authorized /api/v1/groups/:groupId endpoints';
+}
+
+// A story_reactions row is owned by `user_id`; a story_views row by `viewer_id`.
+async function isOwnedDeletableStoryRow(
+  domain: string,
+  id: string,
+  requesterId: string | undefined
+): Promise<boolean> {
+  if (!requesterId) return false;
+  try {
+    const row = await database.read(domain, id);
+    if (!row) return false;
+    const ownerColumn = domain === 'story_reactions' ? 'user_id' : 'viewer_id';
+    return (row as Record<string, unknown>)?.[ownerColumn] === requesterId;
+  } catch {
+    return false;
+  }
 }
 
 async function enforceMessageWritePolicy(
@@ -1702,6 +1744,20 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
       }
     }
 
+    // Story self-replies must be impossible: the owner cannot open a
+    // conversation with themselves through the Story reply system (do.md
+    // section 3 / Scenario G). get_or_create_dm is the entry point the Story
+    // reply flow uses to create the conversation.
+    if (rpcName === 'get_or_create_dm') {
+      const rpcBody = body as Record<string, unknown>;
+      const userA = typeof rpcBody['p_user_a'] === 'string' ? (rpcBody['p_user_a'] as string) : undefined;
+      const userB = typeof rpcBody['p_user_b'] === 'string' ? (rpcBody['p_user_b'] as string) : undefined;
+      if (userA && userB && userA === userB) {
+        res.status(403).json({ error: 'You cannot create a conversation with yourself' });
+        return;
+      }
+    }
+
     // get_channel_user_role reads auth.uid(), which is NULL on the conversations
     // host (it does not share the users JWT secret) — the proxied function would
     // resolve to no role for every caller. Compute it here instead, using the
@@ -2075,7 +2131,45 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
       res.status(403).json({ error: pinDenied });
       return;
     }
-    const result = await database.write(domain, req.body);
+    // Story privacy (do.md): the Story owner must NOT be able to create a
+    // reaction on their own Story (Scenario F), and reaction/view rows are
+    // always stamped with the authenticated caller so no client can attribute
+    // a reaction or a view to another user.
+    if (domain === 'story_reactions') {
+      const reactionDenied = await storyReactionWriteDenied(
+        req.body,
+        projectManager.getReadableProjects('stories').map((p) => p.client),
+        req.user?.id
+      );
+      if (reactionDenied) {
+        res.status(403).json({ error: reactionDenied });
+        return;
+      }
+      if (req.user?.id && req.body && typeof req.body === 'object') {
+        (req.body as Record<string, unknown>).user_id = req.user.id;
+      }
+    }
+    if (domain === 'story_views' && req.user?.id && req.body && typeof req.body === 'object') {
+      (req.body as Record<string, unknown>).viewer_id = req.user.id;
+    }
+    // Re-recording an already recorded view (unique story_id + viewer_id) is
+    // not an error: the view simply stays counted once.
+    let result: Awaited<ReturnType<typeof database.write>> | null;
+    try {
+      result = await database.write(domain, req.body);
+    } catch (writeError) {
+      if (domain === 'story_views' && /duplicate key/i.test(String((writeError as Error).message))) {
+        result = null;
+      } else {
+        throw writeError;
+      }
+    }
+    // Views are counted from `story_views` (independent of reactions) and the
+    // total is stored gateway-side, so no viewer ever reads another user's
+    // view rows/counts (do.md sections 5/6/8).
+    if (domain === 'story_views') {
+      await bumpStoryViewsCount(projectManager.getWritableProject('story_views')?.client, result);
+    }
     if (domain === 'message_requests') {
       console.log('[MessageRequest] request_created', { id: Array.isArray(result) ? result[0]?.id : result?.id });
     }
@@ -2140,6 +2234,18 @@ router.get('/:domain', auth.authenticate.bind(auth), validation.validateDomainMi
           const { data, error } = await query;
           if (error) return [];
           let rows = (data as any[]) || [];
+          // Story privacy (do.md): the generic service-role read bypasses RLS,
+          // so per-row restrictions run here so a non-owner viewer receives
+          // ONLY their own reaction state (story_reactions), Story views are
+          // owner-only (story_views), and view analytics on `stories` rows
+          // (views count + viewed_by ids) never reach a non-owner.
+          if (domain === 'story_reactions') {
+            rows = await restrictStoryReactionsRead(rows, entry.client, requesterId);
+          } else if (domain === 'story_views') {
+            rows = await restrictStoryViewsRead(rows, entry.client, requesterId);
+          } else if (domain === 'stories') {
+            rows = restrictStoryRowsRead(rows, requesterId);
+          }
           // Presence privacy: for `profiles`, do NOT hand presence fields
           // (last_seen_at / manual_status / is_online) to a requester who is a
           // NON-FRIEND with a PENDING message request against the profile owner.
@@ -2242,6 +2348,12 @@ router.get('/:domain/:id', auth.authenticate.bind(auth), validation.validateDoma
     // cannot leak it.
     if (domain === 'posts' && isForeignScheduledPost(result, req.user?.id)) {
       res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    // Story rows carry view analytics; a non-owner must not receive them even
+    // through a single-row read (do.md scenario H).
+    if (domain === 'stories') {
+      res.json(restrictStoryRowsRead([result], req.user?.id)[0]);
       return;
     }
     res.json(result);

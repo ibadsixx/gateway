@@ -14,6 +14,7 @@
     "test:channel-permissions": "ts-node src/features/channelPermissionsTest.ts",
     "test:scheduled-privacy": "ts-node src/features/scheduledPostPrivacyTest.ts",
     "test:people-you-may-know": "ts-node src/features/peopleYouMayKnowTest.ts",
+    "test:story-privacy": "ts-node src/features/storyPrivacyTest.ts",
     "test:storage-sign": "ts-node src/features/storageSignTest.ts",
     "test:storage-resolve": "ts-node src/features/storageResolveTest.ts",
     "test:all-channel": "npm run test:channel-moderator && npm run test:channel-permissions"
