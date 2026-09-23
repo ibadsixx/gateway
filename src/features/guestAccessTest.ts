@@ -271,19 +271,57 @@ async function main(): Promise<void> {
   const followingHiddenClient = fakeClient([{ id: 'x1', following_visibility: false }]);
   const followingNullClient = fakeClient([{ id: 'x1' }]);
 
+  // Following list (row pinned by follower_id): gated on the follower profile's
+  // following_visibility — the existing Follow-graph toggle keeps controlling it.
   const followingRows = [{ id: 'fl1', follower_id: 'x1', following_id: 'y1' }];
   const followingOk = await applyGuestReadPolicy('followers', followingRows, followingPublicClient, ['follower_id=eq.x1']);
   assert.equal(followingOk.length, 1, 'following list (follower_id pin) is guest-readable when following_visibility is true');
   const followingBlocked = await applyGuestReadPolicy('followers', followingRows, followingHiddenClient, ['follower_id=eq.x1']);
   assert.equal(followingBlocked.length, 0, 'following list is hidden when following_visibility is false');
 
+  // Followers list (row pinned by following_id): ALWAYS guest-visible — do.md
+  // requires the Followers list to stay visible to guests. It is NOT coupled to
+  // following_visibility (Following and Followers are separate lists).
   const followersRows = [{ id: 'fs1', follower_id: 'y1', following_id: 'x1' }];
   const followersOk = await applyGuestReadPolicy('followers', followersRows, followingPublicClient, ['following_id=eq.x1']);
   assert.equal(followersOk.length, 1, 'followers list (following_id pin) is guest-readable when following_visibility is true');
-  const followersBlocked = await applyGuestReadPolicy('followers', followersRows, followingHiddenClient, ['following_id=eq.x1']);
-  assert.equal(followersBlocked.length, 0, 'followers list is hidden when following_visibility is false');
+  const followersWithHiddenFollowing = await applyGuestReadPolicy('followers', followersRows, followingHiddenClient, ['following_id=eq.x1']);
+  assert.equal(
+    followersWithHiddenFollowing.length,
+    1,
+    'followers list stays visible even when following_visibility is false (Following/Followers are separate)'
+  );
   const followersDefault = await applyGuestReadPolicy('followers', followersRows, followingNullClient, ['following_id=eq.x1']);
   assert.equal(followersDefault.length, 1, 'absent following_visibility defaults to public (matches app default)');
+
+  // Mixed pin (both directions in one filter): each pinned profile is checked
+  // against the rule of the column it was pinned on.
+  const followersMixedClient = fakeClient([
+    { id: 'x1', following_visibility: false },
+    { id: 'y1', following_visibility: true },
+  ]);
+  const followersBothDirections = await applyGuestReadPolicy(
+    'followers',
+    [{ id: 'm1', follower_id: 'y1', following_id: 'x1' }],
+    followersMixedClient,
+    ['follower_id=eq.y1', 'following_id=eq.x1']
+  );
+  assert.equal(
+    followersBothDirections.length,
+    1,
+    'mixed-direction read: follower_id subject public, following_id subject always public'
+  );
+  const followersBothDirectionsBlocked = await applyGuestReadPolicy(
+    'followers',
+    [{ id: 'm2', follower_id: 'x1', following_id: 'y1' }],
+    followersMixedClient,
+    ['follower_id=eq.x1', 'following_id=eq.y1']
+  );
+  assert.equal(
+    followersBothDirectionsBlocked.length,
+    0,
+    'mixed-direction read is dropped when the follower_id subject hid its Following list'
+  );
 
   // No filters pinned -> every involved profile must be public (never leaks).
   const mixedListClient = fakeClient([
