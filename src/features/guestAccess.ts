@@ -153,22 +153,35 @@ export function stripPrivateProfileFields(row: GuestReadableRow): GuestReadableR
 }
 
 // --- profile lists (friends/following/followers) ---
-// A guest may read a list row for the profile whose list they are viewing. The
-// gate is per list and per column, matched against the profile owner's settings:
-//   friends    -> profiles.friends_visibility === 'public'
-//   following  -> follower_id==X pins (who X follows) require
-//                 profiles[X].following_visibility !== false
-//   followers  -> following_id==X pins (who follows X) are ALWAYS public
-//                 (the app has no separate followers visibility column/setting;
-//                  do.md: "Guest → Can view Followers")
+// A profile-list row may be read by a viewer only as far as the viewed
+// profile's per-list visibility allows, and the rule is enforced at the API
+// boundary for EVERY viewer type (do.md "profile owner must always see their
+// own lists"):
+//   OWNER (requesterId === the pinned profile) -> every row is returned; the
+//     owner's own visibility settings NEVER restrict their own lists.
+//   AUTHENTICATED OTHER USER -> the owner's per-list visibility applies:
+//     friends    -> only when profiles.friends_visibility is 'public', or
+//                   'friends' AND the requester is an accepted friend of the
+//                   profile ('private'/'only_me' -> hidden)
+//     following  -> follower_id==X pins (who X follows) require
+//                   profiles[X].following_visibility !== false
+//     followers  -> following_id==X pins (who follows X) are ALWAYS public
+//                   (the app has no separate followers visibility column)
+//   GUEST -> the same per-list visibility applies, minus the friend check
+//     (guests are never 'friends'; do.md: Guest -> Friends/Following only when
+//     Public, Followers always).
+// Rows the requester is a PARTY to — when they also pinned themselves in the
+// query — are their own edges (friendship status, checkIfFollowing, own
+// lists) and are always visible; gating them would break those reads.
 // The generic read path first applies the client's query filters server-side
 // (`or=(requester_id.eq.X,receiver_id.eq.X)` for friends,
 // `follower_id=eq.X` for following, `following_id=eq.X` for followers), so
-// every returned row is guaranteed to involve the viewed profile. We re-parse
-// those same filters to recover the viewed profile ("subject") grouped by the
-// column it was pinned on, check that profile's visibility for that list, and
-// drop the whole batch when it is not public — the gateway must never hand
-// restricted list data to a guest.
+// every returned row is guaranteed to involve the pinned profile(s). We
+// re-parse those same filters to recover the pinned profiles ("subjects")
+// grouped by the column they were pinned on, and gate each row against the
+// rule for the column(s) it belongs to. A read pinning no subject falls back
+// to per-column rules over every involved profile (never leaks a restricted
+// list).
 
 // Split a PostgREST filter expression into its top-level comma-separated terms
 // (respects nested parens, e.g. or=(and(a),and(b))).
@@ -221,33 +234,42 @@ function collectEqPins(expr: string, cols: ReadonlySet<string>, out: Map<string,
 }
 
 interface ProfileListSpec {
+  // The columns a list-domain query pins a profile by. `friends` rows belong
+  // to both users (each row is part of either profile's friends list);
+  // `followers` rows belong to the follower_id profile (its Following list)
+  // and to the following_id profile (its Followers list).
   subjectCols: ReadonlyArray<string>;
-  // A subject profile permits guest reads of the list identified by `col` when
-  // allow(col, profile) is true. Absent visibility columns default to public
-  // (matches the app).
-  allow: (col: string, profile: GuestReadableRow) => boolean;
 }
 
 const PROFILE_LIST_SPECS: Record<string, ProfileListSpec> = {
-  friends: {
-    subjectCols: ['requester_id', 'receiver_id'],
-    allow: (_col, p) => p['friends_visibility'] == null || p['friends_visibility'] === 'public',
-  },
-  followers: {
-    subjectCols: ['follower_id', 'following_id'],
-    // The followers table holds BOTH directions of a follow edge: a row where
-    // the viewed profile is follower_id is part of that profile's FOLLOWING
-    // list (gated by following_visibility), while a row where it is
-    // following_id is part of its FOLLOWERS list (always public — the app has
-    // no separate followers setting and do.md keeps Followers guest-visible).
-    allow: (col, p) => (col === 'follower_id' ? p['following_visibility'] !== false : true),
-  },
+  friends: { subjectCols: ['requester_id', 'receiver_id'] },
+  followers: { subjectCols: ['follower_id', 'following_id'] },
 };
 
-export async function filterGuestProfileListRows(
+// True when an accepted friendship edge exists between `a` and `b` (used by the
+// friends domain's 'friends'-only visibility for an authenticated viewer).
+export async function hasAcceptedFriendship(client: GuestClient, a: string, b: string): Promise<boolean> {
+  const { data } = await client
+    .from('friends')
+    .select('id')
+    .or(`and(requester_id.eq.${a},receiver_id.eq.${b}),and(requester_id.eq.${b},receiver_id.eq.${a})`)
+    .eq('status', 'accepted')
+    .maybeSingle();
+  return !!data;
+}
+
+// Viewer-aware gate for profile-list reads (friends / following / followers).
+// `requesterId` is the authenticated viewer, or undefined for a guest. Owns:
+//   - every row the requester is a party to AND pinned themselves in the query
+//     (their own edges / own lists) is always returned — the profile owner must
+//     never be restricted by their own visibility settings (do.md);
+//   - other rows are returned only when every pinned subject belongs to a list
+//     this viewer may read (per-column rule above).
+export async function filterProfileListRowsForViewer(
   domain: 'friends' | 'followers',
   rows: GuestReadableRow[],
   client: GuestClient,
+  requesterId: string | undefined,
   filters?: string | string[] | undefined
 ): Promise<GuestReadableRow[]> {
   const spec = PROFILE_LIST_SPECS[domain];
@@ -258,8 +280,8 @@ export async function filterGuestProfileListRows(
   if (pinnedTotal === 0) {
     // No subject pinned by the query — treat every profile involved in the
     // rows as a subject (grouped by its column, so the per-list rule still
-    // applies). Over-restrictive, but it can never leak a row whose owner kept
-    // their list restricted.
+    // applies row by row). Over-restrictive, but it can never leak a row whose
+    // owner kept their list restricted.
     for (const r of rows) {
       for (const col of spec.subjectCols) {
         const id = ROW_PROP(r, col);
@@ -275,13 +297,88 @@ export async function filterGuestProfileListRows(
   const { data } = await client.from('profiles').select('*').in('id', [...ids]);
   const byId = new Map<string, GuestReadableRow>();
   for (const p of (data as GuestReadableRow[]) || []) byId.set(String(p['id']), p);
-  for (const [col, colIds] of subjectsByCol) {
-    for (const id of colIds) {
-      const profile = byId.get(id);
-      if (!profile || !spec.allow(col, profile)) return [];
+
+  // True when the requester pinned themselves as a subject of this read
+  // (own-list / friendship-status / checkIfFollowing reads).
+  const selfPinned = !!requesterId && [...subjectsByCol.values()].some((s) => s.has(requesterId));
+  const involvesRequester = (row: GuestReadableRow): boolean =>
+    !!requesterId && spec.subjectCols.some((col) => ROW_PROP(row, col) === requesterId);
+
+  // Cache for the friends domain's 'friends'-only visibility: is the requester
+  // an accepted friend of the subject profile (authenticated viewers only)?
+  const friendOf = new Map<string, boolean>();
+  const isFriendOf = async (profileId: string): Promise<boolean> => {
+    if (!requesterId) return false;
+    let v = friendOf.get(profileId);
+    if (v === undefined) {
+      v = await hasAcceptedFriendship(client, requesterId, profileId);
+      friendOf.set(profileId, v);
     }
+    return v;
+  };
+
+  // Whether the subject `profileId` (pinned on `col`) may show this list to the
+  // requester. The requester themselves always counts as allowed (the self-row
+  // bypass covers the common case; this is the safety net).
+  const allowedForList = async (col: string, profileId: string): Promise<boolean> => {
+    if (requesterId && profileId === requesterId) return true;
+    const profile = byId.get(profileId);
+    if (!profile) return false;
+    if (domain === 'followers') {
+      // Following list (follower_id pin) follows the follow-graph toggle; the
+      // Followers list (following_id pin) is always public.
+      return col === 'following_id' ? true : profile['following_visibility'] !== false;
+    }
+    // friends domain: public, or 'friends'-only for an accepted friend.
+    const vis = profile['friends_visibility'];
+    if (vis == null || vis === 'public') return true;
+    if (vis === 'friends') return await isFriendOf(profileId);
+    return false;
+  };
+
+  const out: GuestReadableRow[] = [];
+  for (const row of rows) {
+    if (selfPinned && involvesRequester(row)) {
+      out.push(row);
+      continue;
+    }
+    let keep = true;
+    for (const [col, colIds] of subjectsByCol) {
+      const val = ROW_PROP(row, col);
+      if (!val || !colIds.has(val)) continue;
+      if (!(await allowedForList(col, val))) {
+        keep = false;
+        break;
+      }
+    }
+    if (keep) out.push(row);
   }
-  return rows;
+  return out;
+}
+
+// Guest profile-list reads: a guest is never a pinned party and has no
+// friendships, so the 'friends'-only check resolves to false.
+export async function filterGuestProfileListRows(
+  domain: 'friends' | 'followers',
+  rows: GuestReadableRow[],
+  client: GuestClient,
+  filters?: string | string[] | undefined
+): Promise<GuestReadableRow[]> {
+  return filterProfileListRowsForViewer(domain, rows, client, undefined, filters);
+}
+
+// Authenticated profile-list reads: OWNER rows (requester is a party and
+// pinned) are always allowed; other users' lists follow the owner's per-list
+// visibility (do.md: the API/Gateway distinguishes OWNER / AUTHENTICATED
+// OTHER / GUEST, and the owner always sees their own lists).
+export async function filterAuthenticatedProfileListRows(
+  domain: 'friends' | 'followers',
+  rows: GuestReadableRow[],
+  client: GuestClient,
+  requesterId: string,
+  filters?: string | string[] | undefined
+): Promise<GuestReadableRow[]> {
+  return filterProfileListRowsForViewer(domain, rows, client, requesterId, filters);
 }
 
 // --- parent-scoped rows (likes/comments/post_tags on posts, group_posts/

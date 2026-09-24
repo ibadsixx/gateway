@@ -16,6 +16,7 @@ import {
   filterGuestPostScopedRows,
   filterGuestGroupScopedRows,
   applyGuestReadPolicy,
+  filterAuthenticatedProfileListRows,
   isGuestSingleRowVisible,
   stripGuestSingleRowRead,
   type GuestReadableRow,
@@ -42,6 +43,43 @@ function fakeClient(rows: GuestReadableRow[]) {
       }),
     }),
   } as unknown as Parameters<typeof filterGuestPostScopedRows>[1];
+}
+
+// Client for the AUTHENTICATED profile-list gate tests: serves profile rows for
+// the `.select('*').in('id', ids)` subject lookups AND answers the friends
+// domain's accepted-friendship check (`.select('id').or(expr).eq('status',
+// 'accepted').maybeSingle()`) against the given friendship rows.
+function authClient(options: { profiles?: GuestReadableRow[]; friendships?: GuestReadableRow[] } = {}) {
+  const profiles = options.profiles || [];
+  const friendships = options.friendships || [];
+  return {
+    from: (_table: string) => ({
+      select: () => ({
+        in: async (_col: string, ids: string[]) => ({
+          data: profiles.filter((r) => ids.includes(String(r.id))),
+          error: null,
+        }),
+        or: (expr: string) => ({
+          eq: (_col: string, _val: unknown) => ({
+            maybeSingle: async () => {
+              for (const t of expr.match(/and\(\w+\.eq\.[^,]+,\w+\.eq\.[^)]+\)/g) || []) {
+                const m = t.match(/^and\((\w+)\.eq\.([^,]+),(\w+)\.eq\.([^)]+)\)$/);
+                if (!m) continue;
+                const [, ca, va, cb, vb] = m;
+                const hit = friendships.some(
+                  (f: any) =>
+                    (f[ca] === va && f[cb] === vb && f.status === 'accepted') ||
+                    (f[ca] === vb && f[cb] === va && f.status === 'accepted')
+                );
+                if (hit) return { data: { id: 'edge' }, error: null };
+              }
+              return { data: null, error: null };
+            },
+          }),
+        }),
+      }),
+    }),
+  } as unknown as Parameters<typeof filterAuthenticatedProfileListRows>[2];
 }
 
 async function main(): Promise<void> {
@@ -330,6 +368,76 @@ async function main(): Promise<void> {
   ]);
   const friendsNoFilter = await applyGuestReadPolicy('friends', friendsRows, mixedListClient, undefined);
   assert.equal(friendsNoFilter.length, 0, 'no-pin friends read falls back to all involved profiles public');
+
+  // --- profile lists for AUTHENTICATED viewers (do.md: the owner ALWAYS sees
+  // --- their own Friends/Following/Followers; the API/Gateway distinguishes
+  // --- OWNER / AUTHENTICATED OTHER / GUEST) ---
+
+  // OWNER viewing their own profile: hidden/private lists stay visible.
+  const ownerPrivateFriends = authClient({ profiles: [{ id: 'x1', friends_visibility: 'only_me' }] });
+  const ownerFriends = await filterAuthenticatedProfileListRows('friends', friendsRows, ownerPrivateFriends, 'x1', friendsListFilters);
+  assert.equal(ownerFriends.length, 2, 'OWNER sees their own Friends list even when friends_visibility is private');
+
+  const ownerHiddenFollowing = authClient({ profiles: [{ id: 'x1', following_visibility: false }] });
+  const ownerFollowing = await filterAuthenticatedProfileListRows('followers', followingRows, ownerHiddenFollowing, 'x1', ['follower_id=eq.x1']);
+  assert.equal(ownerFollowing.length, 1, 'OWNER sees their own Following list even when following_visibility is false');
+  const ownerFollowers = await filterAuthenticatedProfileListRows('followers', followersRows, ownerHiddenFollowing, 'x1', ['following_id=eq.x1']);
+  assert.equal(ownerFollowers.length, 1, 'OWNER sees their own Followers list');
+
+  // AUTHENTICATED OTHER user viewing someone else's profile: the owner's
+  // per-list visibility applies.
+  const otherPublicFriends = authClient({ profiles: [{ id: 'x1', friends_visibility: 'public' }] });
+  const otherFriendsPublic = await filterAuthenticatedProfileListRows('friends', friendsRows, otherPublicFriends, 'other', friendsListFilters);
+  assert.equal(otherFriendsPublic.length, 2, 'authenticated other sees Friends when the list is public');
+
+  const otherPrivateFriends = authClient({ profiles: [{ id: 'x1', friends_visibility: 'only_me' }] });
+  const otherFriendsPrivate = await filterAuthenticatedProfileListRows('friends', friendsRows, otherPrivateFriends, 'other', friendsListFilters);
+  assert.equal(otherFriendsPrivate.length, 0, 'authenticated other sees no Friends rows when the list is private');
+
+  // 'friends'-only visibility: granted to an accepted friend, denied otherwise.
+  const friendsOnlyClient = authClient({
+    profiles: [{ id: 'x1', friends_visibility: 'friends' }],
+    friendships: [{ requester_id: 'other', receiver_id: 'x1', status: 'accepted' }],
+  });
+  const otherFriendsFriend = await filterAuthenticatedProfileListRows('friends', friendsRows, friendsOnlyClient, 'other', friendsListFilters);
+  assert.equal(otherFriendsFriend.length, 2, 'an accepted friend sees the friends-only Friends list');
+
+  const friendsOnlyNonFriendClient = authClient({ profiles: [{ id: 'x1', friends_visibility: 'friends' }] });
+  const otherFriendsNonFriend = await filterAuthenticatedProfileListRows('friends', friendsRows, friendsOnlyNonFriendClient, 'other', friendsListFilters);
+  assert.equal(otherFriendsNonFriend.length, 0, 'a non-friend sees no rows of a friends-only Friends list');
+
+  const otherFollowingVisible = authClient({ profiles: [{ id: 'x1', following_visibility: true }] });
+  const otherFollowing = await filterAuthenticatedProfileListRows('followers', followingRows, otherFollowingVisible, 'other', ['follower_id=eq.x1']);
+  assert.equal(otherFollowing.length, 1, 'authenticated other sees Following when following_visibility is true');
+
+  const otherFollowingHidden = authClient({ profiles: [{ id: 'x1', following_visibility: false }] });
+  const otherFollowingBlocked = await filterAuthenticatedProfileListRows('followers', followingRows, otherFollowingHidden, 'other', ['follower_id=eq.x1']);
+  assert.equal(otherFollowingBlocked.length, 0, 'authenticated other sees no Following rows when hidden');
+
+  const otherFollowers = await filterAuthenticatedProfileListRows('followers', followersRows, otherFollowingHidden, 'other', ['following_id=eq.x1']);
+  assert.equal(otherFollowers.length, 1, 'authenticated other always sees Followers even when following_visibility is false');
+
+  // Self-involved reads keep working: the requester's OWN friendship/follow
+  // edge is always visible even when the other profile restricts its list
+  // (the SPA's friendship-status, follow-status and checkIfFollowing reads pin
+  // the requester and must not be gated by the other profile's settings).
+  const ownEdge = await filterAuthenticatedProfileListRows(
+    'friends',
+    [{ id: 'e1', requester_id: 'other', receiver_id: 'x1', status: 'accepted' }],
+    otherPrivateFriends,
+    'other',
+    ['or=(and(requester_id.eq.other,receiver_id.eq.x1),and(requester_id.eq.x1,receiver_id.eq.other))']
+  );
+  assert.equal(ownEdge.length, 1, "the requester's own friendship edge is visible even if the other profile hides its list");
+
+  const ownFollow = await filterAuthenticatedProfileListRows(
+    'followers',
+    [{ id: 'e2', follower_id: 'other', following_id: 'x1' }],
+    otherFollowingHidden,
+    'other',
+    ['follower_id=eq.other', 'following_id=eq.x1']
+  );
+  assert.equal(ownFollow.length, 1, 'checkIfFollowing-style read (requester pinned) stays visible');
 
   // --- single-row gates ---
   assert.equal(

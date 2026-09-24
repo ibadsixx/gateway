@@ -44,6 +44,7 @@ import {
   applyGuestReadPolicy,
   isGuestSingleRowVisible,
   stripGuestSingleRowRead,
+  filterAuthenticatedProfileListRows,
 } from '../features/guestAccess';
 import {
   createGroup,
@@ -2291,6 +2292,18 @@ router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validate
             rows = await restrictStoryViewsRead(rows, entry.client, requesterId);
           } else if (domain === 'stories') {
             rows = restrictStoryRowsRead(rows, requesterId);
+          }
+          // Profile-list authorization (do.md "profile owner must always see
+          // their own lists"): the API/Gateway distinguishes OWNER /
+          // AUTHENTICATED OTHER / GUEST. The owner always receives their own
+          // Friends/Following/Followers rows; an authenticated OTHER viewer is
+          // gated by the viewed owner's per-list visibility (friends ->
+          // public | friends-only for friends, following -> following_visibility,
+          // followers -> always visible); guests are handled by the guest
+          // policy above. The SPA's own gates are defense-in-depth — the
+          // enforcement lives here.
+          if (domain === 'friends' || domain === 'followers') {
+            rows = await filterAuthenticatedProfileListRows(domain, rows, entry.client, requesterId, filters);
           }
           // Presence privacy: for `profiles`, do NOT hand presence fields
           // (last_seen_at / manual_status / is_online) to a requester who is a
