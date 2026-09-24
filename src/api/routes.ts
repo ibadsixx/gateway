@@ -47,6 +47,7 @@ import {
   filterAuthenticatedProfileListRows,
   isGuestPostVisible,
   type ProfileRowsReader,
+  type PostsRowsReader,
   type GuestReadableRow,
 } from '../features/guestAccess';
 import { getRelationshipCounts } from '../features/relationshipCounts';
@@ -2328,6 +2329,33 @@ router.get('/posts/:id/reaction-count', auth.authenticateOptional.bind(auth), as
   }
 });
 
+// Posts live on their own Supabase project(s), separate from the comments/
+// likes/post_tags hosts. A guest comment (or like/tag) read therefore cannot
+// resolve its parent post rows through the children's host client — a same-host
+// `posts` lookup always comes back empty in production, which would drop every
+// guest comment. This reader fans out over the readable posts-domain projects
+// and merges rows by id (mirrors the profiles reader used for profile lists).
+function createPostsRowsReader(): PostsRowsReader {
+  const postsProjects = projectManager.getReadableProjects('posts');
+  return async (ids) => {
+    const unique = [...new Set(ids.filter(Boolean))];
+    if (unique.length === 0) return [];
+    const byId = new Map<string, GuestReadableRow>();
+    await Promise.all(
+      postsProjects.map(async (entry) => {
+        try {
+          const { data, error } = await entry.client.from('posts').select('*').in('id', unique);
+          if (error) return;
+          for (const row of (data as GuestReadableRow[]) || []) byId.set(String(row['id']), row);
+        } catch {
+          // Defensive: a host that does not serve the posts table is skipped.
+        }
+      })
+    );
+    return [...byId.values()];
+  };
+}
+
 router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain } = req.params;
   if (!featureFlags.isEnabled(domain)) {
@@ -2390,7 +2418,7 @@ router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validate
           // lists (friends/following/followers) are gated by the viewed
           // owner's per-list visibility.
           if (isGuest) {
-            rows = await applyGuestReadPolicy(domain, rows, entry.client, filters, resolveProfiles);
+            rows = await applyGuestReadPolicy(domain, rows, entry.client, filters, resolveProfiles, createPostsRowsReader());
             return rows;
           }
           // Story privacy (do.md): the generic service-role read bypasses RLS,
@@ -2526,7 +2554,7 @@ router.get('/:domain/:id', auth.authenticateOptional.bind(auth), validation.vali
     if (isGuest) {
       const entries = projectManager.getReadableProjects(domain);
       const client = entries[0]?.client;
-      const visible = client ? await isGuestSingleRowVisible(domain, result, client) : false;
+      const visible = client ? await isGuestSingleRowVisible(domain, result, client, createPostsRowsReader()) : false;
       if (!visible) {
         res.status(404).json({ error: 'Not found' });
         return;

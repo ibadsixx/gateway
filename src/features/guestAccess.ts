@@ -205,6 +205,14 @@ export function stripPrivateProfileFields(row: GuestReadableRow): GuestReadableR
 // case the legacy same-host lookup is used for the single-host mocks.
 export type ProfileRowsReader = (ids: string[]) => Promise<GuestReadableRow[]>;
 
+// Same pattern for posts: in production the comments (and likes/post_tags)
+// tables live on their OWN Supabase project(s), so a guest comment read cannot
+// resolve the parent post rows through the comments-host client. The GET route
+// supplies a reader fanning out over the posts-domain projects (see
+// resolveProfiles); offline tests may omit it and fall back to the same-host
+// lookup used by the single-host mocks.
+export type PostsRowsReader = (ids: string[]) => Promise<GuestReadableRow[]>;
+
 // Split a PostgREST filter expression into its top-level comma-separated terms
 // (respects nested parens, e.g. or=(and(a),and(b))).
 function splitFilterTerms(input: string): string[] {
@@ -426,11 +434,22 @@ const ROW_PROP = (row: GuestReadableRow, col: string): string =>
 async function loadVisiblePostIds(
   client: GuestClient,
   postIds: string[],
-  predicate: (post: GuestReadableRow) => boolean = isGuestPostVisible
+  predicate: (post: GuestReadableRow) => boolean = isGuestPostVisible,
+  resolvePosts?: PostsRowsReader
 ): Promise<Set<string>> {
   const ids = [...new Set(postIds.filter(Boolean))];
   if (ids.length === 0) return new Set();
-  const { data } = await client.from('posts').select('*').in('id', ids);
+  let data: GuestReadableRow[] | null | undefined;
+  if (resolvePosts) {
+    try {
+      data = await resolvePosts(ids);
+    } catch {
+      data = null;
+    }
+  } else {
+    const { data: sameHostRows } = await client.from('posts').select('*').in('id', ids);
+    data = sameHostRows as GuestReadableRow[] | null | undefined;
+  }
   const visible = new Set<string>();
   for (const row of (data as GuestReadableRow[]) || []) {
     if (predicate(row)) visible.add(String(row['id']));
@@ -468,12 +487,14 @@ export async function filterGuestPostScopedRows(
 export async function filterGuestCommentScopedRows(
   rows: GuestReadableRow[],
   client: GuestClient,
-  postIdCol = 'post_id'
+  postIdCol = 'post_id',
+  resolvePosts?: PostsRowsReader
 ): Promise<GuestReadableRow[]> {
   const visible = await loadVisiblePostIds(
     client,
     rows.map((r) => ROW_PROP(r, postIdCol)),
-    isGuestPostCommentsVisible
+    isGuestPostCommentsVisible,
+    resolvePosts
   );
   return rows.filter((r) => visible.has(ROW_PROP(r, postIdCol)));
 }
@@ -514,7 +535,8 @@ export async function applyGuestReadPolicy(
   rows: GuestReadableRow[],
   client: GuestClient,
   filters?: string | string[] | undefined,
-  resolveProfiles?: ProfileRowsReader
+  resolveProfiles?: ProfileRowsReader,
+  resolvePosts?: PostsRowsReader
 ): Promise<GuestReadableRow[]> {
   switch (domain) {
     case 'posts':
@@ -556,8 +578,10 @@ export async function applyGuestReadPolicy(
       return filterGuestPostScopedRows(rows, client);
     case 'comments':
       // Comments respect the owner's comments_enabled setting, and reactor
-      // identities in the embedded reactions are stripped for guests.
-      return (await filterGuestCommentScopedRows(rows, client)).map(stripGuestCommentRow);
+      // identities in the embedded reactions are stripped for guests. Parent
+      // post rows are resolved across the posts-domain projects (the comments
+      // host cannot serve the posts table in production).
+      return (await filterGuestCommentScopedRows(rows, client, 'post_id', resolvePosts)).map(stripGuestCommentRow);
     case 'hashtag_links':
       // hashtag_links.source_id is the linked post id (source_type='post').
       return filterGuestPostScopedRows(rows, client, 'source_id');
@@ -570,7 +594,8 @@ export async function applyGuestReadPolicy(
 export async function isGuestSingleRowVisible(
   domain: string,
   row: GuestReadableRow,
-  client: GuestClient
+  client: GuestClient,
+  resolvePosts?: PostsRowsReader
 ): Promise<boolean> {
   switch (domain) {
     case 'posts':
@@ -610,8 +635,9 @@ export async function isGuestSingleRowVisible(
     }
     case 'comments': {
       // Single comment reads obey the same owner comments_enabled gate as the
-      // list read (do.md comments round).
-      const visible = await loadVisiblePostIds(client, [ROW_PROP(row, 'post_id')], isGuestPostCommentsVisible);
+      // list read (do.md comments round); parent posts resolve across the
+      // posts-domain projects in production.
+      const visible = await loadVisiblePostIds(client, [ROW_PROP(row, 'post_id')], isGuestPostCommentsVisible, resolvePosts);
       return visible.has(ROW_PROP(row, 'post_id'));
     }
     case 'hashtag_links': {

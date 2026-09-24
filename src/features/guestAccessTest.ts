@@ -344,6 +344,53 @@ async function main(): Promise<void> {
     'single comment read is denied when the owner disabled comments'
   );
 
+  // Production shape: the comments table lives on its OWN Supabase project, so
+  // a same-host `posts` lookup through the comments client comes back empty.
+  // The route supplies a fan-out posts reader; comments must survive when the
+  // reader resolves the parent posts (enabled public post kept, friends post
+  // dropped).
+  const noPostsClient = fakeClient([]);
+  const fanoutScoped = await filterGuestCommentScopedRows(
+    [
+      { id: 'c11', post_id: 'post-1', content: 'visible via fan-out' },
+      { id: 'c12', post_id: 'post-2', content: 'private via fan-out' },
+    ],
+    noPostsClient,
+    'post_id',
+    async (ids) =>
+      ids.map((id) =>
+        id === 'post-1'
+          ? { ...PUBLISHED_PUBLIC_POST, id: 'post-1', comments_enabled: true }
+          : { ...PUBLISHED_PUBLIC_POST, id: 'post-2', visibility: 'friends' }
+      )
+  );
+  assert.deepEqual(
+    fanoutScoped.map((r) => r.id),
+    ['c11'],
+    'comments survive via the posts fan-out reader when the host client cannot serve posts'
+  );
+
+  assert.equal(
+    await isGuestSingleRowVisible(
+      'comments',
+      { id: 'c13', post_id: 'post-1' },
+      noPostsClient,
+      async (ids) => ids.map((id) => ({ ...PUBLISHED_PUBLIC_POST, id, comments_enabled: false }))
+    ),
+    false,
+    'single-row gate honors comments_enabled via the posts fan-out reader'
+  );
+  assert.equal(
+    await isGuestSingleRowVisible(
+      'comments',
+      { id: 'c14', post_id: 'post-1' },
+      noPostsClient,
+      async (ids) => ids.map((id) => ({ ...PUBLISHED_PUBLIC_POST, id, comments_enabled: true }))
+    ),
+    true,
+    'single-row gate allows enabled public posts via the posts fan-out reader'
+  );
+
   const publicGroupClient = fakeClient([{ id: 'g1', privacy: 'public' }]);
   const groupPostsPublic = await filterGuestGroupScopedRows([{ id: 'gp1', group_id: 'g1' }], publicGroupClient);
   assert.equal(groupPostsPublic.length, 1, 'group_posts of a public group are guest-readable');
