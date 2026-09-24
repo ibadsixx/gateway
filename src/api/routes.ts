@@ -45,10 +45,12 @@ import {
   isGuestSingleRowVisible,
   stripGuestSingleRowRead,
   filterAuthenticatedProfileListRows,
+  isGuestPostVisible,
   type ProfileRowsReader,
   type GuestReadableRow,
 } from '../features/guestAccess';
 import { getRelationshipCounts } from '../features/relationshipCounts';
+import { getReactionCounts } from '../features/reactionCounts';
 import {
   createGroup,
   updateGroupSettings,
@@ -2277,6 +2279,49 @@ router.get('/profiles/:id/relationship-counts', auth.authenticateOptional.bind(a
       },
       profileId
     );
+    res.json(counts);
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Aggregate reaction counts for a post (do.md "Guest users — reaction
+// visibility" round).
+//
+// A guest viewing a PUBLIC post must see whether the post has reactions and
+// the total reaction count, even though they are denied the reactions LIST
+// (its rows carry reactor identities) and cannot react. This endpoint returns
+// ONLY the aggregate — { reaction_count, reaction_types } — never the reaction
+// rows, so reactor identities stay private. Guests get counts ONLY for posts
+// that pass the guest public-post visibility rule (published + public);
+// anything else is a 404, exactly like the guest post list read hides it.
+// Authenticated callers get counts for any post (their reactions list read is
+// ungated today, so no new information is exposed here).
+router.get('/posts/:id/reaction-count', auth.authenticateOptional.bind(auth), async (req: Request, res: Response) => {
+  const postId = req.params.id;
+  // Post ids are UUIDs; the value is used in URL-filter queries below.
+  if (!postId || typeof postId !== 'string' || !/^[0-9a-fA-F-]{36}$/.test(postId)) {
+    res.status(400).json({ error: 'Valid post id required' });
+    return;
+  }
+  try {
+    const requesterId = req.user?.id;
+    const isGuest = !requesterId;
+
+    // Resolve the post so guests can be held to the public-post rule and
+    // everyone gets a 404 for missing posts.
+    const postsProjects = projectManager.getReadableProjects('posts');
+    let post: GuestReadableRow | null = null;
+    if (postsProjects[0]) {
+      const { data } = await postsProjects[0].client.from('posts').select('*').eq('id', postId).maybeSingle();
+      post = (data as GuestReadableRow | null) ?? null;
+    }
+    if (!post || (isGuest && !isGuestPostVisible(post))) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    const counts = await getReactionCounts(projectManager.getReadableProjects('reactions'), postId);
     res.json(counts);
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
