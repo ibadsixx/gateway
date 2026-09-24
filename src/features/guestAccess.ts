@@ -92,6 +92,17 @@ export function filterGuestPosts(rows: GuestReadableRow[]): GuestReadableRow[] {
   return rows.filter(isGuestPostVisible);
 }
 
+// A guest may read a post's COMMENTS only when the post is itself guest-visible
+// AND the owner has comments enabled (posts.comments_enabled, default true).
+// This is the post owner's comment-visibility setting (do.md "Guest users —
+// comments are viewable but read-only"): when the owner disables comments, a
+// guest must not see them at all. Likes/tags are NOT subject to this toggle —
+// only the comments themselves are.
+export function isGuestPostCommentsVisible(post: GuestReadableRow | null | undefined): boolean {
+  if (!isGuestPostVisible(post)) return false;
+  return (post as GuestReadableRow)['comments_enabled'] !== false;
+}
+
 // A group is viewable by a guest only when it is marked public. Closed groups
 // require approval to join and private groups are invite-only — neither is
 // guest-readable.
@@ -414,14 +425,15 @@ const ROW_PROP = (row: GuestReadableRow, col: string): string =>
 
 async function loadVisiblePostIds(
   client: GuestClient,
-  postIds: string[]
+  postIds: string[],
+  predicate: (post: GuestReadableRow) => boolean = isGuestPostVisible
 ): Promise<Set<string>> {
   const ids = [...new Set(postIds.filter(Boolean))];
   if (ids.length === 0) return new Set();
   const { data } = await client.from('posts').select('*').in('id', ids);
   const visible = new Set<string>();
   for (const row of (data as GuestReadableRow[]) || []) {
-    if (isGuestPostVisible(row)) visible.add(String(row['id']));
+    if (predicate(row)) visible.add(String(row['id']));
   }
   return visible;
 }
@@ -447,6 +459,43 @@ export async function filterGuestPostScopedRows(
 ): Promise<GuestReadableRow[]> {
   const visible = await loadVisiblePostIds(client, rows.map((r) => ROW_PROP(r, postIdCol)));
   return rows.filter((r) => visible.has(ROW_PROP(r, postIdCol)));
+}
+
+// Comments additionally respect the post owner's comments_enabled setting: a
+// guest may read a comment only when its post is guest-visible AND comments
+// are enabled on it (do.md comments round). Disabled comments on a public post
+// become invisible to guests, indistinguishable from a post with no comments.
+export async function filterGuestCommentScopedRows(
+  rows: GuestReadableRow[],
+  client: GuestClient,
+  postIdCol = 'post_id'
+): Promise<GuestReadableRow[]> {
+  const visible = await loadVisiblePostIds(
+    client,
+    rows.map((r) => ROW_PROP(r, postIdCol)),
+    isGuestPostCommentsVisible
+  );
+  return rows.filter((r) => visible.has(ROW_PROP(r, postIdCol)));
+}
+
+// Comment rows embed the commenter's `reactions:comment_reactions` relation,
+// whose rows carry the REACTOR's identity. A guest may read a comment but must
+// never see WHO reacted to it, so each embedded reaction is stripped of
+// user_id (emoji/created_at stay — the summary counter the UI already renders
+// needs only the emoji). The commenter's own profile embed is part of the
+// comment and stays.
+export function stripGuestCommentRow(row: GuestReadableRow): GuestReadableRow {
+  const out: GuestReadableRow = { ...row };
+  const reactions = out['reactions'];
+  if (Array.isArray(reactions)) {
+    out['reactions'] = reactions.map((r) => {
+      if (!r || typeof r !== 'object') return r;
+      const copy: Record<string, unknown> = { ...(r as Record<string, unknown>) };
+      delete copy['user_id'];
+      return copy;
+    });
+  }
+  return out;
 }
 
 export async function filterGuestGroupScopedRows(
@@ -503,9 +552,12 @@ export async function applyGuestReadPolicy(
     case 'group_members':
       return filterGuestGroupScopedRows(rows, client);
     case 'likes':
-    case 'comments':
     case 'post_tags':
       return filterGuestPostScopedRows(rows, client);
+    case 'comments':
+      // Comments respect the owner's comments_enabled setting, and reactor
+      // identities in the embedded reactions are stripped for guests.
+      return (await filterGuestCommentScopedRows(rows, client)).map(stripGuestCommentRow);
     case 'hashtag_links':
       // hashtag_links.source_id is the linked post id (source_type='post').
       return filterGuestPostScopedRows(rows, client, 'source_id');
@@ -552,9 +604,14 @@ export async function isGuestSingleRowVisible(
       return visible.has(ROW_PROP(row, 'group_id'));
     }
     case 'likes':
-    case 'comments':
     case 'post_tags': {
       const visible = await loadVisiblePostIds(client, [ROW_PROP(row, 'post_id')]);
+      return visible.has(ROW_PROP(row, 'post_id'));
+    }
+    case 'comments': {
+      // Single comment reads obey the same owner comments_enabled gate as the
+      // list read (do.md comments round).
+      const visible = await loadVisiblePostIds(client, [ROW_PROP(row, 'post_id')], isGuestPostCommentsVisible);
       return visible.has(ROW_PROP(row, 'post_id'));
     }
     case 'hashtag_links': {
@@ -570,5 +627,7 @@ export async function isGuestSingleRowVisible(
 // the public fields of any profile, including private profiles, but never the
 // visibility-gated or account-private fields).
 export function stripGuestSingleRowRead(domain: string, row: GuestReadableRow): GuestReadableRow {
-  return domain === 'profiles' ? stripPrivateProfileFields(row) : row;
+  if (domain === 'profiles') return stripPrivateProfileFields(row);
+  if (domain === 'comments') return stripGuestCommentRow(row);
+  return row;
 }

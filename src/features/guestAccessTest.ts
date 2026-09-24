@@ -10,10 +10,13 @@ import {
   GUEST_READ_DOMAINS,
   isGuestReadableDomain,
   isGuestPostVisible,
+  isGuestPostCommentsVisible,
   filterGuestPosts,
   isGuestGroupVisible,
   stripPrivateProfileFields,
   filterGuestPostScopedRows,
+  filterGuestCommentScopedRows,
+  stripGuestCommentRow,
   filterGuestGroupScopedRows,
   applyGuestReadPolicy,
   filterAuthenticatedProfileListRows,
@@ -231,6 +234,115 @@ async function main(): Promise<void> {
     'source_id'
   );
   assert.equal(hashtagLinksPrivate.length, 0, 'hashtag_links of a non-public post are NOT guest-readable');
+
+  // --- comments visibility (do.md: guest comments are viewable but read-only) ---
+  // The post owner's comments_enabled toggle (default true) gates guest comment
+  // reads independently of the post being public.
+  assert.equal(
+    isGuestPostCommentsVisible({ ...PUBLISHED_PUBLIC_POST, comments_enabled: true }),
+    true,
+    'public published post with comments enabled is guest-comment-readable'
+  );
+  assert.equal(
+    isGuestPostCommentsVisible({ ...PUBLISHED_PUBLIC_POST, comments_enabled: false }),
+    false,
+    'guest cannot read comments when the owner disabled them'
+  );
+  assert.equal(
+    isGuestPostCommentsVisible({ ...PUBLISHED_PUBLIC_POST, comments_enabled: null }),
+    true,
+    'null comments_enabled (legacy post) defaults to enabled'
+  );
+  assert.equal(
+    isGuestPostCommentsVisible({ ...PUBLISHED_PUBLIC_POST, comments_enabled: undefined }),
+    true,
+    'missing comments_enabled defaults to enabled'
+  );
+  assert.equal(
+    isGuestPostCommentsVisible({ ...PUBLISHED_PUBLIC_POST, visibility: 'friends', comments_enabled: true }),
+    false,
+    'private-scoped post comments stay hidden even when enabled'
+  );
+  assert.equal(isGuestPostCommentsVisible(null), false, 'null post is not comment-readable');
+
+  const enabledPostClient = fakeClient([{ ...PUBLISHED_PUBLIC_POST, comments_enabled: true }]);
+  const commentsOnEnabled = [
+    { id: 'c1', post_id: 'post-1', content: 'hello', user_id: 'u1' },
+    { id: 'c2', post_id: 'post-1', content: 'world', user_id: 'u2' },
+  ];
+  const enabledScoped = await filterGuestCommentScopedRows(commentsOnEnabled, enabledPostClient);
+  assert.equal(enabledScoped.length, 2, 'comments on an enabled public post are guest-readable');
+
+  const disabledPostClient = fakeClient([{ ...PUBLISHED_PUBLIC_POST, comments_enabled: false }]);
+  const commentsOnDisabled = [{ id: 'c3', post_id: 'post-1', content: 'hidden' }];
+  const disabledScoped = await filterGuestCommentScopedRows(commentsOnDisabled, disabledPostClient);
+  assert.equal(disabledScoped.length, 0, 'comments are NOT guest-readable when the owner disabled them');
+
+  const disabledPrivScoped = await filterGuestCommentScopedRows(
+    [{ id: 'c4', post_id: 'post-1', content: 'secret' }],
+    privatePostClient
+  );
+  assert.equal(disabledPrivScoped.length, 0, 'comments on a non-public post are NOT guest-readable via comments filter');
+
+  // Reactor identities in the embedded reactions relation are stripped for
+  // guests; the emoji summary data stays.
+  const commentWithReactions = {
+    id: 'c5',
+    post_id: 'post-1',
+    content: 'nice',
+    user_id: 'author-1',
+    profiles: { username: 'au', display_name: 'Au', profile_pic: null },
+    reactions: [
+      { id: 'r1', comment_id: 'c5', user_id: 'reactor-1', emoji: '👍', created_at: '2026-09-24T00:00:00Z' },
+      { id: 'r2', comment_id: 'c5', user_id: 'reactor-2', emoji: '😂', created_at: '2026-09-24T00:00:00Z' },
+    ],
+  };
+  const stripped = stripGuestCommentRow(commentWithReactions as GuestReadableRow);
+  assert.deepEqual(
+    (stripped as any).reactions.map((r: any) => r.user_id),
+    [undefined, undefined],
+    'reactor user_id is stripped from embedded comment reactions for guests'
+  );
+  assert.deepEqual(
+    (stripped as any).reactions.map((r: any) => r.emoji),
+    ['👍', '😂'],
+    'reaction emoji survives the strip (summary counter still renders)'
+  );
+  assert.equal((stripped as any).profiles?.username, 'au', 'commenter profile embed is untouched');
+  assert.equal(
+    (stripGuestCommentRow({ id: 'c6', post_id: 'post-1', content: 'x' } as GuestReadableRow)).reactions,
+    undefined,
+    'comment without reactions is passed through unchanged'
+  );
+
+  // The policy dispatch applies both gates: visibility + enabled, and strips.
+  const policyComments = await applyGuestReadPolicy('comments', [
+    { id: 'c7', post_id: 'post-1', content: 'visible', user_id: 'u1', reactions: [{ user_id: 'rx', emoji: '❤️' }] },
+    { id: 'c8', post_id: 'post-1', content: 'hidden', user_id: 'u2' },
+  ], disabledPostClient);
+  assert.equal(policyComments.length, 0, 'comments policy drops rows from a comments-disabled post');
+
+  const policyCommentsEnabled = await applyGuestReadPolicy('comments', [
+    { id: 'c9', post_id: 'post-1', content: 'visible', user_id: 'u1', reactions: [{ user_id: 'rx', emoji: '❤️' }] },
+  ], enabledPostClient);
+  assert.equal(policyCommentsEnabled.length, 1, 'comments policy keeps rows from an enabled public post');
+  assert.equal(
+    (policyCommentsEnabled[0] as any).reactions[0].user_id,
+    undefined,
+    'comments policy strips reactor identities'
+  );
+  assert.equal(
+    (policyCommentsEnabled[0] as any).reactions[0].emoji,
+    '❤️',
+    'comments policy keeps reaction emoji'
+  );
+
+  // Single-row comment reads obey the same enabled gate.
+  assert.equal(
+    await isGuestSingleRowVisible('comments', { id: 'c10', post_id: 'post-1' }, disabledPostClient),
+    false,
+    'single comment read is denied when the owner disabled comments'
+  );
 
   const publicGroupClient = fakeClient([{ id: 'g1', privacy: 'public' }]);
   const groupPostsPublic = await filterGuestGroupScopedRows([{ id: 'gp1', group_id: 'g1' }], publicGroupClient);
