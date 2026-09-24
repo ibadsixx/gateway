@@ -48,6 +48,7 @@ import {
   type ProfileRowsReader,
   type GuestReadableRow,
 } from '../features/guestAccess';
+import { getRelationshipCounts } from '../features/relationshipCounts';
 import {
   createGroup,
   updateGroupSettings,
@@ -2240,6 +2241,44 @@ router.get('/users', auth.authenticate.bind(auth), async (_req, res) => {
     );
   } catch (error) {
     console.error('[Auth] List users error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Aggregate relationship counts (friends / following / followers).
+//
+// The COUNT is public profile metadata (do.md): a hidden Friends list hides
+// the identities of the friends, not the total number of friends. This
+// endpoint returns the real server-side totals to EVERY viewer — owner,
+// friend, non-friend and unauthenticated guest — even when the corresponding
+// list is not accessible to them. Only the aggregate numbers are returned;
+// no friendship/follower rows ever leave this endpoint, so the existing
+// list-visibility rules are untouched.
+//
+// The counts are measured independently of the list read: they fan out over
+// every readable hosts of the `friends` / `followers` domains (which live on
+// different Supabase projects than `profiles`) and are NOT derived from any
+// filtered list rows.
+router.get('/profiles/:id/relationship-counts', auth.authenticateOptional.bind(auth), async (req: Request, res: Response) => {
+  const profileId = req.params.id;
+  // Profile ids are auth.users UUIDs; the value is embedded in a PostgREST
+  // `or()` filter below, so reject anything that does not look like one. This
+  // also keeps the filter-expression parsing unambiguous (no stray commas or
+  // parens from a caller-supplied string).
+  if (!profileId || typeof profileId !== 'string' || !/^[0-9a-fA-F-]{36}$/.test(profileId)) {
+    res.status(400).json({ error: 'Valid profile id required' });
+    return;
+  }
+  try {
+    const counts = await getRelationshipCounts(
+      {
+        friends: projectManager.getReadableProjects('friends'),
+        followers: projectManager.getReadableProjects('followers'),
+      },
+      profileId
+    );
+    res.json(counts);
+  } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
 });

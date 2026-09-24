@@ -17,6 +17,7 @@
     "test:story-privacy": "ts-node src/features/storyPrivacyTest.ts",
     "test:highlight-privacy": "ts-node src/features/highlightPrivacyTest.ts",
     "test:guest-access": "ts-node src/features/guestAccessTest.ts",
+    "test:relationship-counts": "ts-node src/features/relationshipCountsTest.ts",
     "test:storage-sign": "ts-node src/features/storageSignTest.ts",
     "test:storage-resolve": "ts-node src/features/storageResolveTest.ts",
     "test:all-channel": "npm run test:channel-moderator && npm run test:channel-permissions"
