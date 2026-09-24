@@ -183,6 +183,17 @@ export function stripPrivateProfileFields(row: GuestReadableRow): GuestReadableR
 // to per-column rules over every involved profile (never leaks a restricted
 // list).
 
+// Resolves the pinned profiles' rows (id + friends_visibility +
+// following_visibility) for the profile-list gate. The gate MUST NOT read them
+// through the list host's own client: in production the `friends`/`followers`
+// tables and the `profiles` table are served by DIFFERENT Supabase projects, so
+// `listClient.from('profiles')` comes back empty and `allowedForList` would
+// drop every non-owner row — public lists included (do.md regression: only the
+// self-pinned owner bypass was surviving). The GET route supplies a reader
+// backed by the profiles-domain projects; offline tests may omit it, in which
+// case the legacy same-host lookup is used for the single-host mocks.
+export type ProfileRowsReader = (ids: string[]) => Promise<GuestReadableRow[]>;
+
 // Split a PostgREST filter expression into its top-level comma-separated terms
 // (respects nested parens, e.g. or=(and(a),and(b))).
 function splitFilterTerms(input: string): string[] {
@@ -270,7 +281,8 @@ export async function filterProfileListRowsForViewer(
   rows: GuestReadableRow[],
   client: GuestClient,
   requesterId: string | undefined,
-  filters?: string | string[] | undefined
+  filters?: string | string[] | undefined,
+  resolveProfiles?: ProfileRowsReader
 ): Promise<GuestReadableRow[]> {
   const spec = PROFILE_LIST_SPECS[domain];
   const subjectsByCol = new Map<string, Set<string>>();
@@ -294,9 +306,15 @@ export async function filterProfileListRowsForViewer(
   const ids = new Set<string>();
   for (const set of subjectsByCol.values()) for (const id of set) ids.add(id);
   if (ids.size === 0) return rows;
-  const { data } = await client.from('profiles').select('*').in('id', [...ids]);
+  // The subjects' visibility rows come from the profiles-domain reader when
+  // supplied (production). The offline fallback resolves them through the list
+  // host client, which is a valid approximation only in the single-host mocks.
+  const idsArr = [...ids];
+  const profileRows = resolveProfiles
+    ? await resolveProfiles(idsArr)
+    : ((await client.from('profiles').select('*').in('id', idsArr)).data as GuestReadableRow[] | null);
   const byId = new Map<string, GuestReadableRow>();
-  for (const p of (data as GuestReadableRow[]) || []) byId.set(String(p['id']), p);
+  for (const p of (profileRows as GuestReadableRow[]) || []) byId.set(String(p['id']), p);
 
   // True when the requester pinned themselves as a subject of this read
   // (own-list / friendship-status / checkIfFollowing reads).
@@ -362,9 +380,10 @@ export async function filterGuestProfileListRows(
   domain: 'friends' | 'followers',
   rows: GuestReadableRow[],
   client: GuestClient,
-  filters?: string | string[] | undefined
+  filters?: string | string[] | undefined,
+  resolveProfiles?: ProfileRowsReader
 ): Promise<GuestReadableRow[]> {
-  return filterProfileListRowsForViewer(domain, rows, client, undefined, filters);
+  return filterProfileListRowsForViewer(domain, rows, client, undefined, filters, resolveProfiles);
 }
 
 // Authenticated profile-list reads: OWNER rows (requester is a party and
@@ -376,9 +395,10 @@ export async function filterAuthenticatedProfileListRows(
   rows: GuestReadableRow[],
   client: GuestClient,
   requesterId: string,
-  filters?: string | string[] | undefined
+  filters?: string | string[] | undefined,
+  resolveProfiles?: ProfileRowsReader
 ): Promise<GuestReadableRow[]> {
-  return filterProfileListRowsForViewer(domain, rows, client, requesterId, filters);
+  return filterProfileListRowsForViewer(domain, rows, client, requesterId, filters, resolveProfiles);
 }
 
 // --- parent-scoped rows (likes/comments/post_tags on posts, group_posts/
@@ -444,7 +464,8 @@ export async function applyGuestReadPolicy(
   domain: string,
   rows: GuestReadableRow[],
   client: GuestClient,
-  filters?: string | string[] | undefined
+  filters?: string | string[] | undefined,
+  resolveProfiles?: ProfileRowsReader
 ): Promise<GuestReadableRow[]> {
   switch (domain) {
     case 'posts':
@@ -477,7 +498,7 @@ export async function applyGuestReadPolicy(
       // pinned on: friends need friends_visibility == 'public'; the Following
       // list (follower_id pin) needs following_visibility true; the Followers
       // list (following_id pin) is always public.
-      return filterGuestProfileListRows(domain, rows, client, filters);
+      return filterGuestProfileListRows(domain, rows, client, filters, resolveProfiles);
     case 'group_posts':
     case 'group_members':
       return filterGuestGroupScopedRows(rows, client);

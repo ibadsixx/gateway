@@ -20,6 +20,7 @@ import {
   isGuestSingleRowVisible,
   stripGuestSingleRowRead,
   type GuestReadableRow,
+  type ProfileRowsReader,
 } from './guestAccess';
 
 const PUBLISHED_PUBLIC_POST: GuestReadableRow = {
@@ -438,6 +439,110 @@ async function main(): Promise<void> {
     ['follower_id=eq.other', 'following_id=eq.x1']
   );
   assert.equal(ownFollow.length, 1, 'checkIfFollowing-style read (requester pinned) stays visible');
+
+  // --- CROSS-HOST regression (production) ---
+  // In production the friends/followers tables and the profiles table live on
+  // DIFFERENT Supabase projects, so the list host's own client cannot serve
+  // `profiles` rows. The gate must resolve the viewed owner's visibility
+  // through the profiles-domain reader (`resolveProfiles`); before it existed,
+  // the subject lookup always came back empty and every non-owner row was
+  // dropped — public lists included (do.md: only the self-pinned OWNER row was
+  // surviving). The clients below serve NO profiles rows, exactly like a real
+  // friends/followers host.
+  const profilesOnly = (rows: GuestReadableRow[]): ProfileRowsReader => async (ids: string[]) =>
+    rows.filter((r) => ids.includes(String(r.id)));
+  const emptyProfilesClient = authClient({
+    profiles: [],
+    friendships: [{ requester_id: 'other', receiver_id: 'x1', status: 'accepted' }],
+  });
+
+  const crossHostPublicFriends = await filterAuthenticatedProfileListRows(
+    'friends',
+    friendsRows,
+    emptyProfilesClient,
+    'other',
+    friendsListFilters,
+    profilesOnly([{ id: 'x1', friends_visibility: 'public' }])
+  );
+  assert.equal(crossHostPublicFriends.length, 2, 'cross-host: public Friends list stays visible to an authenticated other');
+
+  const crossHostPrivateFriends = await filterAuthenticatedProfileListRows(
+    'friends',
+    friendsRows,
+    emptyProfilesClient,
+    'other',
+    friendsListFilters,
+    profilesOnly([{ id: 'x1', friends_visibility: 'only_me' }])
+  );
+  assert.equal(crossHostPrivateFriends.length, 0, 'cross-host: private Friends list stays hidden');
+
+  const crossHostFriendsOnly = await filterAuthenticatedProfileListRows(
+    'friends',
+    friendsRows,
+    emptyProfilesClient,
+    'other',
+    friendsListFilters,
+    profilesOnly([{ id: 'x1', friends_visibility: 'friends' }])
+  );
+  assert.equal(crossHostFriendsOnly.length, 2, 'cross-host: friends-only Friends list visible to an accepted friend');
+
+  const crossHostGuestFriends = await applyGuestReadPolicy(
+    'friends',
+    friendsRows,
+    emptyProfilesClient,
+    friendsListFilters,
+    profilesOnly([{ id: 'x1', friends_visibility: 'public' }])
+  );
+  assert.equal(crossHostGuestFriends.length, 2, 'cross-host: public Friends list stays visible to a guest');
+
+  const crossHostOwnerFriends = await filterAuthenticatedProfileListRows(
+    'friends',
+    friendsRows,
+    emptyProfilesClient,
+    'x1',
+    friendsListFilters,
+    profilesOnly([{ id: 'x1', friends_visibility: 'only_me' }])
+  );
+  assert.equal(crossHostOwnerFriends.length, 2, 'cross-host: OWNER still sees their own Friends list when hidden');
+
+  const crossHostFollowingHidden = await filterAuthenticatedProfileListRows(
+    'followers',
+    followingRows,
+    emptyProfilesClient,
+    'other',
+    ['follower_id=eq.x1'],
+    profilesOnly([{ id: 'x1', following_visibility: false }])
+  );
+  assert.equal(crossHostFollowingHidden.length, 0, 'cross-host: Following list hidden when following_visibility is false');
+
+  const crossHostFollowingVisible = await filterAuthenticatedProfileListRows(
+    'followers',
+    followingRows,
+    emptyProfilesClient,
+    'other',
+    ['follower_id=eq.x1'],
+    profilesOnly([{ id: 'x1', following_visibility: true }])
+  );
+  assert.equal(crossHostFollowingVisible.length, 1, 'cross-host: Following list visible when following_visibility is true');
+
+  const crossHostFollowers = await filterAuthenticatedProfileListRows(
+    'followers',
+    followersRows,
+    emptyProfilesClient,
+    'other',
+    ['following_id=eq.x1'],
+    profilesOnly([{ id: 'x1', following_visibility: false }])
+  );
+  assert.equal(crossHostFollowers.length, 1, 'cross-host: Followers list is always visible to an authenticated other');
+
+  const crossHostGuestFollowers = await applyGuestReadPolicy(
+    'followers',
+    followersRows,
+    emptyProfilesClient,
+    ['following_id=eq.x1'],
+    profilesOnly([{ id: 'x1', following_visibility: false }])
+  );
+  assert.equal(crossHostGuestFollowers.length, 1, 'cross-host: Followers list is always visible to a guest');
 
   // --- single-row gates ---
   assert.equal(

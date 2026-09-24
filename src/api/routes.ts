@@ -45,6 +45,8 @@ import {
   isGuestSingleRowVisible,
   stripGuestSingleRowRead,
   filterAuthenticatedProfileListRows,
+  type ProfileRowsReader,
+  type GuestReadableRow,
 } from '../features/guestAccess';
 import {
   createGroup,
@@ -2264,6 +2266,32 @@ router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validate
       return;
     }
     const filters = req.query.filter as string[] | string | undefined;
+    // Profile-list authorization must resolve each pinned profile's visibility
+    // columns THROUGH THE PROFILES DOMAIN projects. `entry.client` (the host of
+    // the friends/followers tables) cannot serve `profiles` in production —
+    // friends/followers and profiles live on different Supabase projects — so
+    // looking subjects up through the list host always comes back empty and
+    // `allowedForList` drops every non-owner row, public lists included (only
+    // the self-pinned owner bypass survived). This reader queries every
+    // readable profiles-domain project and merges the rows by id.
+    const profilesProjects = projectManager.getReadableProjects('profiles');
+    const resolveProfiles: ProfileRowsReader = async (ids) => {
+      const unique = [...new Set(ids.filter(Boolean))];
+      if (unique.length === 0) return [];
+      const byId = new Map<string, GuestReadableRow>();
+      await Promise.all(
+        profilesProjects.map(async (entry) => {
+          try {
+            const { data, error } = await entry.client.from('profiles').select('*').in('id', unique);
+            if (error) return;
+            for (const row of (data as GuestReadableRow[]) || []) byId.set(String(row['id']), row);
+          } catch {
+            // Defensive: a host that does not serve the profiles table is skipped.
+          }
+        })
+      );
+      return [...byId.values()];
+    };
     const results = await Promise.all(
       readableProjects.map(async (entry) => {
         try {
@@ -2278,7 +2306,7 @@ router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validate
           // lists (friends/following/followers) are gated by the viewed
           // owner's per-list visibility.
           if (isGuest) {
-            rows = await applyGuestReadPolicy(domain, rows, entry.client, filters);
+            rows = await applyGuestReadPolicy(domain, rows, entry.client, filters, resolveProfiles);
             return rows;
           }
           // Story privacy (do.md): the generic service-role read bypasses RLS,
@@ -2303,7 +2331,7 @@ router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validate
           // policy above. The SPA's own gates are defense-in-depth — the
           // enforcement lives here.
           if (domain === 'friends' || domain === 'followers') {
-            rows = await filterAuthenticatedProfileListRows(domain, rows, entry.client, requesterId, filters);
+            rows = await filterAuthenticatedProfileListRows(domain, rows, entry.client, requesterId, filters, resolveProfiles);
           }
           // Presence privacy: for `profiles`, do NOT hand presence fields
           // (last_seen_at / manual_status / is_online) to a requester who is a
