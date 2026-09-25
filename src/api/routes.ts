@@ -45,13 +45,28 @@ import {
   isGuestSingleRowVisible,
   stripGuestSingleRowRead,
   filterAuthenticatedProfileListRows,
-  isGuestPostVisible,
   type ProfileRowsReader,
   type PostsRowsReader,
   type GuestReadableRow,
 } from '../features/guestAccess';
 import { getRelationshipCounts } from '../features/relationshipCounts';
 import { getReactionCounts } from '../features/reactionCounts';
+import {
+  attachCommentReactionSummaries,
+  canonicalReactionType,
+  filterCommentReactionRows,
+  filterPostReactionRows,
+  getCommentReactionSummaries,
+  getReactionTypeCounts,
+  getReactionUsersPage,
+  getViewerReactionRows,
+  enrichReactionUsers,
+  resolveComments,
+  resolveReactionContent,
+  type ReactionContentDeps,
+  type ReactionContentType,
+  type ReactionProject,
+} from '../features/reactionUsers';
 import {
   createGroup,
   updateGroupSettings,
@@ -858,6 +873,15 @@ v1.post('/:domain', validation.validateDomainMiddleware, async (req, res) => {
       res.status(403).json({ error: pinDenied });
       return;
     }
+    if (
+      (domain === 'reactions' || domain === 'comment_reactions' || domain === 'comments' || domain === 'privacy_settings') &&
+      req.user?.id &&
+      req.body &&
+      typeof req.body === 'object' &&
+      !Array.isArray(req.body)
+    ) {
+      (req.body as Record<string, unknown>).user_id = req.user.id;
+    }
     const result = await database.write(domain, req.body);
     if (domain === 'message_requests') {
       console.log('[MessageRequest] request_created', { id: Array.isArray(result) ? result[0]?.id : result?.id });
@@ -886,11 +910,43 @@ v1.get('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => 
       res.status(404).json({ error: 'Not found' });
       return;
     }
+    if (domain === 'reactions') {
+      const visible = await filterPostReactionRows([result], req.user?.id, createReactionContentDeps());
+      if (visible.length === 0) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
+      res.json(visible[0]);
+      return;
+    }
+    if (domain === 'comment_reactions') {
+      const visible = await filterCommentReactionRows([result], req.user?.id, createReactionContentDeps());
+      if (visible.length === 0) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
+      res.json(visible[0]);
+      return;
+    }
+    if (domain === 'privacy_settings' && (result as Record<string, unknown>).user_id !== req.user?.id) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+async function isOwnedGatewayRow(domain: string, id: string, userId: string | undefined): Promise<boolean> {
+  if (!userId) return false;
+  try {
+    const row = await database.read(domain, id);
+    return !!row && (row as Record<string, unknown>).user_id === userId;
+  } catch {
+    return false;
+  }
+}
 
 v1.put('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => {
   const { domain, id } = req.params;
@@ -909,6 +965,22 @@ v1.put('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => 
   if (groupMemberUpdateDenied) {
     res.status(403).json({ error: groupMemberUpdateDenied });
     return;
+  }
+  if (
+    (domain === 'reactions' || domain === 'comment_reactions' || domain === 'comments' || domain === 'privacy_settings') &&
+    !(await isOwnedGatewayRow(domain, id, req.user?.id))
+  ) {
+    res.status(403).json({ error: 'You can only change your own row' });
+    return;
+  }
+  if (
+    (domain === 'reactions' || domain === 'comment_reactions' || domain === 'comments' || domain === 'privacy_settings') &&
+    req.user?.id &&
+    req.body &&
+    typeof req.body === 'object' &&
+    !Array.isArray(req.body)
+  ) {
+    (req.body as Record<string, unknown>).user_id = req.user.id;
   }
   try {
     console.log(`[gateway] PUT /api/v1/${domain}/${id}`, { body: req.body });
@@ -952,6 +1024,13 @@ v1.delete('/:domain/:id', validation.validateDomainMiddleware, async (req, res) 
   // the generic service-role delete (do.md privacy).
   if ((domain === 'story_reactions' || domain === 'story_views') && !(await isOwnedDeletableStoryRow(domain, id, req.user?.id))) {
     res.status(403).json({ error: 'You can only delete your own story reaction or view rows' });
+    return;
+  }
+  if (
+    (domain === 'reactions' || domain === 'comment_reactions' || domain === 'comments' || domain === 'privacy_settings') &&
+    !(await isOwnedGatewayRow(domain, id, req.user?.id))
+  ) {
+    res.status(403).json({ error: 'You can only delete your own row' });
     return;
   }
   const permanent = req.query.permanent === 'true';
@@ -1027,6 +1106,18 @@ v1.delete('/:domain', validation.validateDomainMiddleware, async (req, res) => {
               return;
             }
             deletable = deletable.filter((row) => (row?.user_id || row?.viewer_id) === requesterId);
+          } else if (
+            domain === 'reactions' ||
+            domain === 'comment_reactions' ||
+            domain === 'comments' ||
+            domain === 'privacy_settings'
+          ) {
+            const requesterId = req.user?.id;
+            if (!requesterId) {
+              res.status(403).json({ error: 'You can only delete your own row' });
+              return;
+            }
+            deletable = deletable.filter((row) => row?.user_id === requesterId);
           }
           for (const row of deletable) {
             if (row.id) {
@@ -2166,6 +2257,27 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
     if (domain === 'story_views' && req.user?.id && req.body && typeof req.body === 'object') {
       (req.body as Record<string, unknown>).viewer_id = req.user.id;
     }
+    // Reaction and comment rows are attributed to the authenticated actor,
+    // never to a caller-controlled body. This is also the server-side owner
+    // boundary used by the reaction-list policy.
+    if (
+      (domain === 'reactions' || domain === 'comment_reactions' || domain === 'comments') &&
+      req.user?.id &&
+      req.body &&
+      typeof req.body === 'object' &&
+      !Array.isArray(req.body)
+    ) {
+      (req.body as Record<string, unknown>).user_id = req.user.id;
+    }
+    if (
+      domain === 'privacy_settings' &&
+      req.user?.id &&
+      req.body &&
+      typeof req.body === 'object' &&
+      !Array.isArray(req.body)
+    ) {
+      (req.body as Record<string, unknown>).user_id = req.user.id;
+    }
     // Highlight authorization (do.md "Add to Highlight"): a user may only add
     // THEIR OWN Story to THEIR OWN Highlight. The Story owner id and the
     // Highlight owner id are resolved server-side and compared with the
@@ -2307,17 +2419,17 @@ router.get('/posts/:id/reaction-count', auth.authenticateOptional.bind(auth), as
   }
   try {
     const requesterId = req.user?.id;
-    const isGuest = !requesterId;
 
-    // Resolve the post so guests can be held to the public-post rule and
-    // everyone gets a 404 for missing posts.
-    const postsProjects = projectManager.getReadableProjects('posts');
-    let post: GuestReadableRow | null = null;
-    if (postsProjects[0]) {
-      const { data } = await postsProjects[0].client.from('posts').select('*').eq('id', postId).maybeSingle();
-      post = (data as GuestReadableRow | null) ?? null;
-    }
-    if (!post || (isGuest && !isGuestPostVisible(post))) {
+    // Counts are independent from the reactor-list permission, but they are not
+    // independent from the underlying post's own visibility. Use the same
+    // cross-project, guest-safe content resolver as the list endpoint.
+    const resolution = await resolveReactionContent(
+      'post',
+      postId,
+      requesterId,
+      createReactionContentDeps()
+    );
+    if (resolution.status !== 'allowed') {
       res.status(404).json({ error: 'Not found' });
       return;
     }
@@ -2325,6 +2437,188 @@ router.get('/posts/:id/reaction-count', auth.authenticateOptional.bind(auth), as
     const counts = await getReactionCounts(projectManager.getReadableProjects('reactions'), postId);
     res.json(counts);
   } catch (error) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Reaction identities are served by dedicated, paginated routes. The generic
+// domain reads below still receive the same per-row policy, but these endpoints
+// are the only place that reads reactor rows for a modal.
+function readableReactionProjects(domain: string): ReactionProject[] {
+  const direct = projectManager.getReadableProjects(domain) as ReactionProject[];
+  if (direct.length > 0) return direct;
+  // The local/offline registry historically kept several tables on the users
+  // host. Keep that fallback so the feature remains usable there as well.
+  return projectManager.getReadableProjects('users') as ReactionProject[];
+}
+
+function createReactionContentDeps(): ReactionContentDeps {
+  return {
+    posts: readableReactionProjects('posts'),
+    comments: readableReactionProjects('comments'),
+    privacySettings: readableReactionProjects('privacy_settings'),
+    friends: readableReactionProjects('friends'),
+  };
+}
+
+function reactionPageOptions(req: Request): {
+  includeUsers: boolean;
+  limit: number;
+  offset: number;
+  type?: string;
+} {
+  const rawType = req.query.type ?? req.query.reaction ?? req.query.emoji;
+  const type = Array.isArray(rawType) ? rawType[0] : rawType;
+  const rawLimit = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+  const rawOffset = Array.isArray(req.query.offset) ? req.query.offset[0] : req.query.offset;
+  const parsedLimit = Number(rawLimit);
+  const parsedOffset = Number(rawOffset);
+  return {
+    includeUsers: (Array.isArray(req.query.include_users) ? req.query.include_users[0] : req.query.include_users) !== 'false',
+    limit: Number.isFinite(parsedLimit) ? Math.max(1, Math.min(100, Math.floor(parsedLimit))) : 25,
+    offset: Number.isFinite(parsedOffset) ? Math.max(0, Math.floor(parsedOffset)) : 0,
+    type: typeof type === 'string' && type.length > 0 ? type : undefined,
+  };
+}
+
+async function handleReactionUsersRequest(
+  kind: ReactionContentType,
+  req: Request,
+  res: Response
+): Promise<void> {
+  const contentId = req.params.id;
+  if (!contentId || typeof contentId !== 'string' || !/^[0-9a-fA-F-]{36}$/.test(contentId)) {
+    res.status(400).json({ error: `Valid ${kind} id required` });
+    return;
+  }
+
+  try {
+    const viewerId = req.user?.id;
+    const contentDeps = createReactionContentDeps();
+    const resolution = await resolveReactionContent(kind, contentId, viewerId, contentDeps);
+    if (resolution.status === 'not_found') {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    if (resolution.status === 'forbidden') {
+      res.status(403).json({ error: 'Reaction users are not available for this content' });
+      return;
+    }
+
+    const options = reactionPageOptions(req);
+    if (options.includeUsers && !resolution.canViewUsers) {
+      // Do not return a count, a hint, or an empty list here: an unauthorized
+      // caller must not be able to probe whether a private reactor list exists.
+      res.status(403).json({ error: 'Reaction users are not available for this content' });
+      return;
+    }
+
+    const reactionProjects = readableReactionProjects(kind === 'post' ? 'reactions' : 'comment_reactions');
+    const profileProjects = readableReactionProjects('profiles');
+    let page: Awaited<ReturnType<typeof getReactionUsersPage>>;
+    if (options.includeUsers) {
+      page = await getReactionUsersPage(reactionProjects, kind, contentId, options);
+    } else {
+      // The state/count mode deliberately selects only the type column. It is
+      // safe to expose aggregate counts and the caller's own reaction without
+      // making a paginated identity query at all.
+      const counts = await getReactionTypeCounts(reactionProjects, kind, contentId);
+      const filteredType = canonicalReactionType(options.type, kind);
+      page = {
+        ...counts,
+        users: [],
+        filtered_reaction_count: filteredType ? counts.reaction_types[filteredType] || 0 : counts.reaction_count,
+        has_more: false,
+        next_offset: null,
+      };
+    }
+
+    const viewerReactions = await getViewerReactionRows(
+      reactionProjects,
+      kind,
+      contentId,
+      viewerId
+    );
+    const users = options.includeUsers
+      ? await enrichReactionUsers(page.users, profileProjects)
+      : [];
+
+    // A response cache must never share an identity list between viewers.
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({
+      content_type: kind,
+      content_id: contentId,
+      reaction_count: page.reaction_count,
+      reaction_types: page.reaction_types,
+      filtered_reaction_count: page.filtered_reaction_count,
+      users,
+      viewer_reactions: viewerReactions,
+      has_more: page.has_more,
+      next_offset: page.next_offset,
+    });
+  } catch (error) {
+    console.error(`[reaction-users] ${kind} read failed:`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+router.get(
+  '/posts/:id/reaction-users',
+  auth.authenticateOptional.bind(auth),
+  (req: Request, res: Response) => handleReactionUsersRequest('post', req, res)
+);
+router.get(
+  '/comments/:id/reaction-users',
+  auth.authenticateOptional.bind(auth),
+  (req: Request, res: Response) => handleReactionUsersRequest('comment', req, res)
+);
+
+// Aggregate-only comment reaction counts. A restricted viewer receives the
+// true count even though the comment relation is reduced to their own reaction
+// row. The endpoint intentionally returns no user/profile fields.
+router.get('/comments/reaction-counts', auth.authenticateOptional.bind(auth), async (req: Request, res: Response) => {
+  const rawIds = req.query.ids ?? req.query.comment_ids;
+  const ids = (Array.isArray(rawIds) ? rawIds : rawIds ? [rawIds] : [])
+    .flatMap((value) => String(value).split(','))
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const uniqueIds = [...new Set(ids)];
+  if (uniqueIds.length === 0 || uniqueIds.length > 100 || uniqueIds.some((id) => !/^[0-9a-fA-F-]{36}$/.test(id))) {
+    res.status(400).json({ error: 'Provide between 1 and 100 valid comment ids' });
+    return;
+  }
+
+  try {
+    const deps = createReactionContentDeps();
+    const comments = await resolveComments(deps.comments, uniqueIds);
+    const summaries = await getCommentReactionSummaries(
+      readableReactionProjects('comment_reactions'),
+      uniqueIds,
+      req.user?.id
+    );
+    const result: Record<string, {
+      reaction_count: number;
+      reaction_types: Record<string, number>;
+      viewer_reactions: Array<{ id: string; user_id: string; reaction_type: string; created_at: string | null }>;
+    }> = {};
+    for (const id of uniqueIds) {
+      if (!comments.has(id)) continue;
+      const resolution = await resolveReactionContent('comment', id, req.user?.id, deps);
+      if (resolution.status !== 'allowed') continue;
+      const summary = summaries.get(id);
+      if (!summary) continue;
+      result[id] = {
+        reaction_count: summary.reaction_count,
+        reaction_types: summary.reaction_types,
+        // Only the authenticated viewer's own rows are included; this is state
+        // data for the picker, not a reactor-list bypass.
+        viewer_reactions: summary.viewer_reactions,
+      };
+    }
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ counts: result });
+  } catch (error) {
+    console.error('[reaction-counts] comment read failed:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2465,7 +2759,37 @@ router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validate
         }
       })
     );
-    res.json(domain === 'posts' ? filterScheduledPosts(results.flat(), requesterId) : results.flat());
+
+    let responseRows = results.flat();
+    if (domain === 'reactions' && requesterId) {
+      // Generic reads remain available for existing reaction-state callers, but
+      // the service-role result is reduced to reactor identities the requester
+      // is authorized to see. An unauthorized viewer can still see their own
+      // row so the counter/picker can render accurate state.
+      responseRows = await filterPostReactionRows(responseRows, requesterId, createReactionContentDeps());
+    } else if (domain === 'comment_reactions' && requesterId) {
+      responseRows = await filterCommentReactionRows(responseRows, requesterId, createReactionContentDeps());
+    }
+
+    if (domain === 'comments') {
+      // Counts are aggregate-only and therefore remain available even when the
+      // embedded/authorized reaction rows have been reduced for privacy.
+      const summaries = await getCommentReactionSummaries(
+        readableReactionProjects('comment_reactions'),
+        responseRows.map((row) => row.id).filter((id): id is string => typeof id === 'string'),
+        requesterId
+      );
+      responseRows = attachCommentReactionSummaries(responseRows, summaries);
+    }
+    if (domain === 'privacy_settings') {
+      // Privacy settings are account data. A service-role read must never let
+      // one authenticated account inspect another account's policy rows.
+      responseRows = requesterId
+        ? responseRows.filter((row) => row.user_id === requesterId)
+        : [];
+    }
+
+    res.json(domain === 'posts' ? filterScheduledPosts(responseRows, requesterId) : responseRows);
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -2568,6 +2892,30 @@ router.get('/:domain/:id', auth.authenticateOptional.bind(auth), validation.vali
     if (domain === 'posts' && isForeignScheduledPost(result, req.user?.id)) {
       res.status(404).json({ error: 'Not found' });
       return;
+    }
+    if (domain === 'reactions' && requesterId) {
+      const visible = await filterPostReactionRows([result], requesterId, createReactionContentDeps());
+      if (visible.length === 0) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
+      res.json(visible[0]);
+      return;
+    }
+    if (domain === 'comment_reactions' && requesterId) {
+      const visible = await filterCommentReactionRows([result], requesterId, createReactionContentDeps());
+      if (visible.length === 0) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
+      res.json(visible[0]);
+      return;
+    }
+    if (domain === 'privacy_settings') {
+      if (!requesterId || (result as Record<string, unknown>).user_id !== requesterId) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
     }
     // Story rows carry view analytics; a non-owner must not receive them even
     // through a single-row read (do.md scenario H).
