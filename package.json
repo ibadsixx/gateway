@@ -13,6 +13,7 @@
     "verify:message-requests": "ts-node src/features/verifyMessageRequestCategory.ts",
     "test:channel-permissions": "ts-node src/features/channelPermissionsTest.ts",
     "test:scheduled-privacy": "ts-node src/features/scheduledPostPrivacyTest.ts",
+    "test:content-visibility": "ts-node src/features/contentVisibilityTest.ts",
     "test:people-you-may-know": "ts-node src/features/peopleYouMayKnowTest.ts",
     "test:story-privacy": "ts-node src/features/storyPrivacyTest.ts",
     "test:highlight-privacy": "ts-node src/features/highlightPrivacyTest.ts",

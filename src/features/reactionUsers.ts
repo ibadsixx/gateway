@@ -631,6 +631,63 @@ function stringArray(value: unknown): string[] {
   return [];
 }
 
+// Canonical audience for a content row. `null` means "the field carried no
+// value" (so a caller may fall back to another column); `DENIED` means "the
+// value was present but unrecognized" and must fail closed rather than be
+// treated as public. Aliases are accepted because the same audience has been
+// written as `friends`, `Friends`, `friends_only` and `friends-only` over time.
+export const DENIED_AUDIENCE = 'denied';
+
+export function canonicalAudienceType(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const raw = String(value).trim().toLowerCase();
+  if (raw === '') return null;
+  switch (raw.replace(/[\s-]+/g, '_')) {
+    case 'public':
+    case 'everyone':
+    case 'anyone':
+    case 'all':
+      return 'public';
+    case 'friends':
+    case 'friend':
+    case 'ally':
+    case 'allies':
+    case 'friends_only':
+    case 'followers':
+      return 'friends';
+    case 'only_me':
+    case 'onlyme':
+    case 'me':
+    case 'private':
+    case 'restricted':
+      return 'only_me';
+    case 'friends_except':
+      return 'friends_except';
+    case 'specific':
+      return 'specific';
+    case 'custom_list':
+      return 'custom_list';
+    default:
+      return DENIED_AUDIENCE;
+  }
+}
+
+// `audience_type` is the canonical, RLS-authoritative column (it is what
+// public.can_view_post and the `Posts are viewable based on audience and status`
+// policy evaluate, and the column DEFAULT is 'public'). The legacy `visibility`
+// column is NOT allowed to shadow it: the reel composer writes both columns
+// with the same value, so evaluating `visibility` first rejected a
+// `friends` post for every accepted friend and reduced it to owner-only. It is
+// consulted only when `audience_type` carries no value at all (legacy rows
+// written before the column existed), and an unrecognized value fails closed.
+export function resolveContentAudience(row: ReactionRow): string {
+  const declared = canonicalAudienceType(row['audience_type']);
+  if (declared !== null) return declared;
+  const legacy = canonicalAudienceType(row['visibility']);
+  if (legacy === null) return 'public';
+  return legacy;
+}
+
 export function canViewerViewPost(
   post: ReactionRow | null | undefined,
   viewerId: string | undefined,
@@ -641,22 +698,33 @@ export function canViewerViewPost(
   if (ownerId && ownerId === viewerId) return true;
   if (!viewerId) return isGuestPostVisible(post);
 
-  const visibility = rowValue(post, 'visibility');
-  if (visibility && visibility !== 'public') return false;
+  // Drafts and scheduled posts are author-only. The author already returned
+  // above, so a non-author must never receive an unpublished row.
   const status = rowValue(post, 'status');
   if (status && status !== 'published') return false;
 
-  const audience = rowValue(post, 'audience_type') || 'public';
+  const audience = resolveContentAudience(post);
   if (audience === 'public') return !stringArray(post.audience_excluded_user_ids).includes(viewerId);
-  if (audience === 'friends') return friendIds.has(ownerId || '');
+  // Guests are never friends: an unauthenticated viewer is handled by
+  // isGuestPostVisible above, and an empty friend set can never grant access.
+  if (audience === 'friends') return !!ownerId && friendIds.has(ownerId);
   if (audience === 'friends_except') {
-    return friendIds.has(ownerId || '') && !stringArray(post.audience_excluded_user_ids).includes(viewerId);
+    return !!ownerId && friendIds.has(ownerId) && !stringArray(post.audience_excluded_user_ids).includes(viewerId);
   }
   if (audience === 'specific') return stringArray(post.audience_user_ids).includes(viewerId);
-  // Custom audience lists require an additional list-membership reader. Deny
-  // here rather than risk serving a private post/reaction list to a stranger.
-  if (audience === 'only_me' || audience === 'private' || audience === 'custom_list') return false;
+  // `only_me`, `custom_list` (needs a list-membership reader this feature does
+  // not have) and any unrecognized value are denied rather than risk serving a
+  // private post/reaction list to a stranger.
   return false;
+}
+
+// True when the row is public content that any viewer (including a guest) may
+// see. Used to keep friends-only content out of public discovery surfaces.
+export function isPublicContent(row: ReactionRow | null | undefined): boolean {
+  if (!row) return false;
+  const status = rowValue(row, 'status');
+  if (status && status !== 'published') return false;
+  return resolveContentAudience(row) === 'public';
 }
 
 export function canViewerViewReactionUsers(

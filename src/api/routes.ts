@@ -52,6 +52,11 @@ import {
 import { getRelationshipCounts } from '../features/relationshipCounts';
 import { getReactionCounts } from '../features/reactionCounts';
 import {
+  filterContentRowsForViewer,
+  resolveViewerFriendIds,
+  canViewerReadContentRow,
+} from '../features/contentVisibility';
+import {
   attachCommentReactionSummaries,
   canonicalReactionType,
   filterCommentReactionRows,
@@ -909,6 +914,15 @@ v1.get('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => 
     if (domain === 'posts' && isForeignScheduledPost(result, req.user?.id)) {
       res.status(404).json({ error: 'Not found' });
       return;
+    }
+    // do.md: the audience is enforced on this single-row route too, so
+    // /api/v1/posts/:id cannot be used to bypass the list route's filtering.
+    if (domain === 'posts' && req.user?.id) {
+      const friendIds = await resolveViewerFriendIds(req.user.id, readableReactionProjects('friends'));
+      if (!canViewerReadContentRow(result, req.user.id, friendIds)) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
     }
     if (domain === 'reactions') {
       const visible = await filterPostReactionRows([result], req.user?.id, createReactionContentDeps());
@@ -2789,7 +2803,26 @@ router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validate
         : [];
     }
 
-    res.json(domain === 'posts' ? filterScheduledPosts(responseRows, requesterId) : responseRows);
+    if (domain === 'posts') {
+      // do.md "Friends audience": the service-role read bypasses the
+      // `Posts are viewable based on audience and status` RLS policy, so the
+      // audience is enforced here instead. This is the single choke point every
+      // SPA read of posts/reels/photos goes through (home feed, profile,
+      // Explore, search, hashtags, reels, photos, saved posts and a direct
+      // /post/:id link), so applying it to the merged result covers all of
+      // them. The viewer is the authenticated session id only; the accepted
+      // friend set is resolved once per request.
+      const friendIds = await resolveViewerFriendIds(requesterId, readableReactionProjects('friends'));
+      responseRows = filterContentRowsForViewer(responseRows, requesterId, friendIds);
+      // do.md: the response is now viewer-specific, so it must never be stored
+      // in a shared cache or prefetched for a different viewer.
+      res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+      res.setHeader('Vary', 'Authorization');
+      res.json(filterScheduledPosts(responseRows, requesterId));
+      return;
+    }
+
+    res.json(responseRows);
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -2892,6 +2925,18 @@ router.get('/:domain/:id', auth.authenticateOptional.bind(auth), validation.vali
     if (domain === 'posts' && isForeignScheduledPost(result, req.user?.id)) {
       res.status(404).json({ error: 'Not found' });
       return;
+    }
+    // do.md: a direct single-row read of a post/reel/photo must enforce the
+    // same audience rules as a list read, otherwise `/post/:id` is a way to
+    // fetch a friends-only row (and its media URL) as any authenticated user.
+    if (domain === 'posts' && requesterId) {
+      const friendIds = await resolveViewerFriendIds(requesterId, readableReactionProjects('friends'));
+      if (!canViewerReadContentRow(result, requesterId, friendIds)) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
+      res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+      res.setHeader('Vary', 'Authorization');
     }
     if (domain === 'reactions' && requesterId) {
       const visible = await filterPostReactionRows([result], requesterId, createReactionContentDeps());
