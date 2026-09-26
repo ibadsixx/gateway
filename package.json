@@ -21,6 +21,7 @@
     "test:relationship-counts": "ts-node src/features/relationshipCountsTest.ts",
     "test:reaction-counts": "ts-node src/features/reactionCountsTest.ts",
     "test:reaction-users": "ts-node src/features/reactionUsersTest.ts",
+    "test:profile-content": "ts-node src/features/profileContentTest.ts",
     "test:storage-sign": "ts-node src/features/storageSignTest.ts",
     "test:storage-resolve": "ts-node src/features/storageResolveTest.ts",
     "test:all-channel": "npm run test:channel-moderator && npm run test:channel-permissions"

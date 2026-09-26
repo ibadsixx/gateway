@@ -57,6 +57,11 @@ import {
   canViewerReadContentRow,
 } from '../features/contentVisibility';
 import {
+  getProfileContentPage,
+  parseProfileContentKind,
+  clampProfileContentLimit,
+} from '../features/profileContent';
+import {
   attachCommentReactionSummaries,
   canonicalReactionType,
   filterCommentReactionRows,
@@ -2585,6 +2590,75 @@ router.get(
   '/comments/:id/reaction-users',
   auth.authenticateOptional.bind(auth),
   (req: Request, res: Response) => handleReactionUsersRequest('comment', req, res)
+);
+
+// Profile content, one item per request (do.md "Profile content pages").
+//
+// The SPA's four Profile sections — Posts, Photos, Reels, Shared — are four
+// views of the one `posts` table, and each is read here with its own keyset
+// cursor so the client can append exactly one item per scroll. The generic
+// `GET /:domain` read below cannot do this: it applies no `order`, `limit`,
+// `offset` or `range`, so it would hand over the author's entire history on
+// every page.
+//
+// Privacy is NOT re-implemented here. `getProfileContentPage` gates every row
+// with the same `canViewerViewPost` predicate the generic `posts` read uses, and
+// advances the cursor past the rows it withholds, so a guest asking for the
+// next item is served the next item they may actually see instead of being
+// handed a private post to hide in React.
+//
+// Registered before `GET /:domain` so the path is not swallowed by it.
+router.get(
+  '/profiles/:id/content',
+  auth.authenticateOptional.bind(auth),
+  async (req: Request, res: Response) => {
+    const profileId = req.params.id;
+    // Guests may read a public profile. Rows they may not see are withheld by
+    // the per-row gate, so an empty page is the correct answer for a private
+    // profile rather than a 403 that would confirm the account exists.
+    if (!profileId || !/^[0-9a-fA-F-]{36}$/.test(profileId)) {
+      res.status(400).json({ error: 'Provide a valid profile id' });
+      return;
+    }
+    const kind = parseProfileContentKind(req.query.kind ?? 'posts');
+    if (!kind) {
+      res.status(400).json({ error: 'kind must be one of: posts, photos, reels, shared' });
+      return;
+    }
+
+    try {
+      const viewerId = req.user?.id;
+      const friendIds = await resolveViewerFriendIds(viewerId, readableReactionProjects('friends'));
+      const page = await getProfileContentPage(
+        {
+          posts: readableReactionProjects('posts'),
+          friends: readableReactionProjects('friends'),
+          profiles: readableReactionProjects('profiles'),
+        },
+        profileId,
+        viewerId,
+        friendIds,
+        kind,
+        { limit: clampProfileContentLimit(req.query.limit), cursor: req.query.cursor }
+      );
+
+      // The response is viewer-specific (a guest, a friend and the author each
+      // get different rows), so it must never be cached or shared.
+      res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+      res.setHeader('Vary', 'Authorization');
+      res.json({
+        kind: page.kind,
+        profile_id: profileId,
+        items: page.items,
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        withheld_count: page.withheld_count,
+      });
+    } catch (error) {
+      console.error(`[profile-content] ${kind} read failed:`, error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  }
 );
 
 // Aggregate-only comment reaction counts. A restricted viewer receives the
