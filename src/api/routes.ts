@@ -7,11 +7,12 @@ import { storage } from '../infrastructure/storage';
 import { ai } from '../infrastructure/ai';
 import { projectRegistry } from '../registry/projectRegistry';
 import {
-  buildPublicSitemapIndex,
-  buildPublicSitemapPage,
-  SitemapSegmentOutOfRange,
+  buildSitemapRoot,
+  buildSitemapChild,
+  SITEMAP_SECTIONS,
+  SitemapPageOutOfRange,
 } from '../features/sitemap';
-import { supabasePublicContentSource } from '../features/sitemapSource';
+import { supabaseSitemapSource } from '../features/sitemapSource';
 import { featureFlags } from '../features';
 import { configCenter } from '../config';
 import { rateLimiter } from '../rate-limiting';
@@ -2766,64 +2767,88 @@ function createPostsRowsReader(): PostsRowsReader {
 //
 // These endpoints are unauthenticated by design - a crawler has no session - and
 // they are NOT the thing that makes content public. They only ever emit paths
-// for rows that `isGuestSafePublicAudience` already accepts, i.e. rows an
-// anonymous caller can read anyway. Nothing here consults the User-Agent, and
-// there is no "crawler" branch anywhere: the sitemap is strictly narrower than
-// what a guest can already fetch from `GET /api/posts`.
+// for rows the per-section predicate already accepts, i.e. rows an anonymous
+// caller can read anyway. Nothing here consults the User-Agent, and there is no
+// "crawler" branch anywhere: the sitemap is strictly narrower than what a guest
+// can already fetch from `GET /api/posts`.
+//
+// The Gateway is the generator but NOT the advertised origin. do.md §1/§22 put
+// the canonical URL on the frontend, and §17 explicitly allows the generator to
+// live here provided the rewrite is configured: tone-your-social-voice/vercel.json
+// rewrites /sitemap.xml and /sitemap-<section>-<n>.xml onto these two routes, and
+// the <loc> values below are frontend-origin so the file a crawler follows is the
+// one a browser would load. The old `/api/sitemap/<n>.xml` shape is gone rather
+// than kept as an alias, so there is exactly one advertised path per file - an
+// alias here would be a second URL a crawler could index the same content under.
 // ---------------------------------------------------------------------------
 
-// Absolute, crawler-usable base URL for the sitemap's own <loc> values. Declared
-// in env because the Gateway is deployed behind several hostnames; falling back
-// to the request's own origin keeps local development working with no config.
-function sitemapBaseUrl(req: Request): string {
+// do.md §22: every generated URL uses the canonical origin. This deliberately
+// does NOT fall back to the request's own host the way it used to - a sitemap
+// whose <loc> origin depends on which hostname happened to answer is how a
+// sitemap ends up advertising a site that is not the one it was fetched from, and
+// that is a silent, index-level bug. Set PUBLIC_SITE_URL for a deployment that
+// is not tonesn.vercel.app.
+const CANONICAL_SITE_URL = 'https://tonesn.vercel.app';
+
+function sitemapBaseUrl(): string {
   const configured = process.env.PUBLIC_SITE_URL?.trim();
-  if (configured) return configured.replace(/\/+$/, '');
-  const host = req.get('host');
-  const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
-  return host ? `${proto}://${host}` : 'https://tonesn.vercel.app';
+  return (configured || CANONICAL_SITE_URL).replace(/\/+$/, '');
 }
 
 router.get('/sitemap.xml', async (req: Request, res: Response) => {
   try {
-    const { xml, segmentCount } = await buildPublicSitemapIndex(supabasePublicContentSource(), {
-      baseUrl: sitemapBaseUrl(req),
+    const { xml, shape, pageCount, urlCount } = await buildSitemapRoot(supabaseSitemapSource(), {
+      baseUrl: sitemapBaseUrl(),
     });
-    // Short TTL only. The whole point of generating this per request is that a
-    // public->private change disappears on the next crawl; a long cache would
-    // undo that, and a shared cache is not safe for a URL list that shrinks.
+    // do.md §18: a short shared TTL, so a crawler that repeats a request does not
+    // re-query the database, and recently published content is still picked up
+    // within minutes. No stale-while-revalidate: that would extend the window in
+    // which a shared cache can still hold a URL whose audience has since changed.
+    // The residual is bounded and harmless - a public->private change can linger
+    // up to 5 minutes, but the URL then 404s for the crawler anyway, so the cost
+    // is one wasted fetch rather than a leak.
     res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.setHeader('Content-Type', 'application/xml; charset=utf-8');
-    res.setHeader('X-Sitemap-Segments', String(segmentCount));
+    // Shape and size as headers, so an operator can tell "one small sitemap" from
+    // "the index grew to 40 children" without parsing XML.
+    res.setHeader('X-Sitemap-Shape', shape);
+    res.setHeader('X-Sitemap-Pages', String(pageCount));
+    if (shape === 'urlset') res.setHeader('X-Sitemap-Urls', String(urlCount));
     res.status(200).send(xml);
   } catch (err) {
-    console.error('[Gateway] sitemap index failed:', (err as Error).message);
+    // do.md §19: log the cause, return a generic error. The message can contain a
+    // host name or a Supabase error string, none of which belong in a response a
+    // crawler archives.
+    console.error('[Gateway] sitemap root failed:', (err as Error).message);
     res.status(500).json({ error: 'Failed to build sitemap' });
   }
 });
 
-router.get('/sitemap/:segment', async (req: Request, res: Response) => {
-  const raw = req.params.segment ?? '';
-  const match = /^(\d+)\.xml$/.exec(raw);
-  if (!match) {
+// /api/sitemap-posts-1.xml, /api/sitemap-profiles-2.xml, ...
+router.get('/sitemap-:file', async (req: Request, res: Response) => {
+  const raw = req.params.file ?? '';
+  const match = /^([a-z]+)-(\d+)\.xml$/.exec(raw);
+  if (!match || !(SITEMAP_SECTIONS as readonly string[]).includes(match[1])) {
     res.status(404).json({ error: 'Not found' });
     return;
   }
   try {
-    const { xml, urlCount } = await buildPublicSitemapPage(supabasePublicContentSource(), {
-      baseUrl: sitemapBaseUrl(req),
-      segment: Number.parseInt(match[1], 10),
+    const { xml, urlCount } = await buildSitemapChild(supabaseSitemapSource(), {
+      baseUrl: sitemapBaseUrl(),
+      section: match[1],
+      page: Number.parseInt(match[2], 10),
     });
     res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.setHeader('Content-Type', 'application/xml; charset=utf-8');
     res.setHeader('X-Sitemap-Urls', String(urlCount));
     res.status(200).send(xml);
   } catch (err) {
-    if (err instanceof SitemapSegmentOutOfRange) {
+    if (err instanceof SitemapPageOutOfRange) {
       res.status(404).json({ error: 'Not found' });
       return;
     }
-    console.error('[Gateway] sitemap segment failed:', (err as Error).message);
-    res.status(500).json({ error: 'Failed to build sitemap segment' });
+    console.error('[Gateway] sitemap child failed:', (err as Error).message);
+    res.status(500).json({ error: 'Failed to build sitemap' });
   }
 });
 

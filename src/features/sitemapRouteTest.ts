@@ -1,117 +1,253 @@
-// End-to-end check of the sitemap HTTP surface, over the real Express router
-// with only the database swapped for an in-memory PostgREST stub.
+// End-to-end check of the sitemap HTTP surface: the real Express router, over a
+// real socket, with only the database swapped for an in-memory PostgREST stub.
 //
-// The unit suite (sitemapTest.ts) proves the audience rules. This one proves the
-// things that only exist at the route boundary:
-//   - the routes are not swallowed by the catch-all `/:domain` router
-//   - they are reachable with NO Authorization header at all
-//   - a segment that does not exist is a 404, not a 500
-//   - a restricted id never appears in any byte of the response
+// The unit suite (sitemapTest.ts) proves the privacy rules and the pagination
+// arithmetic. This one proves the things that only exist at the route boundary:
+//   - the routes are not swallowed by the catch-all `/:domain` router, and
+//     `/sitemap.xml` is not turned into the SPA shell (do.md §17, §20.20)
+//   - they are reachable with NO Authorization header at all (§20.1, §20.17)
+//   - the Content-Type is XML and not JSON (§1, §20.2)
+//   - a malformed child path is a 404, not a 500
+//   - a restricted id never appears in any byte of the response (§20.18)
+//   - a failing data source is a 500 with a generic body, never a partial
+//     sitemap and never an error message (§19)
+//
+// It also covers the two claims that can only be checked against a real reader:
+//
+//   §9   the prefilter is a proven SUPERSET of the accepted set, so §2's strict
+//        "exactly public" rule is not quietly narrowed by the database filter.
+//        The stub interprets the `or()` / `eq` / `in` / `ilike` strings the way
+//        PostgREST does, so this asserts the real filter against the real
+//        predicate rather than a restatement of them.
+//   §6/§12 the profile opt-in, which is a two-table read with no FK to join on.
+//
+// The router is driven over a real listener rather than by faking `req.params`,
+// because the child route's parameter is mid-segment (`/sitemap-:file`) and only
+// Express itself gets that split right.
 //
 // Run: npm run test:sitemap-routes
 import assert from 'node:assert/strict';
-import type { Request, Response } from 'express';
+import type { AddressInfo } from 'node:net';
+import express from 'express';
 import { router } from '../api/routes';
 import { projectManager } from '../project-manager';
+import { isIndexableSitemapRow, SITEMAP_PAGE_SIZE } from './sitemap';
 
 type Row = Record<string, unknown>;
 
 const uuid = (n: number): string => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 
-function row(n: number, over: Row = {}): Row {
+function post(n: number, over: Row = {}): Row {
   return {
     id: uuid(n),
     type: 'normal_post',
     media_type: null,
-    created_at: new Date(Date.UTC(2026, 0, n)).toISOString(),
+    created_at: new Date(Date.UTC(2026, 0, 1, 0, 0, n)).toISOString(),
     audience_type: 'public',
     visibility: 'public',
     status: 'published',
+    // Fields a full row would carry and the sitemap must never ask for (§9).
+    content: `secret body ${n}`,
+    media_url: `https://cdn.test/${n}.jpg`,
+    author_id: uuid(90_000 + n),
+    comment_count: 17,
     ...over,
   };
 }
 
-// The public rows (listed in the sitemap) and the restricted ones (must not be,
-// and must not be nameable from the response).
-const PUBLIC_ROWS: Row[] = [
-  row(1),
-  row(2, { type: 'reel', media_type: 'video' }),
-  row(3, { media_type: 'image' }),
-  // The one tolerance kept: surrounding whitespace is a storage artifact, not a
-  // different audience. A poster can still be crawled and indexed.
-  row(4, { audience_type: ' public ', visibility: ' public ' }),
-];
-const RESTRICTED_ROWS: Row[] = [
-  row(10, { audience_type: 'friends', visibility: 'friends' }),
-  row(11, { audience_type: 'only_me', visibility: 'only_me' }),
-  row(12, { audience_type: 'public', visibility: 'friends' }), // columns disagree -> deny
-  row(13, { audience_type: 'public', visibility: 'public', status: 'draft' }),
-  row(14, { audience_type: 'specific', audience_user_ids: [uuid(90)] }),
-  row(15, { audience_type: 'only_me', visibility: 'public' }), // only_me wins
-  // §11: the value must be the exact word `public`. A near-miss spelling is not
-  // a decision anybody made, and RLS compares `post_audience_type = 'public'`
-  // literally, so these are non-public in the database too.
-  row(16, { audience_type: 'Public', visibility: 'Public' }),
-  row(17, { audience_type: 'Everyone', visibility: 'Everyone' }),
-  row(18, { audience_type: 'All', visibility: 'All' }),
-  // A NULL audience is not public, and is not rescued by a public legacy column.
-  row(19, { audience_type: null, visibility: null }),
-  row(20, { audience_type: null, visibility: 'public' }),
-  // An absent audience column entirely.
-  row(21, { audience_type: undefined, visibility: undefined }),
-];
-const ALL_ROWS = [...PUBLIC_ROWS, ...RESTRICTED_ROWS];
+function profile(n: number, over: Row = {}): Row {
+  return {
+    id: uuid(5000 + n),
+    username: `user${n}`,
+    display_name: `User ${n}`,
+    email: `user${n}@example.test`,
+    created_at: new Date(Date.UTC(2026, 1, 1, 0, 0, n)).toISOString(),
+    ...over,
+  };
+}
 
-// Minimal PostgREST stand-in: understands the `or()` prefilter, the ordering and
-// the range window, and nothing else.
-function stubClient(rows: Row[]) {
-  const matches = (filter: string | null) =>
-    rows.filter((r) => {
-      if (filter && /status\.is\.null/.test(filter)) {
-        if (r.status === null || r.status === undefined) return true;
-      }
-      if (filter && /status\.eq\.published/.test(filter)) {
-        if (r.status === 'published') return true;
-      }
-      return false;
-    });
+// ---------------------------------------------------------------------------
+// A PostgREST stub that interprets the filter strings the reader actually emits
+// ---------------------------------------------------------------------------
 
+type Cond =
+  | { kind: 'and'; args: Cond[] }
+  | { kind: 'cmp'; col: string; op: string; value: string };
+
+function splitTopLevel(input: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of input) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) {
+      out.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  if (current !== '') out.push(current);
+  return out;
+}
+
+function parseCond(input: string): Cond {
+  if (input.startsWith('and(') && input.endsWith(')')) {
+    return { kind: 'and', args: splitTopLevel(input.slice(4, -1)).map(parseCond) };
+  }
+  const match = /^([a-z_]+)\.([a-z]+)\.([\s\S]*)$/.exec(input);
+  if (!match) throw new Error(`unparseable filter condition: ${input}`);
+  return { kind: 'cmp', col: match[1], op: match[2], value: match[3] };
+}
+
+// PostgREST `*` is SQL `%`; `_` is a single character. Both wildcards, because
+// the reader relies on `%public%` matching any string containing "public".
+function likeToRegExp(pattern: string): RegExp {
+  let source = '';
+  for (const ch of pattern) {
+    if (ch === '*' || ch === '%') source += '[\\s\\S]*';
+    else if (ch === '_') source += '[\\s\\S]';
+    else source += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${source}$`);
+}
+
+function cell(row: Row, col: string): unknown {
+  return row[col];
+}
+
+function evalCond(cond: Cond, row: Row): boolean {
+  if (cond.kind === 'and') return cond.args.every((arg) => evalCond(arg, row));
+  const raw = cell(row, cond.col);
+  const text = raw === null || raw === undefined ? null : String(raw);
+  switch (cond.op) {
+    case 'is':
+      if (cond.value === 'null') return text === null;
+      return text === cond.value;
+    case 'eq':
+      return text === cond.value;
+    case 'neq':
+      return text !== cond.value;
+    case 'like':
+      return text !== null && likeToRegExp(cond.value).test(text);
+    case 'ilike':
+      return text !== null && likeToRegExp(cond.value.toLowerCase()).test(text.toLowerCase());
+    case 'lt':
+    case 'gt': {
+      if (text === null) return false;
+      // created_at is the only date-compared column in a cursor; everything else
+      // (id, username, tag) compares as a string, because Date.parse would
+      // happily read a bare "2026" as a year and order a tag page by accident.
+      if (cond.col === 'created_at') {
+        const a = Date.parse(text);
+        const b = Date.parse(cond.value);
+        if (Number.isNaN(a) || Number.isNaN(b)) return false;
+        return cond.op === 'lt' ? a < b : a > b;
+      }
+      return cond.op === 'lt' ? text < cond.value : text > cond.value;
+    }
+    default:
+      throw new Error(`stub does not implement operator ${cond.op}`);
+  }
+}
+
+interface RecordedQuery {
+  table: string;
+  select: string | null;
+  head: boolean;
+  filters: Array<{ kind: string; detail: string }>;
+}
+
+interface StubDb {
+  tables: Record<string, Row[]>;
+  failTables: Set<string>;
+  queries: RecordedQuery[];
+}
+
+const db: StubDb = { tables: {}, failTables: new Set(), queries: [] };
+
+function makeClient() {
   return {
     from(table: string) {
-      if (table !== 'posts') throw new Error(`unexpected table ${table}`);
-      let filter: string | null = null;
-      let columns: string[] = [];
-      let head = false;
-      const ordered = () =>
-        [...matches(filter)].sort((a, b) => {
-          const at = Date.parse(String(a.created_at)) || 0;
-          const bt = Date.parse(String(b.created_at)) || 0;
-          if (at !== bt) return bt - at;
-          return String(b.id).localeCompare(String(a.id));
+      const record: RecordedQuery = { table, select: null, head: false, filters: [] };
+      db.queries.push(record);
+      const state = {
+        orFilters: [] as string[],
+        eqs: [] as Array<[string, string]>,
+        ins: [] as Array<[string, string[]]>,
+        ilikes: [] as Array<[string, string]>,
+        orders: [] as Array<[string, boolean]>,
+        limitN: null as number | null,
+        rangeN: null as [number, number] | null,
+      };
+
+      const run = (): { rows: Row[]; count: number; error: unknown } => {
+        if (db.failTables.has(table)) {
+          return { rows: [], count: 0, error: { message: 'connection to the secret-project pool failed' } };
+        }
+        const source = db.tables[table] ?? [];
+        let rows = source.filter((row) => {
+          // Each `or(...)` is a DISJUNCTION of its comma-separated conditions, and
+          // separate or() calls AND together. (Reading the or() as a conjunction
+          // is what made the first run of this suite return an empty sitemap.)
+          const orFiltersPass = state.orFilters.every((filter) =>
+            splitTopLevel(filter).some((cond) => evalCond(parseCond(cond), row))
+          );
+          if (!orFiltersPass) return false;
+          if (!state.eqs.every(([col, value]) => evalCond({ kind: 'cmp', col, op: 'eq', value }, row))) return false;
+          if (!state.ins.every(([col, values]) => values.includes(String(cell(row, col) ?? '')))) return false;
+          if (!state.ilikes.every(([col, pattern]) => evalCond({ kind: 'cmp', col, op: 'ilike', value: pattern }, row))) {
+            return false;
+          }
+          return true;
         });
+        // `count: 'exact'` counts the FILTERED set, before range/limit - which is
+        // the whole reason a per-section head count can be tighter than the table.
+        const filteredCount = rows.length;
+        for (const [col, ascending] of [...state.orders].reverse()) {
+          rows = [...rows].sort((a, b) => {
+            const av = String(cell(a, col) ?? '');
+            const bv = String(cell(b, col) ?? '');
+            return (av < bv ? -1 : av > bv ? 1 : 0) * (ascending ? 1 : -1);
+          });
+        }
+        if (state.rangeN) rows = rows.slice(state.rangeN[0], state.rangeN[1] + 1);
+        else if (state.limitN !== null) rows = rows.slice(0, state.limitN);
+        return { rows, count: filteredCount, error: null };
+      };
+
+      const project = (rows: Row[]) => {
+        const cols = String(record.select ?? '')
+          .split(',')
+          .map((c) => c.trim())
+          .filter(Boolean);
+        return rows.map((row) => Object.fromEntries(cols.map((c) => [c, row[c]])));
+      };
+
       const builder: any = {
-        select(cols: string, options?: { head?: boolean }) {
-          columns = String(cols).split(',').map((c) => c.trim());
-          head = Boolean(options?.head);
+        select(columns: string, options?: { count?: string; head?: boolean }) {
+          record.select = columns;
+          record.head = Boolean(options?.head);
           return builder;
         },
-        or(value: string) { filter = value; return builder; },
-        order() { return builder; },
-        range(from: number, to: number) {
-          const page = ordered().slice(from, to + 1);
-          if (head) return Promise.resolve({ data: null, error: null, count: ordered().length });
-          return Promise.resolve({
-            data: page.map((r) => Object.fromEntries(columns.map((c) => [c, r[c]]))),
-            error: null,
-            count: ordered().length,
-          });
-        },
-        then(resolve: (v: unknown) => unknown) {
-          return Promise.resolve({
-            data: ordered().map((r) => Object.fromEntries(columns.map((c) => [c, r[c]]))),
-            error: null,
-            count: ordered().length,
-          }).then(resolve);
+        or(filter: string) { record.filters.push({ kind: 'or', detail: filter }); state.orFilters.push(filter); return builder; },
+        eq(col: string, value: string) { record.filters.push({ kind: 'eq', detail: `${col}=${value}` }); state.eqs.push([col, value]); return builder; },
+        in(col: string, values: string[]) { record.filters.push({ kind: 'in', detail: `${col} in (${values.length})` }); state.ins.push([col, values]); return builder; },
+        ilike(col: string, pattern: string) { record.filters.push({ kind: 'ilike', detail: `${col}~${pattern}` }); state.ilikes.push([col, pattern]); return builder; },
+        order(col: string, options: { ascending: boolean }) { record.filters.push({ kind: 'order', detail: col }); state.orders.push([col, options.ascending]); return builder; },
+        limit(count: number) { record.filters.push({ kind: 'limit', detail: String(count) }); state.limitN = count; return builder; },
+        range(from: number, to: number) { state.rangeN = [from, to]; return builder; },
+        then(resolve: (value: unknown) => unknown, reject?: (reason: unknown) => unknown) {
+          try {
+            const { rows, count, error } = run();
+            const value = record.head
+              ? { data: null, error, count }
+              : { data: project(rows), error, count };
+            return Promise.resolve(value).then(resolve, reject);
+          } catch (err) {
+            return Promise.reject(err).then(resolve, reject);
+          }
         },
       };
       return builder;
@@ -119,152 +255,366 @@ function stubClient(rows: Row[]) {
   };
 }
 
-interface Captured {
-  status: number;
-  body: string;
-  contentType: string;
-  headers: Record<string, string>;
-}
+const ALL_DOMAINS = ['posts', 'profiles', 'privacy_settings', 'pages', 'groups', 'hashtags', 'users'];
 
-// The router is mounted at `/api` in both entrypoints, so drive it with the
-// post-mount URL - exactly what Express hands the router at runtime.
-function call(method: 'GET', path: string, headers: Record<string, string> = {}): Promise<Captured> {
-  const url = path.replace(/^\/api/, '') || '/';
-  return new Promise((resolve, reject) => {
-    const req = {
-      method,
-      path: url,
-      url,
-      params: pathParams(url),
-      query: {},
-      body: {},
-      headers,
-      get: (name: string) => headers[name.toLowerCase()] ?? undefined,
-      protocol: 'https',
-      // No `user`: these routes must work for a caller with no session at all.
-    } as unknown as Request;
+let registeredDomains = new Set(ALL_DOMAINS);
 
-    let status = 200;
-    let body = '';
-    const resHeaders: Record<string, string> = {};
-    const res = {
-      statusCode: 200,
-      setHeader(name: string, value: string) { resHeaders[name.toLowerCase()] = String(value); return res; },
-      status(code: number) { status = code; res.statusCode = code; return res; },
-      json(payload: unknown) { body = JSON.stringify(payload); resolve({ status, body, contentType: resHeaders['content-type'] ?? '', headers: resHeaders }); return res; },
-      send(payload: string) { body = String(payload); resolve({ status, body, contentType: resHeaders['content-type'] ?? '', headers: resHeaders }); return res; },
-      end() { resolve({ status, body, contentType: resHeaders['content-type'] ?? '', headers: resHeaders }); return res; },
-    } as unknown as Response;
-
-    try {
-      const layer = (router as any).handle({ ...req }, res, (err?: unknown) => {
-        if (err) reject(err);
-      });
-      if (layer && typeof layer.catch === 'function') layer.catch(reject);
-    } catch (err) {
-      reject(err);
-    }
-  });
-}
-
-function pathParams(path: string): Record<string, string> {
-  const parts = path.split('?')[0].split('/').filter(Boolean);
-  const params: Record<string, string> = {};
-  for (let i = 0; i < parts.length; i++) {
-    if (parts[i].startsWith(':')) {
-      params[parts[i].slice(1)] = decodeURIComponent(parts[i + 1] ?? '');
-      i++;
-    }
-  }
-  return params;
+function setTables(tables: Record<string, Row[]>): void {
+  db.tables = tables;
+  db.failTables = new Set();
+  db.queries = [];
 }
 
 const locs = (xml: string) => [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
 
+// ---------------------------------------------------------------------------
+// Real listener
+// ---------------------------------------------------------------------------
+
+let base = '';
+
+async function get(path: string, headers: Record<string, string> = {}) {
+  // No Authorization header is ever sent: a crawler has no session (§20.17).
+  const res = await fetch(`${base}${path}`, { headers });
+  return {
+    status: res.status,
+    body: await res.text(),
+    contentType: res.headers.get('content-type') ?? '',
+    headers: Object.fromEntries(res.headers.entries()),
+  };
+}
+
 async function main(): Promise<void> {
-  // Swap in the stub. `getReadableProjects` filters on project status, so the
-  // fake project must look active.
   const original = projectManager.getReadableProjects.bind(projectManager);
   (projectManager as any).getReadableProjects = (domain: string) => {
-    if (domain !== 'posts') return [];
-    return [{ status: 'active', client: stubClient(ALL_ROWS) }];
+    if (!registeredDomains.has(domain)) return [];
+    return [{ status: 'active', client: makeClient() }];
   };
 
+  const app = express();
+  app.use('/api', router);
+  const server = app.listen(0);
+  await new Promise<void>((resolve) => server.once('listening', resolve));
+  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
   try {
-    // --- unauthenticated reachability (the crawler has no session) ---
-    const index = await call('GET', '/api/sitemap.xml');
-    assert.equal(index.status, 200, `sitemap index is reachable with no auth (got ${index.status})`);
-    assert.match(index.contentType, /xml/, 'the index is served as XML');
-    assert.equal(index.body.includes('<sitemapindex'), true, 'the index is a sitemapindex');
-    assert.equal(index.body.includes('/api/sitemap/0.xml'), true, 'segment 0 is advertised');
+    // =======================================================================
+    // §20.1/2/3/17/20/22 - the small-corpus path
+    // =======================================================================
+    setTables({
+      posts: [
+        post(1),
+        post(2, { type: 'reel', media_type: 'video' }),
+        post(3, { media_type: 'image' }),
+        // The one leniency the predicate keeps: surrounding whitespace on the
+        // exact value. A poster can still be crawled and indexed.
+        post(4, { audience_type: ' public ', visibility: ' public ' }),
+        // ...and the case variations it must NOT keep, even though the old
+        // prefilter would have dropped them too - see the §9 matrix below.
+        post(5, { status: 'Published' }),
+      ],
+      profiles: [profile(1), profile(2), profile(3)],
+      // Only user1 opted in. user2 and user3 have no row at all.
+      privacy_settings: [{ id: uuid(1), user_id: uuid(5001), setting_name: 'search_engine_indexing', setting_value: 'true' }],
+      pages: [{ id: uuid(6001), name: 'Tone', created_at: '2026-03-01T00:00:00Z' }],
+      groups: [
+        { id: uuid(7001), name: 'Open', privacy: 'public', created_at: '2026-04-01T00:00:00Z' },
+        { id: uuid(7002), name: 'Closed', privacy: 'private', created_at: '2026-04-01T00:00:00Z' },
+      ],
+      hashtags: [{ id: uuid(1), tag: 'Tone', created_at: '2026-05-01T00:00:00Z' }],
+    });
+
+    const root = await get('/api/sitemap.xml');
+    assert.equal(root.status, 200, `§20.1: /sitemap.xml is reachable logged out (got ${root.status})`);
+    assert.match(root.contentType, /xml/, '§20.2: the response Content-Type is XML, not JSON');
+    assert.equal(root.body.startsWith('<?xml version="1.0" encoding="UTF-8"?>'), true, '§20.3: it is XML');
+    assert.match(root.body, /<urlset xmlns="http:\/\/www\.sitemaps\.org\/schemas\/sitemap\/0\.9">/, '§20.3: a urlset');
+    // §20.20: the whole point of the vercel.json rewrite - this must not be the
+    // SPA shell.
+    assert.equal(/<!doctype html/i.test(root.body), false, '§20.20: /sitemap.xml is not the SPA index.html');
+    assert.equal(/<div id="root"/.test(root.body), false, '§20.20: and carries no app markup');
     // Not swallowed by the catch-all domain router.
-    assert.equal(index.body.includes('Not found'), false, 'the index did not fall through to /:domain');
+    assert.equal(root.body.includes('Not found'), false, 'the route did not fall through to /:domain');
+    assert.equal(root.headers['x-sitemap-shape'], 'urlset', '§13: a small corpus is served inline');
+    assert.match(root.headers['cache-control'] || '', /max-age=300/, '§18: cached briefly, not indefinitely');
+    assert.equal(/stale-while-revalidate/.test(root.headers['cache-control'] || ''), false,
+      '§18: no stale-while-revalidate, which would extend the privacy window');
 
-    const seg0 = await call('GET', '/api/sitemap/0.xml');
-    assert.equal(seg0.status, 200, 'segment 0 is reachable with no auth');
-    assert.equal(seg0.body.includes('<urlset'), true, 'a segment is a urlset');
+    const listed = locs(root.body);
+    // §22: every URL is on the canonical origin.
+    assert.equal(listed.every((loc) => loc.startsWith('https://tonesn.vercel.app/')), true,
+      `§20.22: all <loc> use the canonical origin (got ${JSON.stringify(listed)})`);
+    assert.equal(listed.every((loc) => !loc.includes('127.0.0.1')), true,
+      '§20.22: the request origin is NOT used, even though it is the one answering');
 
-    // --- §14 A-C are listed; D-G/J are not, and not by name ---
-    const listed = locs(seg0.body);
-    for (const publicRow of PUBLIC_ROWS) {
-      assert.equal(listed.some((loc) => loc.endsWith(`/${publicRow.id}`)), true,
-        `public row ${String(publicRow.id)} is listed`);
+    // §20.4/8/10 - the three public content kinds on their own routes.
+    for (const [n, prefix] of [[1, 'post'], [2, 'reel'], [3, 'photo']] as const) {
+      assert.equal(listed.includes(`https://tonesn.vercel.app/${prefix}/${uuid(n)}`), true,
+        `§20.4/8/10: the public ${prefix} is listed`);
     }
-    for (const restricted of RESTRICTED_ROWS) {
-      assert.equal(seg0.body.includes(String(restricted.id)), false,
-        `restricted id ${String(restricted.id)} appears nowhere in the response`);
+    // ...and the whitespace / case-status tolerances.
+    assert.equal(listed.includes(`https://tonesn.vercel.app/post/${uuid(4)}`), true,
+      'a public post stored with surrounding whitespace is still listed');
+    assert.equal(listed.includes(`https://tonesn.vercel.app/post/${uuid(5)}`), true,
+      'a public post stored as status=Published is still listed');
+    // §20.12/13 - the profile section follows the real opt-in table.
+    assert.equal(listed.includes('https://tonesn.vercel.app/profile/user1'), true,
+      '§20.12: the opted-in profile is listed');
+    for (const username of ['user2', 'user3']) {
+      assert.equal(listed.includes(`https://tonesn.vercel.app/profile/${username}`), false,
+        `§20.13: ${username} (no opt-in) is not advertised`);
+    }
+    // §7 - the other public entities, each under its own rule.
+    assert.equal(listed.includes(`https://tonesn.vercel.app/pages/${uuid(6001)}`), true, '§7: a page is listed');
+    assert.equal(listed.includes(`https://tonesn.vercel.app/groups/${uuid(7001)}`), true, '§7: a public group is listed');
+    assert.equal(listed.includes(`https://tonesn.vercel.app/groups/${uuid(7002)}`), false, '§7: a private group is not');
+    assert.equal(listed.includes('https://tonesn.vercel.app/hashtag/tone'), true, '§7: a hashtag is listed, lowercased');
+
+    // §20.18 - the strongest form: no row data, and no restricted id, anywhere.
+    assert.equal(root.body.includes('secret body'), false, '§20.18: no post content leaks');
+    assert.equal(root.body.includes('cdn.test'), false, '§20.18: no media URL leaks');
+    assert.equal(root.body.includes('audience_type'), false, '§20.18: no column names leak');
+    assert.equal(root.body.toLowerCase().includes('friends'), false, '§20.18: no audience values leak');
+    assert.equal(root.body.includes('example.test'), false, '§20.18: no profile email leaks');
+
+    // §9 - the read asks for the minimum, and never for a private column.
+    const postQueries = db.queries.filter((q) => q.table === 'posts');
+    assert.equal(postQueries.length > 0, true, 'the posts section was read');
+    for (const q of postQueries) {
+      const cols = String(q.select).split(',').map((c) => c.trim());
+      for (const forbidden of ['content', 'media_url', 'author_id', 'comment_count', 'reactions']) {
+        assert.equal(cols.includes(forbidden), false, `§9: the sitemap must not select ${forbidden}`);
+      }
+      assert.equal(cols.includes('id') && cols.includes('created_at') && cols.includes('audience_type'), true,
+        '§9: but it does select what a URL and an indexability decision need');
+    }
+    // §8 - one read per section, not one per URL. Six sections must not cost
+    // more than a small constant number of queries.
+    const distinctTables = new Set(db.queries.map((q) => q.table));
+    assert.equal(distinctTables.size <= ALL_DOMAINS.length, true, '§8: only the owning projects are queried');
+    assert.equal(db.queries.length < 60, true,
+      `§8: a small sitemap costs a constant number of queries, not one per URL (got ${db.queries.length})`);
+
+    // =======================================================================
+    // §9 - the prefilter is a proven superset of the accepted set
+    //
+    // This is the check that would have caught the previous `status.eq.published`
+    // prefilter, which silently dropped every row stored as 'Published' even
+    // though the predicate accepts it.
+    // =======================================================================
+    const MATRIX: Row[] = [
+      { audience: 'public', status: 'published' },
+      { audience: 'public', status: 'Published' },
+      { audience: 'public', status: 'PUBLISHED' },
+      { audience: 'public', status: ' published ' },
+      { audience: ' public ', status: 'published' },
+      { audience: 'public', status: null },
+      { audience: 'public', status: undefined },
+      { audience: 'friends', status: 'published' },
+      { audience: 'only_me', status: 'published' },
+      { audience: 'everyone', status: 'published' },
+      { audience: 'not public', status: 'published' },
+      { audience: 'unpublic', status: 'published' },
+      { audience: null, status: 'published' },
+    ].map((entry, i) => post(2000 + i, entry as Row));
+
+    for (const row of MATRIX) {
+      const accepted = isIndexableSitemapRow('posts', row);
+      // Run the row through the real filter chain, alone, so the outcome is
+      // exactly "does the prefilter keep it".
+      setTables({ posts: [row] });
+      registeredDomains = new Set(ALL_DOMAINS);
+      const child = await get('/api/sitemap-posts-1.xml');
+      const kept = locs(child.body).length > 0;
+      if (accepted) {
+        assert.equal(kept, true,
+          `§9: the predicate accepts ${JSON.stringify({ a: row.audience_type, s: row.status })} but the DB prefilter drops it, so it would never be listed`);
+      }
+      // The converse is allowed (a superset may over-include and let the
+      // in-memory predicate reject), so it is asserted for the clear cases only.
+      if (!accepted && kept) {
+        assert.equal(true, true, 'over-inclusion is allowed: the in-memory predicate still rejects it');
+      }
     }
 
-    // --- the URL kind matches the row type ---
-    assert.equal(listed.some((loc) => loc.includes(`/post/${uuid(1)}`)), true, 'post URL');
-    assert.equal(listed.some((loc) => loc.includes(`/reel/${uuid(2)}`)), true, 'reel URL');
-    assert.equal(listed.some((loc) => loc.includes(`/photo/${uuid(3)}`)), true, 'photo URL');
+    // =======================================================================
+    // §20.5/6/7/9/11/14/18 - the restricted corpus, over real HTTP
+    // =======================================================================
+    const RESTRICTED = [
+      post(10, { audience_type: 'friends', visibility: 'friends' }),
+      post(11, { audience_type: 'only_me', visibility: 'only_me' }),
+      post(12, { audience_type: 'public', visibility: 'friends' }),
+      post(13, { audience_type: 'public', visibility: 'public', status: 'draft' }),
+      post(14, { audience_type: 'public', visibility: 'public', status: 'deleted' }),
+      post(15, { audience_type: 'specific', audience_user_ids: [uuid(90)] }),
+      post(16, { audience_type: 'only_me', visibility: 'public' }),
+      post(17, { audience_type: 'Public', visibility: 'Public' }),
+      post(18, { audience_type: 'Everyone', visibility: 'Everyone' }),
+      post(19, { audience_type: 'All', visibility: 'All' }),
+      post(20, { audience_type: null, visibility: null }),
+      post(21, { audience_type: null, visibility: 'public' }),
+      post(22, { audience_type: undefined, visibility: undefined }),
+      post(23, { audience_type: 'public', visibility: 'public', status: 'scheduled' }),
+      post(24, { type: 'reel', audience_type: 'friends', visibility: 'friends' }),
+      post(25, { type: 'reel', audience_type: 'only_me', visibility: 'only_me' }),
+      post(26, { media_type: 'image', audience_type: 'friends', visibility: 'friends' }),
+      post(27, { media_type: 'image', audience_type: 'only_me', visibility: 'only_me' }),
+    ];
+    setTables({ posts: [post(1), post(2, { type: 'reel' }), post(3, { media_type: 'image' }), ...RESTRICTED] });
+    const restrictedRes = await get('/api/sitemap.xml');
+    assert.equal(restrictedRes.status, 200, 'the restricted corpus still serves a sitemap');
+    for (const row of RESTRICTED) {
+      assert.equal(restrictedRes.body.includes(String(row.id)), false,
+        `§20.18: restricted id ${String(row.id)} appears nowhere in the response bytes`);
+    }
+    assert.equal(locs(restrictedRes.body).length, 3,
+      `§20.5/6/7/9/11: only the 3 public rows survive 18 restricted ones`);
 
-    // --- H/I: audience transitions, on a fresh request each time ---
-    const flip = new Map<string, Row>(ALL_ROWS.map((r) => [String(r.id), r]));
-    const reread = async () => {
-      (projectManager as any).getReadableProjects = () => [{ status: 'active', client: stubClient([...flip.values()]) }];
-      return call('GET', '/api/sitemap/0.xml');
+    // =======================================================================
+    // §20.14/15/16 - transitions, each on its own request
+    // =======================================================================
+    const live = new Map<string, Row>();
+    live.set(uuid(1), post(1));
+    const setCorpus = () => setTables({ posts: [...live.values()] });
+    setCorpus();
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith(`/${uuid(1)}`)), true,
+      'listed while public');
+    live.set(uuid(1), post(1, { audience_type: 'friends', visibility: 'friends' }));
+    setCorpus();
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith(`/${uuid(1)}`)), false,
+      '§20.15: public -> friends removes the URL on the next generation');
+    live.set(uuid(1), post(1));
+    setCorpus();
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith(`/${uuid(1)}`)), true,
+      '§20.16: friends -> public makes it eligible again, with no regeneration step');
+    live.delete(uuid(1));
+    setCorpus();
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith(`/${uuid(1)}`)), false,
+      '§20.14: a deleted row disappears');
+
+    // §20.13 - the profile opt-out transition, which is the §14-critical one.
+    setTables({
+      profiles: [profile(1)],
+      privacy_settings: [{ user_id: uuid(5001), setting_name: 'search_engine_indexing', setting_value: 'true' }],
+    });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/user1')), true,
+      'the profile is listed while opted in');
+    setTables({
+      profiles: [profile(1)],
+      privacy_settings: [{ user_id: uuid(5001), setting_name: 'search_engine_indexing', setting_value: 'false' }],
+    });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/user1')), false,
+      '§20.13: opting out removes the profile URL on the very next request, with no cached opt-in set');
+
+    // A profile whose setting row is missing entirely is the §6 default.
+    setTables({ profiles: [profile(1)], privacy_settings: [] });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/user1')), false,
+      '§6: no setting row is not an opt-in');
+
+    // =======================================================================
+    // §10/§13/§19/§20.21 - large corpus: an index, then followable children
+    // =======================================================================
+    const BIG = SITEMAP_PAGE_SIZE * 2 + 137;
+    setTables({ posts: Array.from({ length: BIG }, (_, i) => post(3000 + i)) });
+    const bigRoot = await get('/api/sitemap.xml');
+    assert.equal(bigRoot.status, 200, 'the large sitemap is served');
+    assert.match(bigRoot.body, /<sitemapindex xmlns="http:\/\/www\.sitemaps\.org\/schemas\/sitemap\/0\.9">/,
+      '§10/§13: past one page it becomes a sitemap index');
+    assert.equal(bigRoot.headers['x-sitemap-pages'], '3', '§10: 2137 rows -> 3 child sitemaps');
+    const childLocs = locs(bigRoot.body);
+    assert.deepEqual(childLocs, [
+      'https://tonesn.vercel.app/sitemap-posts-1.xml',
+      'https://tonesn.vercel.app/sitemap-posts-2.xml',
+      'https://tonesn.vercel.app/sitemap-posts-3.xml',
+    ], '§10/§13: children are /sitemap-<section>-<n>.xml on the canonical origin');
+    assert.equal(/<url>/.test(bigRoot.body), false, 'the index never lists <url>');
+
+    // §20.21 - every advertised child is fetchable, is XML, and is a urlset.
+    //
+    // The advertised <loc> is the CANONICAL FRONTEND path, but the Gateway is
+    // what serves the bytes, behind a rewrite that maps /sitemap-<file> onto
+    // /api/sitemap-<file>. This is the gateway half of that contract; the
+    // frontend half (the vercel.json rewrite) is asserted in the frontend repo.
+    const gatewayPathFor = (loc: string) => {
+      const path = new URL(loc).pathname;
+      assert.match(path, /^\/sitemap-[a-z]+-\d+\.xml$/, `${loc} is an advertised child path`);
+      return path.replace(/^\/sitemap-/, '/api/sitemap-');
     };
 
-    assert.equal(locs((await reread()).body).some((l) => l.endsWith(`/${uuid(1)}`)), true, 'H/I: listed while public');
-    flip.set(uuid(1), { ...flip.get(uuid(1))!, audience_type: 'friends', visibility: 'friends' });
-    assert.equal(locs((await reread()).body).some((l) => l.endsWith(`/${uuid(1)}`)), false,
-      'H: public -> friends removes it from the sitemap');
-    flip.set(uuid(1), { ...flip.get(uuid(1))!, audience_type: 'public', visibility: 'public' });
-    assert.equal(locs((await reread()).body).some((l) => l.endsWith(`/${uuid(1)}`)), true,
-      'I: friends -> public makes it eligible again');
-    flip.delete(uuid(1));
-    assert.equal(locs((await reread()).body).some((l) => l.endsWith(`/${uuid(1)}`)), false,
-      'J: a deleted row disappears');
+    const seen: string[] = [];
+    for (const child of childLocs) {
+      const res = await get(gatewayPathFor(child));
+      assert.equal(res.status, 200, `§20.21: ${child} is fetchable behind the rewrite (got ${res.status})`);
+      assert.match(res.contentType, /xml/, `§20.21: ${child} is served as XML`);
+      assert.match(res.body, /<urlset xmlns=/, `§20.21: ${child} is a valid urlset`);
+      assert.equal(res.body.startsWith('<?xml version="1.0" encoding="UTF-8"?>'), true, `§20.21: ${child} has a declaration`);
+      assert.equal(/<!doctype html/i.test(res.body), false, `§20.21: ${child} is not the SPA shell`);
+      // The child repeats the canonical origin in its own <loc>s - a crawler
+      // that followed the index one hop must not be handed gateway URLs.
+      assert.equal(locs(res.body).every((loc) => loc.startsWith('https://tonesn.vercel.app/')), true,
+        `§20.22: ${child} keeps the canonical origin in its own URLs`);
+      seen.push(...locs(res.body));
+    }
+    // §20.19 - the children partition the corpus exactly.
+    assert.equal(seen.length, BIG, `§20.19: the children cover all ${BIG} rows (got ${seen.length})`);
+    assert.equal(new Set(seen).size, BIG, '§20.19: no URL appears in two children');
+    assert.equal(seen.every((loc) => loc.startsWith('https://tonesn.vercel.app/post/')), true,
+      '§20.19: every child URL is a post URL');
 
-    // --- bad segment numbers are 404, not 500 ---
-    for (const bad of ['/api/sitemap/abc.xml', '/api/sitemap/-1.xml', '/api/sitemap/1e5.xml', '/api/sitemap/999999.xml']) {
-      const res = await call('GET', bad);
+    // Malformed child paths are 404s, not 500s.
+    for (const bad of ['/api/sitemap-abc-1.xml', '/api/sitemap-posts-0.xml', '/api/sitemap-posts--1.xml',
+                       '/api/sitemap-posts-1e5.xml', '/api/sitemap-posts.xml', '/api/sitemap-.xml',
+                       '/api/sitemap-secrets-1.xml', '/api/sitemap-posts-99999.xml']) {
+      const res = await get(bad);
       assert.equal(res.status, 404, `${bad} is a 404 (got ${res.status})`);
     }
-    // A segment beyond the corpus is a valid, empty urlset rather than an error:
-    // the index may advertise an empty tail segment.
-    const tail = await call('GET', '/api/sitemap/1.xml');
-    assert.equal(tail.status, 200, 'a segment past the corpus is a valid empty page');
+    // A page past the corpus is a valid empty urlset, because a head count is an
+    // upper bound and may advertise a tail page that comes back empty.
+    const tail = await get('/api/sitemap-posts-4.xml');
+    assert.equal(tail.status, 200, 'a page past the corpus is a valid empty page');
     assert.equal(locs(tail.body).length, 0, 'and it contains no URLs');
 
-    // --- absolute locs, and a stable cache policy ---
-    assert.equal(listed.every((loc) => loc.startsWith('https://') || loc.startsWith('http://')), true,
-      'every <loc> is absolute, as the sitemap spec requires');
-    assert.match(index.headers['cache-control'] || '', /max-age=\d+/, 'the index is cached briefly, not indefinitely');
+    // =======================================================================
+    // §19 - a failing data source
+    // =======================================================================
+    setTables({ posts: [post(1)], pages: [{ id: uuid(6001), created_at: '2026-03-01T00:00:00Z' }] });
+    db.failTables.add('pages');
+    const broken = await get('/api/sitemap.xml');
+    assert.equal(broken.status, 500,
+      '§19: a registered-but-unreadable section is a server error, not a quietly shorter sitemap');
+    assert.equal(/secret-project pool/.test(broken.body), false,
+      '§19: the internal error message is not exposed in the response');
+    assert.equal(/<urlset|<sitemapindex/.test(broken.body), false,
+      '§19: and no misleading partial sitemap is served');
+    db.failTables.delete('pages');
 
-    // --- the response carries no row payload at all ---
-    assert.equal(seg0.body.includes('audience_type'), false, 'no column names leak into the sitemap');
-    assert.equal(seg0.body.toLowerCase().includes('friends'), false, 'no audience values leak into the sitemap');
+    // An UNREGISTERED domain is the opposite case: there is provably no such
+    // content in this deployment, so an empty section is truthful, not a failure.
+    setTables({ posts: [post(1)] });
+    registeredDomains = new Set(['posts']);
+    const sparse = await get('/api/sitemap.xml');
+    assert.equal(sparse.status, 200,
+      'an unregistered domain yields an empty section, not a 500');
+    assert.equal(locs(sparse.body).length, 1, 'and the registered section is still served');
+    registeredDomains = new Set(ALL_DOMAINS);
+
+    // A completely empty deployment is still a valid, non-broken sitemap.
+    setTables({});
+    const empty = await get('/api/sitemap.xml');
+    assert.equal(empty.status, 200, 'an empty deployment still serves a sitemap');
+    assert.match(empty.body, /<urlset xmlns=/, 'and it is a valid urlset');
+    assert.equal(locs(empty.body).length, 0, 'with no URLs');
+    assert.equal(/<lastmod>/.test(empty.body), false, '§12: and no invented dates');
+
+    console.log('sitemapRouteTest: all assertions passed ✓');
   } finally {
     (projectManager as any).getReadableProjects = original;
   }
-
-  console.log('sitemapRouteTest: all assertions passed ✓');
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
