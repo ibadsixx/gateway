@@ -512,6 +512,59 @@ async function main(): Promise<void> {
     assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith(`/${uuid(1)}`)), false,
       '§20.14: a deleted row disappears');
 
+    // =======================================================================
+    // do.md §10 B/F/L/M - creation, Only Me, and the "no deployment" framing
+    //
+    // The transitions above mutate and remove a row that already existed. These
+    // cover the two cases that were missing: a post that did not exist at all
+    // before the request, and the Only Me audience as a transition rather than
+    // as a static corpus entry.
+    //
+    // L and M are not separate mechanisms, they are the SAME code path observed
+    // across separate requests to one already-running process. There is no
+    // restart, no rebuild, no regeneration call and no write to any sitemap
+    // store between the requests below - the only thing that changes is the rows
+    // the database returns. That is the whole claim, so it is asserted as such.
+    // =======================================================================
+    const FRESH = 9100;
+    setTables({ posts: [] });
+    const before = await get('/api/sitemap.xml');
+    assert.equal(before.status, 200, 'B: an empty corpus still serves a sitemap');
+    assert.equal(locs(before.body).some((l) => l.endsWith(`/${uuid(FRESH)}`)), false,
+      'B/L: the post URL is NOT present before it is created');
+
+    // The insert. Nothing else in this process changes.
+    setTables({ posts: [post(FRESH)] });
+    const after = await get('/api/sitemap.xml');
+    assert.equal(locs(after.body).some((l) => l.endsWith(`/${uuid(FRESH)}`)), true,
+      'B/L: a newly created public post is listed on the very next request, with no deployment');
+    assert.equal(locs(after.body).includes(`https://tonesn.vercel.app/post/${uuid(FRESH)}`), true,
+      'B: at its exact canonical URL');
+
+    // F: public -> Only Me, as a transition.
+    setTables({ posts: [post(FRESH, { audience_type: 'only_me', visibility: 'only_me' })] });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith(`/${uuid(FRESH)}`)), false,
+      'F: public -> only_me removes the URL on the next request');
+
+    // M: and the delete, with no deployment, closing the lifecycle.
+    setTables({ posts: [] });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith(`/${uuid(FRESH)}`)), false,
+      'M: a deleted post is gone on the next request, with no deployment');
+
+    // I: the soft-delete states, reached the way a tombstone would reach them.
+    // Tone has no soft delete - `deletePost` is a hard `from('posts').delete()`
+    // and the column is CHECK-constrained to three literals - so these are the
+    // states a tombstone could occupy, and all of them must stay out.
+    for (const tombstone of ['draft', 'scheduled', 'deleted', 'archived', null]) {
+      setTables({ posts: [post(FRESH, { audience_type: 'public', visibility: 'public', status: tombstone })] });
+      assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith(`/${uuid(FRESH)}`)), false,
+        `I: a row marked ${JSON.stringify(tombstone)} is excluded`);
+    }
+    // ...and the control, so the block above cannot pass by excluding everything.
+    setTables({ posts: [post(FRESH)] });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith(`/${uuid(FRESH)}`)), true,
+      'I: the control row is still listed, so the exclusions above are specific');
+
     // §20.13 - the profile opt-out transition, which is the §14-critical one.
     setTables({
       profiles: [profile(1)],
