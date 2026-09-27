@@ -201,6 +201,85 @@ async function main(): Promise<void> {
   assert.equal(redacted.profile_pic, 'https://media/pic.jpg', 'profile_pic is kept');
   assert.equal((redacted as GuestReadableRow).email_visibility, 'private', 'visibility flags stay intact for UI gating');
 
+  // --- visibility casing (do.md: public profile / guest privacy) ---
+  // The six columns CHECK-constrained to Title Case can only ever store
+  // 'Public' / 'Friends' / 'Private'. A case-sensitive `=== 'public'` never
+  // matched them, so an owner who had marked a field Public still had it
+  // redacted from every guest. Verified against production data: every
+  // profiles row stored phone/websites/gender/pronouns/birth_date/birth_year
+  // visibility as 'Public' and all six fields were withheld from guests.
+  const titleCasePublic: GuestReadableRow = {
+    id: 'u2',
+    username: 'bob',
+    phone_number: '+44',
+    phone_visibility: 'Public',
+    websites_social_links: ['https://b.example'],
+    websites_visibility: 'Public',
+    gender: 'nonbinary',
+    gender_visibility: 'Public',
+    pronouns: 'they/them',
+    pronouns_visibility: 'Public',
+    birth_date: '1991-02-03',
+    birth_date_visibility: 'Public',
+    birth_year: '1991',
+    birth_year_visibility: 'Public',
+  };
+  const titleCaseRedacted = stripPrivateProfileFields(titleCasePublic);
+  assert.equal(titleCaseRedacted.phone_number, '+44', "Title Case 'Public' phone is kept for a guest");
+  assert.deepEqual(
+    titleCaseRedacted.websites_social_links,
+    ['https://b.example'],
+    "Title Case 'Public' websites are kept for a guest"
+  );
+  assert.equal(titleCaseRedacted.gender, 'nonbinary', "Title Case 'Public' gender is kept for a guest");
+  assert.equal(titleCaseRedacted.pronouns, 'they/them', "Title Case 'Public' pronouns are kept for a guest");
+  assert.equal(titleCaseRedacted.birth_date, '1991-02-03', "Title Case 'Public' birth_date is kept for a guest");
+  assert.equal(titleCaseRedacted.birth_year, '1991', "Title Case 'Public' birth_year is kept for a guest");
+
+  // The same Title Case columns, marked non-public, must still be withheld.
+  const titleCasePrivate = stripPrivateProfileFields({
+    ...titleCasePublic,
+    phone_visibility: 'Friends',
+    websites_visibility: 'Private',
+    gender_visibility: 'Only_Me',
+    birth_year_visibility: 'FRIENDS',
+  });
+  assert.equal(titleCasePrivate.phone_number, null, "Title Case 'Friends' phone is stripped");
+  assert.equal(titleCasePrivate.websites_social_links, null, "Title Case 'Private' websites are stripped");
+  assert.equal(titleCasePrivate.gender, null, "Title Case 'Only_Me' gender is stripped");
+  assert.equal(titleCasePrivate.birth_year, null, "Title Case 'FRIENDS' birth_year is stripped");
+  // Untouched columns keep the lower-case behaviour.
+  assert.equal(titleCasePrivate.pronouns, 'they/them', "Title Case 'Public' pronouns still kept");
+  assert.equal(titleCasePrivate.birth_date, '1991-02-03', "Title Case 'Public' birth_date still kept");
+  // An unrecognised value fails closed, matching the audience evaluator.
+  assert.equal(
+    stripPrivateProfileFields({ ...titleCasePublic, phone_visibility: 'everyone-ish' }).phone_number,
+    null,
+    'an unknown visibility value is stripped (fail closed)'
+  );
+
+  // --- a field with no visibility column of its own ---
+  // `birthday` is a date of birth that PROFILE_VISIBILITY_PAIRS never covered,
+  // so it was returned verbatim to every guest and shown on public profiles.
+  // It has no gating column, and its only readers are the owner's own
+  // settings/privacy-checkup screens, so it is private outright.
+  const withBirthday = stripPrivateProfileFields({
+    id: 'u3',
+    username: 'carol',
+    birthday: '1998-07-02',
+    display_name: 'Carol',
+  } as GuestReadableRow);
+  assert.equal(withBirthday.birthday, null, 'birthday is always stripped from a guest read');
+  assert.equal(withBirthday.display_name, 'Carol', 'the rest of the profile is untouched');
+  // The redaction is a nulled field, not a dropped row: the guest still gets a
+  // valid object it can render.
+  assert.equal(withBirthday.id, 'u3', 'the row itself is still returned to a guest');
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(withBirthday, 'username'),
+    true,
+    'public profile fields are still present'
+  );
+
   // --- parent-scoped rows ---
   const publicPostClient = fakeClient([PUBLISHED_PUBLIC_POST]);
   const likesOnPublic = [

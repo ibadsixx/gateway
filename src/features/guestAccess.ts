@@ -112,9 +112,10 @@ export function isGuestGroupVisible(group: GuestReadableRow | null | undefined):
 
 // --- profiles ---
 // Fields gated by a *_visibility column are public to a guest only when that
-// column is exactly 'public' (absent visibility defaults to public, mirroring
-// the app's own viewer display forms). Fields that gate account/settings data
-// and have no visibility column are never handed to a guest.
+// column says 'public' (an absent visibility column defaults to public,
+// mirroring the app's own viewer display forms). Fields that gate
+// account/settings data and have no visibility column are never handed to a
+// guest.
 const PROFILE_VISIBILITY_PAIRS: ReadonlyArray<[field: string, visibilityCol: string]> = [
   ['about_you', 'about_you_visibility'],
   ['birth_date', 'birth_date_visibility'],
@@ -135,6 +136,26 @@ const PROFILE_VISIBILITY_PAIRS: ReadonlyArray<[field: string, visibilityCol: str
   ['name_pronunciation', 'name_pronunciation_visibility'],
 ];
 
+/**
+ * Whether a `*_visibility` cell grants guest visibility.
+ *
+ * The columns do not agree on casing. Six of them — `phone_visibility`,
+ * `websites_visibility`, `gender_visibility`, `pronouns_visibility`,
+ * `birth_date_visibility` and `birth_year_visibility` — are CHECK-constrained to
+ * Title Case and therefore only ever store `'Public'` / `'Friends'` /
+ * `'Private'`, while the rest store lowercase. A case-sensitive `=== 'public'`
+ * could never match those six, so an owner who had deliberately marked a field
+ * Public still had it redacted from every guest. Compare the same way the
+ * client does (the app's `normalizeVisibilityValue`): case- and
+ * whitespace-insensitive.
+ */
+function visibilityGrantsGuestAccess(value: unknown): boolean {
+  // No visibility column at all means the field was never gated, so it stays
+  // as-is — the pairing above is what decides whether it is gated.
+  if (value == null) return true;
+  return String(value).trim().toLowerCase().replace(/\s+/g, '_') === 'public';
+}
+
 // Always-private profile fields a logged-out visitor must never receive,
 // regardless of any visibility column.
 const PROFILE_ALWAYS_PRIVATE: ReadonlyArray<string> = [
@@ -146,14 +167,20 @@ const PROFILE_ALWAYS_PRIVATE: ReadonlyArray<string> = [
   'check_keys_in_conversations',
   'show_read_indicator',
   'disable_auto_uploads',
+  // A date of birth with no visibility column of its own, so the pairing above
+  // can never redact it. Left out of PROFILE_VISIBILITY_PAIRS it was returned
+  // verbatim to every guest, and no guest-facing surface renders it — the only
+  // readers are the owner's own settings and privacy-checkup screens, which
+  // read their own authenticated row. Absent a column that can gate it, it is
+  // private.
+  'birthday',
 ];
 
 export function stripPrivateProfileFields(row: GuestReadableRow): GuestReadableRow {
   const redacted = { ...row };
   for (const [field, visCol] of PROFILE_VISIBILITY_PAIRS) {
     if (redacted[field] == null) continue;
-    const visibility = redacted[visCol];
-    if (visibility != null && visibility !== 'public') {
+    if (!visibilityGrantsGuestAccess(redacted[visCol])) {
       redacted[field] = null;
     }
   }

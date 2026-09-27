@@ -91,7 +91,13 @@ class RoutingService {
     return RetryEngine.execute(async () => {
       const { data, error } = await client.from(domain).select('*').eq('id', id).single();
       if (error) {
-        if ((error as { code?: string }).code === 'PGRST116') return null;
+        const code = (error as { code?: string }).code;
+        // PGRST116 is PostgREST's "zero rows". 22P02 is 'invalid input syntax
+        // for type uuid' — a malformed id, which can never match a row and so
+        // is a missing row too. Both answer 404 rather than a 500, so a bad id
+        // in the path reports itself as not-found like every other absent row
+        // instead of a server fault.
+        if (code === 'PGRST116' || code === '22P02') return null;
         return Promise.reject(new Error(`Read error: ${error.message}`));
       }
       metricsService.record('db.read.duration', Date.now() - start, { domain });
