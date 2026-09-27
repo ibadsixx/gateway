@@ -11,6 +11,19 @@
 // with the reaction table.
 
 import { isGuestPostVisible } from './guestAccess';
+import {
+  isPublicAudience,
+  isPublishedContent,
+  resolveContentAudience,
+} from './contentAudience';
+
+// Re-exported for the existing importers (`./reactionUsers` is the historical
+// home of the audience vocabulary). See the note at the definition site.
+export {
+  DENIED_AUDIENCE,
+  canonicalAudienceType,
+  resolveContentAudience,
+} from './contentAudience';
 
 export type ReactionContentType = 'post' | 'comment';
 export type ReactionVisibility = 'public' | 'friends' | 'friends_of_friends' | 'only_me';
@@ -631,62 +644,11 @@ function stringArray(value: unknown): string[] {
   return [];
 }
 
-// Canonical audience for a content row. `null` means "the field carried no
-// value" (so a caller may fall back to another column); `DENIED` means "the
-// value was present but unrecognized" and must fail closed rather than be
-// treated as public. Aliases are accepted because the same audience has been
-// written as `friends`, `Friends`, `friends_only` and `friends-only` over time.
-export const DENIED_AUDIENCE = 'denied';
-
-export function canonicalAudienceType(value: unknown): string | null {
-  if (value === null || value === undefined) return null;
-  const raw = String(value).trim().toLowerCase();
-  if (raw === '') return null;
-  switch (raw.replace(/[\s-]+/g, '_')) {
-    case 'public':
-    case 'everyone':
-    case 'anyone':
-    case 'all':
-      return 'public';
-    case 'friends':
-    case 'friend':
-    case 'ally':
-    case 'allies':
-    case 'friends_only':
-    case 'followers':
-      return 'friends';
-    case 'only_me':
-    case 'onlyme':
-    case 'me':
-    case 'private':
-    case 'restricted':
-      return 'only_me';
-    case 'friends_except':
-      return 'friends_except';
-    case 'specific':
-      return 'specific';
-    case 'custom_list':
-      return 'custom_list';
-    default:
-      return DENIED_AUDIENCE;
-  }
-}
-
-// `audience_type` is the canonical, RLS-authoritative column (it is what
-// public.can_view_post and the `Posts are viewable based on audience and status`
-// policy evaluate, and the column DEFAULT is 'public'). The legacy `visibility`
-// column is NOT allowed to shadow it: the reel composer writes both columns
-// with the same value, so evaluating `visibility` first rejected a
-// `friends` post for every accepted friend and reduced it to owner-only. It is
-// consulted only when `audience_type` carries no value at all (legacy rows
-// written before the column existed), and an unrecognized value fails closed.
-export function resolveContentAudience(row: ReactionRow): string {
-  const declared = canonicalAudienceType(row['audience_type']);
-  if (declared !== null) return declared;
-  const legacy = canonicalAudienceType(row['visibility']);
-  if (legacy === null) return 'public';
-  return legacy;
-}
+// The audience vocabulary itself moved to `./contentAudience` so the guest read
+// path (`guestAccess.ts`) can use the canonical resolution without importing
+// this module - this module already imports `guestAccess`, so keeping a copy
+// here is what produced two disagreeing evaluators. Re-exported under the same
+// names so the existing importers and tests are unaffected.
 
 export function canViewerViewPost(
   post: ReactionRow | null | undefined,
@@ -722,9 +684,7 @@ export function canViewerViewPost(
 // see. Used to keep friends-only content out of public discovery surfaces.
 export function isPublicContent(row: ReactionRow | null | undefined): boolean {
   if (!row) return false;
-  const status = rowValue(row, 'status');
-  if (status && status !== 'published') return false;
-  return resolveContentAudience(row) === 'public';
+  return isPublishedContent(row) && isPublicAudience(row);
 }
 
 export function canViewerViewReactionUsers(

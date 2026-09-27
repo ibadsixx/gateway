@@ -7,6 +7,7 @@
 // Authenticated behavior is untouched: every rule below applies only when
 // `req.user` is undefined.
 import { SupabaseClient } from '@supabase/supabase-js';
+import { isGuestSafePublicAudience, isPublishedContent } from './contentAudience';
 
 export type GuestReadableRow = Record<string, unknown>;
 
@@ -70,22 +71,25 @@ export function isGuestReadableDomain(domain: string): boolean {
 }
 
 // A post (reels are posts with type='reel') is public to a guest only when
-// visibility, audience and status are all unrestricted:
-//  - visibility: 'public' (absent treated as public — matches the app's
-//    isPostVisibleToViewer, which hides only visibility!=='public')
-//  - audience_type: absent or 'public' (only_me / friends / friends_except /
-//    specific / custom_list are never public)
-//  - status: 'published' or absent (drafts and scheduled posts are author-only;
-//    scheduled posts are additionally stripped by scheduledPostPrivacy)
+// audience and status are both unrestricted:
+//  - audience: `isGuestSafePublicAudience` - the canonical `audience_type`
+//    (falling back to the legacy `visibility` column) must be public AND the
+//    legacy column must not contradict it. See the predicate for why the
+//    disagreement denies. Values are normalized, so `Public`/`Everyone` are
+//    public and `Only Me`/`Private` are not; an unrecognized value fails closed.
+//  - status: published, or absent on a legacy row.
+//
+// This previously compared the raw strings to 'public', so `audience_type:
+// 'Public'` - and every alias the composer has always written, 'Everyone',
+// 'All', 'Anyone' - was served to authenticated viewers while being withheld
+// from guests and crawlers. Guests were never granted anything they should not
+// have had; public content simply stopped being crawlable over letter case.
+// Public content is now reachable by guests exactly when the Gateway's
+// authenticated path and `isPublicContent` agree it is public.
 export function isGuestPostVisible(post: GuestReadableRow | null | undefined): boolean {
   if (!post || typeof post !== 'object') return false;
-  const visibility = post['visibility'];
-  if (visibility && visibility !== 'public') return false;
-  const audience = post['audience_type'];
-  if (audience && audience !== 'public') return false;
-  const status = post['status'];
-  if (status && status !== 'published') return false;
-  return true;
+  if (!isPublishedContent(post)) return false;
+  return isGuestSafePublicAudience(post);
 }
 
 export function filterGuestPosts(rows: GuestReadableRow[]): GuestReadableRow[] {

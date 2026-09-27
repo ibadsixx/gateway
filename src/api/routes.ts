@@ -6,6 +6,12 @@ import { database } from '../infrastructure/database';
 import { storage } from '../infrastructure/storage';
 import { ai } from '../infrastructure/ai';
 import { projectRegistry } from '../registry/projectRegistry';
+import {
+  buildPublicSitemapIndex,
+  buildPublicSitemapPage,
+  SitemapSegmentOutOfRange,
+} from '../features/sitemap';
+import { supabasePublicContentSource } from '../features/sitemapSource';
 import { featureFlags } from '../features';
 import { configCenter } from '../config';
 import { rateLimiter } from '../rate-limiting';
@@ -2737,6 +2743,76 @@ function createPostsRowsReader(): PostsRowsReader {
     return [...byId.values()];
   };
 }
+
+// ---------------------------------------------------------------------------
+// Public sitemap (do.md "Sitemap/discovery")
+//
+// Registered BEFORE `router.get('/:domain')` so the dynamic path is not swallowed
+// by the domain router (it would otherwise be read as a domain named
+// "sitemap.xml" and 404 through validateDomainMiddleware).
+//
+// These endpoints are unauthenticated by design - a crawler has no session - and
+// they are NOT the thing that makes content public. They only ever emit paths
+// for rows that `isGuestSafePublicAudience` already accepts, i.e. rows an
+// anonymous caller can read anyway. Nothing here consults the User-Agent, and
+// there is no "crawler" branch anywhere: the sitemap is strictly narrower than
+// what a guest can already fetch from `GET /api/posts`.
+// ---------------------------------------------------------------------------
+
+// Absolute, crawler-usable base URL for the sitemap's own <loc> values. Declared
+// in env because the Gateway is deployed behind several hostnames; falling back
+// to the request's own origin keeps local development working with no config.
+function sitemapBaseUrl(req: Request): string {
+  const configured = process.env.PUBLIC_SITE_URL?.trim();
+  if (configured) return configured.replace(/\/+$/, '');
+  const host = req.get('host');
+  const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
+  return host ? `${proto}://${host}` : 'https://tonesn.vercel.app';
+}
+
+router.get('/sitemap.xml', async (req: Request, res: Response) => {
+  try {
+    const { xml, segmentCount } = await buildPublicSitemapIndex(supabasePublicContentSource(), {
+      baseUrl: sitemapBaseUrl(req),
+    });
+    // Short TTL only. The whole point of generating this per request is that a
+    // public->private change disappears on the next crawl; a long cache would
+    // undo that, and a shared cache is not safe for a URL list that shrinks.
+    res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+    res.setHeader('X-Sitemap-Segments', String(segmentCount));
+    res.status(200).send(xml);
+  } catch (err) {
+    console.error('[Gateway] sitemap index failed:', (err as Error).message);
+    res.status(500).json({ error: 'Failed to build sitemap' });
+  }
+});
+
+router.get('/sitemap/:segment', async (req: Request, res: Response) => {
+  const raw = req.params.segment ?? '';
+  const match = /^(\d+)\.xml$/.exec(raw);
+  if (!match) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  try {
+    const { xml, urlCount } = await buildPublicSitemapPage(supabasePublicContentSource(), {
+      baseUrl: sitemapBaseUrl(req),
+      segment: Number.parseInt(match[1], 10),
+    });
+    res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300');
+    res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+    res.setHeader('X-Sitemap-Urls', String(urlCount));
+    res.status(200).send(xml);
+  } catch (err) {
+    if (err instanceof SitemapSegmentOutOfRange) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    console.error('[Gateway] sitemap segment failed:', (err as Error).message);
+    res.status(500).json({ error: 'Failed to build sitemap segment' });
+  }
+});
 
 router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain } = req.params;
