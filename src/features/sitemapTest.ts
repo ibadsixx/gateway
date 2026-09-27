@@ -261,6 +261,33 @@ async function main(): Promise<void> {
       `restricted row ${String(row.id)} (${String(row.audience_type)}/${String(row.status)}) is not indexable`);
   }
 
+  // §20.9 - the status gate is EXACT, mirroring the posts RLS CASE whose
+  // fallthrough is `ELSE false`. An anonymous client can read a post row only when
+  // `status` is literally 'published', so the sitemap may only list that state.
+  // Two of these are the reason the gate exists at all:
+  //   - `null` is storable (a CHECK constraint is satisfied by NULL, and an
+  //     explicit NULL bypasses the column DEFAULT) and RLS denies it. Nothing in
+  //     the app writes it today, which is exactly why it needs a test.
+  //   - the mixed-case and whitespace forms are NOT storable (the column is
+  //     `CHECK (status IN ('published','scheduled','draft'))`), so the gate must
+  //     not come to depend on that constraint continuing to hold.
+  for (const status of [null, undefined, 'Published', 'PUBLISHED', ' published ', 'published ',
+                        'draft', 'scheduled', 'deleted', 'archived', '']) {
+    const row = post(34, { audience_type: 'public', visibility: 'public', status });
+    assert.equal(isIndexableSitemapRow('posts', row), false,
+      `§20.9: status=${JSON.stringify(status)} is not indexable (RLS ELSE false denies it)`);
+    // ...and the same gate holds for the other two content sections, so a reel
+    // and a photo cannot route around it.
+    assert.equal(isIndexableSitemapRow('reels', { ...row, type: 'reel' }), false,
+      `§20.9: a reel with status=${JSON.stringify(status)} is not indexable`);
+    assert.equal(isIndexableSitemapRow('photos', { ...row, media_type: 'image' }), false,
+      `§20.9: a photo with status=${JSON.stringify(status)} is not indexable`);
+  }
+  // The positive control for the gate above: exact 'published' IS indexable, so
+  // the block is not passing by rejecting everything.
+  assert.equal(isIndexableSitemapRow('posts', post(35, { audience_type: 'public', visibility: 'public', status: 'published' })), true,
+    '§20.9: status=published is indexable');
+
   // §20.9/§20.11 - private reels and photos, in both content sections.
   for (const row of [post(40, { type: 'reel', audience_type: 'friends', visibility: 'friends' }),
                      post(41, { type: 'reel', audience_type: 'only_me', visibility: 'only_me' })]) {

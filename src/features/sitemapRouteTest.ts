@@ -311,7 +311,14 @@ async function main(): Promise<void> {
         post(4, { audience_type: ' public ', visibility: ' public ' }),
         // ...and the case variations it must NOT keep, even though the old
         // prefilter would have dropped them too - see the §9 matrix below.
+        // The posts RLS CASE falls through to `ELSE false`, so an anonymous
+        // client cannot read a row whose status is not exactly 'published'.
+        // The column's CHECK constraint cannot even store 'Published'; this row
+        // proves the sitemap does not depend on the constraint holding.
         post(5, { status: 'Published' }),
+        // ...and a row with a NULL status, which the CHECK *does* permit and the
+        // RLS CASE *does* deny. This is the reachable divergence.
+        post(6, { status: null }),
       ],
       profiles: [profile(1), profile(2), profile(3)],
       // Only user1 opted in. user2 and user3 have no row at all.
@@ -352,11 +359,16 @@ async function main(): Promise<void> {
       assert.equal(listed.includes(`https://tonesn.vercel.app/${prefix}/${uuid(n)}`), true,
         `§20.4/8/10: the public ${prefix} is listed`);
     }
-    // ...and the whitespace / case-status tolerances.
+    // ...and the whitespace tolerance on the audience, which is kept.
     assert.equal(listed.includes(`https://tonesn.vercel.app/post/${uuid(4)}`), true,
       'a public post stored with surrounding whitespace is still listed');
-    assert.equal(listed.includes(`https://tonesn.vercel.app/post/${uuid(5)}`), true,
-      'a public post stored as status=Published is still listed');
+    // The status gate is EXACT, because RLS's CASE is exact. Both of these rows
+    // are unreadable to an anonymous client, so advertising them would leak the
+    // existence of a post nobody may see.
+    assert.equal(listed.includes(`https://tonesn.vercel.app/post/${uuid(5)}`), false,
+      'a public post stored as status=Published is NOT listed (RLS ELSE false denies it)');
+    assert.equal(listed.includes(`https://tonesn.vercel.app/post/${uuid(6)}`), false,
+      'a public post with status=NULL is NOT listed (RLS ELSE false denies it)');
     // §20.12/13 - the profile section follows the real opt-in table.
     assert.equal(listed.includes('https://tonesn.vercel.app/profile/user1'), true,
       '§20.12: the opted-in profile is listed');
@@ -398,9 +410,17 @@ async function main(): Promise<void> {
     // =======================================================================
     // §9 - the prefilter is a proven superset of the accepted set
     //
-    // This is the check that would have caught the previous `status.eq.published`
-    // prefilter, which silently dropped every row stored as 'Published' even
-    // though the predicate accepts it.
+    // `accepted` is the AUTHORITY (isIndexableSitemapRow -> contentRowPath, which
+    // is the audience predicate plus the exact RLS status gate), and the assertion
+    // is one-directional: anything the authority accepts must survive the DB
+    // prefilter. This is the check that would have caught the previous
+    // `status.eq.published` prefilter back when the predicate accepted
+    // 'Published', and it still guards the audience prefilter today.
+    //
+    // The mixed-case and NULL status rows are now REJECTED by the authority, so
+    // they sit in this matrix as states the prefilter may over-exclude: no
+    // assertion is demanded of them, and that is correct - a row nobody may read
+    // has no claim on being listed.
     // =======================================================================
     const MATRIX: Row[] = [
       { audience: 'public', status: 'published' },
@@ -573,6 +593,54 @@ async function main(): Promise<void> {
     const tail = await get('/api/sitemap-posts-4.xml');
     assert.equal(tail.status, 200, 'a page past the corpus is a valid empty page');
     assert.equal(locs(tail.body).length, 0, 'and it contains no URLs');
+
+    // =======================================================================
+    // §2/§8 - the INDEX is not a fixed partition; it is recomputed per request
+    //
+    // do.md §2: "The sitemap index does not reference an obsolete sitemap solely
+    // because of that deleted post." That is only true if the child count is
+    // derived from a live count rather than being a hardcoded split. Crossing a
+    // page boundary in BOTH directions is the test: a static partition would have
+    // to have been right about the corpus size in advance to pass it.
+    // =======================================================================
+    // Regime A: the index shape is retained on both sides, so this isolates the
+    // "obsolete child is dropped" property from the shape change below.
+    setTables({ posts: Array.from({ length: SITEMAP_PAGE_SIZE * 2 + 1 }, (_, i) => post(7000 + i)) });
+    const threeChild = await get('/api/sitemap.xml');
+    assert.equal(threeChild.headers['x-sitemap-shape'], 'sitemapindex', '§8: 2001 rows is an index');
+    assert.equal(locs(threeChild.body).length, 3, '§8: 2001 rows -> exactly 3 child sitemaps');
+    assert.equal(locs(threeChild.body).includes('https://tonesn.vercel.app/sitemap-posts-3.xml'), true,
+      '§8: the third child is referenced');
+
+    // One deletion crosses the boundary back down. The index must shrink on the
+    // very next request - no regeneration step, no deploy.
+    setTables({ posts: Array.from({ length: SITEMAP_PAGE_SIZE * 2 }, (_, i) => post(7000 + i)) });
+    const twoChild = await get('/api/sitemap.xml');
+    assert.equal(twoChild.headers['x-sitemap-shape'], 'sitemapindex', '§8: 2000 rows is still an index');
+    assert.equal(locs(twoChild.body).length, 2, '§2: the index drops to 2 children after one deletion');
+    assert.equal(locs(twoChild.body).includes('https://tonesn.vercel.app/sitemap-posts-3.xml'), false,
+      '§2: the index no longer references the now-obsolete child sitemap');
+    assert.equal(locs(twoChild.body).includes('https://tonesn.vercel.app/sitemap-posts-1.xml'), true,
+      '§2: the surviving children are still referenced');
+
+    // Regime B: down to a single page, the whole thing collapses to one inline
+    // urlset, so the obsolete child is not merely unreferenced - the indirection
+    // disappears entirely, which is the §13 preference in action.
+    setTables({ posts: Array.from({ length: SITEMAP_PAGE_SIZE }, (_, i) => post(7000 + i)) });
+    const inline = await get('/api/sitemap.xml');
+    assert.equal(inline.headers['x-sitemap-shape'], 'urlset',
+      `§13: at exactly one page the index collapses to a urlset (got ${inline.headers['x-sitemap-shape']})`);
+    assert.equal(inline.headers['x-sitemap-urls'], String(SITEMAP_PAGE_SIZE),
+      '§13: and the urls are served inline');
+    assert.equal(/sitemap-posts-\d+\.xml/.test(inline.body), false,
+      '§2: no child sitemap is referenced at all once it fits in one document');
+
+    // ...and back over the boundary, proving the GROWTH direction too.
+    setTables({ posts: Array.from({ length: SITEMAP_PAGE_SIZE + 1 }, (_, i) => post(7000 + i)) });
+    const regrown = await get('/api/sitemap.xml');
+    assert.equal(locs(regrown.body).length, 2, '§8: the index grows again with no manual step');
+    assert.equal(locs(regrown.body).includes('https://tonesn.vercel.app/sitemap-posts-2.xml'), true,
+      '§8: the new child is referenced');
 
     // =======================================================================
     // §19 - a failing data source

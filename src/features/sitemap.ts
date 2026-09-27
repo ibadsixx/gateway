@@ -205,14 +205,47 @@ export function hashtagPath(tag: unknown): string | null {
 // Per-section privacy / indexability
 // ---------------------------------------------------------------------------
 
-// Posts, reels and photos. This is the ONE predicate: the same
-// `isGuestSafePublicContent` that decides whether an anonymous caller may read
-// the row. The sitemap is strictly narrower than what a guest can already fetch
-// from `GET /api/posts`, never wider (do.md §3-§5, §14).
+// The posts RLS policy is a CASE whose fallthrough is `false`
+// (migration 20250907142243, as rewritten by 20250913194929):
+//
+//     WHEN status = 'scheduled' THEN user_id = auth.uid()
+//     WHEN status = 'published' THEN can_view_post(...)
+//     WHEN status = 'draft'     THEN user_id = auth.uid()
+//     ELSE false
+//
+// So an anonymous client can read a post row ONLY when `status` is exactly the
+// lowercase literal 'published'. In particular `ELSE false` also denies
+// `status IS NULL`, which the column permits: the column is
+// `text DEFAULT 'published' CHECK (status IN ('published','scheduled','draft'))`
+// and a CHECK constraint is satisfied by NULL, so an explicit NULL insert
+// (which bypasses the DEFAULT) lands in the denied branch.
+//
+// `isGuestSafePublicContent` is deliberately more permissive here - it treats an
+// absent status as published, for legacy rows that predate the column. The
+// Gateway reads with service_role, which bypasses RLS, so that tolerance is
+// invisible to a crawler: the sitemap would advertise a URL that an anonymous
+// PostgREST read refuses. This gate closes that gap in the one direction that
+// matters, fail-closed, and costs nothing real: a NULL-status row is unreadable
+// by everyone but its author anyway, so listing it has no discoverability value
+// and only reveals that the id exists.
+//
+// It is also a strict superset check, not a heuristic: the CHECK constraint
+// rejects any casing but the three literals, so 'PUBLISHED' cannot be stored and
+// the exact comparison cannot miss a legitimately published post.
+function isAnonymousReadablePostStatus(status: unknown): boolean {
+  return status === 'published';
+}
+
+// Posts, reels and photos. Layer 1 of 2 (the other is the query prefilter in
+// ./sitemapSource): the same `isGuestSafePublicContent` that decides whether an
+// anonymous caller may read the row, PLUS the RLS status gate above. The sitemap
+// is strictly narrower than what a guest can already fetch from `GET /api/posts`,
+// never wider (do.md §3-§5, §14).
 function contentRowPath(section: SitemapSection, row: SitemapRow): string | null {
   const kind = CONTENT_SECTION_KIND[section];
   if (!kind) return null;
   if (!isGuestSafePublicContent(row)) return null;
+  if (!isAnonymousReadablePostStatus(row.status)) return null;
   // A reel is not also a post. Without this, `publicContentKind` would happily
   // place a reel in /sitemap-posts-1.xml while the index also advertises
   // /sitemap-reels-1.xml, and a crawler would see the same id twice.

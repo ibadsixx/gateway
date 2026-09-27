@@ -17,15 +17,21 @@
 //                    'public`, is rejected by the predicate, and is correctly
 //                    excluded here too.
 //
-//     status         accepted iff absent OR `String(v).trim().toLowerCase() ===
-//                    'published'`. That is a CASE-WIDENING comparison, so
-//                    `like %published%` would NOT be a superset ('PUBLISHED'
-//                    passes the predicate and fails the filter) and the filter
-//                    would silently under-list. `ilike` is the case-insensitive
-//                    operator, so `ilike %published%` is the correct superset.
-//                    This was a live bug: the previous prefilter was
-//                    `status.eq.published`, which dropped every row stored as
-//                    'Published'.
+//     status         accepted iff exactly the lowercase literal 'published'
+//                    (see isAnonymousReadablePostStatus in ./sitemap: the RLS
+//                    CASE falls through to `ELSE false`, so NULL and any other
+//                    value are unreadable to an anonymous client and must not be
+//                    listed). An exact `eq` is therefore a true superset - it
+//                    matches every accepted row and excludes the rest. The
+//                    previous prefilter was `status.is.null,status.ilike
+//                    .*published*`, a case-WIDENING filter that had to be an
+//                    `ilike` because `isPublishedContent` accepted 'Published'
+//                    and NULL. That widening guarded two states the schema
+//                    cannot store: the column is
+//                    `CHECK (status IN ('published','scheduled','draft'))`, so
+//                    'Published' is impossible, and no insert path in the app
+//                    writes status at all, so every row takes the DEFAULT. It
+//                    also fetched rows the sitemap then threw away.
 //
 //     visibility     NO prefilter at all, and this is not an oversight. The
 //                    predicate accepts visibility only when it is absent or also
@@ -83,7 +89,7 @@ const PRIVACY_SETTINGS_SELECT = 'user_id';
 // accept.
 const IN_CHUNK_SIZE = 250;
 
-const PUBLISHED_PREFILTER = `status.is.null,status.ilike.*published*`;
+const PUBLISHED_PREFILTER = 'status.eq.published';
 const PUBLIC_AUDIENCE_PREFILTER = 'audience_type.like.*public*';
 
 // `publicContentKind` treats a case-insensitive 'reel' as a reel, so the prefilter
