@@ -138,10 +138,64 @@ async function main(): Promise<void> {
     true,
     'null status is treated as published'
   );
+  // A NULL audience is NOT public. The column is `text DEFAULT 'public'`, but a
+  // default only applies to an INSERT that omits the column, so NULL is
+  // reachable (an explicit null, or any row written before the column existed).
+  // An absent audience is an absent DECISION, and a guest has no identity for the
+  // per-viewer rules to be checked against, so the anonymous read is refused.
+  // This is the behaviour RLS already enforces, where `can_view_post` is
+  // `WHEN post_audience_type = 'public' THEN true ... ELSE false`.
   assert.equal(
     isGuestPostVisible({ ...PUBLISHED_PUBLIC_POST, visibility: null, audience_type: null }),
+    false,
+    'null visibility/audience is NOT public for a guest'
+  );
+  assert.equal(
+    isGuestPostVisible({ ...PUBLISHED_PUBLIC_POST, audience_type: null }),
+    false,
+    'null audience_type alone is not public, even with visibility=public'
+  );
+  // Nor is a missing column, nor an unrecognized value, nor a near-miss spelling.
+  assert.equal(
+    isGuestPostVisible({ ...PUBLISHED_PUBLIC_POST, audience_type: undefined }),
+    false,
+    'undefined audience is not public'
+  );
+  assert.equal(
+    isGuestPostVisible({ ...PUBLISHED_PUBLIC_POST, audience_type: 'unknown_value' }),
+    false,
+    'an unknown audience value is not public'
+  );
+  // The public aliases must not silently publish. RLS compares
+  // `post_audience_type = 'public'` literally and treats these as non-public, so
+  // widening them here would make the Gateway more permissive than the database
+  // it fronts. Same for a different case: 'Public' is not the documented value.
+  for (const value of ['Everyone', 'everyone', 'AnyOne', 'All', 'all', 'Public', 'PUBLIC']) {
+    assert.equal(
+      isGuestPostVisible({ ...PUBLISHED_PUBLIC_POST, audience_type: value, visibility: value }),
+      false,
+      `audience ${JSON.stringify(value)} is not the exact value 'public' and is refused`
+    );
+  }
+  // The one leniency kept: surrounding whitespace is a storage artifact, not a
+  // different audience, and no audience picker can produce it.
+  assert.equal(
+    isGuestPostVisible({ ...PUBLISHED_PUBLIC_POST, audience_type: 'public', visibility: 'public' }),
     true,
-    'null visibility/audience defaults to public (matches app filter)'
+    'the exact value public is guest-visible'
+  );
+  // A drifted row whose two audience columns disagree is refused, because RLS
+  // reads only audience_type and would publish a row that `visibility` calls
+  // friends-only.
+  assert.equal(
+    isGuestPostVisible({ ...PUBLISHED_PUBLIC_POST, audience_type: 'public', visibility: 'friends' }),
+    false,
+    'disagreeing audience columns are refused for a guest'
+  );
+  assert.equal(
+    isGuestPostVisible({ ...PUBLISHED_PUBLIC_POST, audience_type: 'public', visibility: null }),
+    true,
+    'an absent legacy column does not contradict audience_type'
   );
   assert.equal(
     isGuestPostVisible({ ...PUBLISHED_PUBLIC_POST, type: 'reel' }),

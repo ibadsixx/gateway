@@ -7,7 +7,7 @@
 // Authenticated behavior is untouched: every rule below applies only when
 // `req.user` is undefined.
 import { SupabaseClient } from '@supabase/supabase-js';
-import { isGuestSafePublicAudience, isPublishedContent } from './contentAudience';
+import { isGuestSafePublicContent } from './contentAudience';
 
 export type GuestReadableRow = Record<string, unknown>;
 
@@ -88,8 +88,7 @@ export function isGuestReadableDomain(domain: string): boolean {
 // authenticated path and `isPublicContent` agree it is public.
 export function isGuestPostVisible(post: GuestReadableRow | null | undefined): boolean {
   if (!post || typeof post !== 'object') return false;
-  if (!isPublishedContent(post)) return false;
-  return isGuestSafePublicAudience(post);
+  return isGuestSafePublicContent(post);
 }
 
 export function filterGuestPosts(rows: GuestReadableRow[]): GuestReadableRow[] {

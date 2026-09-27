@@ -40,6 +40,7 @@ const STRANGER = 'non-friend-uuid';
 const PENDING = 'pending-request-uuid';
 
 const VISIBLE = true;
+const DENIED = false;
 const HIDDEN = false;
 
 // A guest has no session id. A guest is never a friend, for any audience.
@@ -124,10 +125,29 @@ for (const kind of KINDS) {
   assert.equal(isPublicContent(pub), true, `${kind}: public discovery`);
   assert.deepEqual(filterContentRowsForViewer([pub], GUEST, new Set()), [pub], `${kind}: guest list`);
 
-  // A row with no audience_type at all is public (the column DEFAULT).
+  // A row with no audience_type at all. The column is `text DEFAULT 'public'`,
+  // but a default only applies to an INSERT that omits the column, so a row can
+  // still hold NULL (and every row written before the column existed does).
+  //
+  // The two viewer kinds now answer differently, and that asymmetry is the whole
+  // point of the rule rather than an inconsistency:
+  //
+  //   authenticated -> VISIBLE. The viewer has an identity, so the per-viewer
+  //     rules still apply and `resolveContentAudience` may keep defaulting an
+  //     empty audience to public. Restricting it here would change who can read
+  //     their own existing content, which the authenticated rules are not
+  //     supposed to do.
+  //   guest -> DENIED. There is no identity to check, so the audience value is
+  //     the entire basis for the decision. A NULL is an absent decision, not a
+  //     decision to publish, so it must not cross the anonymous boundary. This
+  //     is also what RLS already does: `can_view_post` is
+  //     `WHEN post_audience_type = 'public' THEN true ... ELSE false`, and NULL
+  //     falls through to ELSE false.
   const legacyPublic = { ...pub, audience_type: null, visibility: null };
-  assert.equal(canViewerViewPost(legacyPublic, STRANGER, STRANGER_FRIENDS), VISIBLE, `${kind}: legacy public`);
-  assert.equal(canViewerViewPost(legacyPublic, GUEST, new Set()), VISIBLE, `${kind}: legacy public guest`);
+  assert.equal(canViewerViewPost(legacyPublic, STRANGER, STRANGER_FRIENDS), VISIBLE, `${kind}: legacy public authenticated`);
+  assert.equal(canViewerViewPost(legacyPublic, GUEST, new Set()), DENIED, `${kind}: legacy public is not guest-visible`);
+  // The owner's access is never audience-dependent.
+  assert.equal(canViewerViewPost(legacyPublic, OWNER, OWNER_FRIENDS), VISIBLE, `${kind}: legacy public owner`);
 
   // A public row that excludes a specific viewer keeps them out.
   const excluded = { ...pub, audience_excluded_user_ids: [STRANGER] };

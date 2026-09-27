@@ -37,8 +37,9 @@ const PUBLIC_ROWS: Row[] = [
   row(1),
   row(2, { type: 'reel', media_type: 'video' }),
   row(3, { media_type: 'image' }),
-  row(4, { audience_type: 'Public', visibility: 'Public' }), // casing must not hide it
-  row(5, { audience_type: 'Everyone', visibility: 'Everyone' }), // alias must not hide it
+  // The one tolerance kept: surrounding whitespace is a storage artifact, not a
+  // different audience. A poster can still be crawled and indexed.
+  row(4, { audience_type: ' public ', visibility: ' public ' }),
 ];
 const RESTRICTED_ROWS: Row[] = [
   row(10, { audience_type: 'friends', visibility: 'friends' }),
@@ -47,6 +48,17 @@ const RESTRICTED_ROWS: Row[] = [
   row(13, { audience_type: 'public', visibility: 'public', status: 'draft' }),
   row(14, { audience_type: 'specific', audience_user_ids: [uuid(90)] }),
   row(15, { audience_type: 'only_me', visibility: 'public' }), // only_me wins
+  // §11: the value must be the exact word `public`. A near-miss spelling is not
+  // a decision anybody made, and RLS compares `post_audience_type = 'public'`
+  // literally, so these are non-public in the database too.
+  row(16, { audience_type: 'Public', visibility: 'Public' }),
+  row(17, { audience_type: 'Everyone', visibility: 'Everyone' }),
+  row(18, { audience_type: 'All', visibility: 'All' }),
+  // A NULL audience is not public, and is not rescued by a public legacy column.
+  row(19, { audience_type: null, visibility: null }),
+  row(20, { audience_type: null, visibility: 'public' }),
+  // An absent audience column entirely.
+  row(21, { audience_type: undefined, visibility: undefined }),
 ];
 const ALL_ROWS = [...PUBLIC_ROWS, ...RESTRICTED_ROWS];
 

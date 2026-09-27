@@ -928,7 +928,20 @@ v1.get('/:domain/:id', validation.validateDomainMiddleware, async (req, res) => 
     }
     // do.md: the audience is enforced on this single-row route too, so
     // /api/v1/posts/:id cannot be used to bypass the list route's filtering.
-    if (domain === 'posts' && req.user?.id) {
+    //
+    // The read is service-role, so RLS is NOT a backstop here (see the list route
+    // for the same note) and this handler is the whole authorization. The v1
+    // middleware above requires a session, so `req.user?.id` is populated in
+    // practice, but the check is written without relying on that: a posts read
+    // with no identity is refused outright, because there is no audience value
+    // that may be served to a caller who has not proved who they are. Keeping
+    // the rule here rather than in the middleware means relaxing the v1 auth
+    // later can never quietly turn this into an unauthenticated content read.
+    if (domain === 'posts') {
+      if (!req.user?.id) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
       const friendIds = await resolveViewerFriendIds(req.user.id, readableReactionProjects('friends'));
       if (!canViewerReadContentRow(result, req.user.id, friendIds)) {
         res.status(404).json({ error: 'Not found' });

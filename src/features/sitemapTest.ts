@@ -140,10 +140,12 @@ async function main(): Promise<void> {
   assert.equal(isIndexablePublicRow(publicPost(52, { status: null })), true,
     'legacy row with no status column is still public');
 
-  // --- audience spelling: a public value in any casing/alias is crawlable ---
-  for (const value of ['public', 'Public', 'PUBLIC', ' everyone ', 'Everyone', 'All', 'Anyone', 'everyone']) {
-    assert.equal(isIndexablePublicRow(publicPost(60, { audience_type: value, visibility: value })), true,
-      `public spelling ${JSON.stringify(value)} is indexable`);
+  // --- audience spelling: ONLY the exact value `public` is indexable ---
+  assert.equal(isIndexablePublicRow(publicPost(60, { audience_type: 'public', visibility: 'public' })), true,
+    'the exact value public is indexable');
+  for (const value of ['Everyone', 'everyone', 'AnyOne', 'All', 'all', 'Public', 'PUBLIC', 'Public ']) {
+    assert.equal(isIndexablePublicRow(publicPost(63, { audience_type: value, visibility: value })), false,
+      `audience ${JSON.stringify(value)} is not the exact value public and is not in the sitemap`);
   }
   for (const value of ['only_me', 'Only Me', 'Private', 'private', 'restricted', 'Me']) {
     assert.equal(isIndexablePublicRow(publicPost(61, { audience_type: value, visibility: value })), false,
@@ -152,6 +154,21 @@ async function main(): Promise<void> {
   // Unrecognized values fail closed rather than defaulting to public.
   assert.equal(isIndexablePublicRow(publicPost(62, { audience_type: 'secret_handshake', visibility: 'secret_handshake' })), false,
     'an unknown audience value fails closed');
+
+  // --- §11: a NULL/absent audience is not public, at the sitemap too ---
+  assert.equal(isIndexablePublicRow(publicPost(64, { audience_type: null, visibility: null })), false,
+    'null audience is not in the sitemap');
+  assert.equal(isIndexablePublicRow(publicPost(65, { audience_type: null, visibility: 'public' })), false,
+    'a null audience is not rescued by a public legacy column');
+  assert.equal(isIndexablePublicRow(publicPost(66, { audience_type: undefined, visibility: undefined })), false,
+    'a missing audience is not in the sitemap');
+  // Whitespace around the exact value is tolerated; it is a storage artifact.
+  assert.equal(isIndexablePublicRow(publicPost(67, { audience_type: ' public ', visibility: ' public ' })), true,
+    'surrounding whitespace on the exact value is tolerated');
+  // Drifted rows: RLS reads only audience_type, so a contradicting legacy column
+  // is refused rather than published on the strength of the column RLS ignores.
+  assert.equal(isIndexablePublicRow(publicPost(68, { audience_type: 'public', visibility: 'friends' })), false,
+    'a contradicting legacy column keeps the row out of the sitemap');
 
   // --- id hygiene: only a verified uuid can become a path ---
   for (const bad of ['', '   ', 'not-a-uuid', '../../etc/passwd', 'a"b', "x'><script>", null, undefined, 42]) {

@@ -30,7 +30,7 @@
 // and pick up the shift. This is the standard dynamic-sitemap trade: no
 // per-segment manifest to keep in sync, at the cost of a small amount of
 // re-fetching after publication, which is what Google recommends anyway.
-import { isGuestSafePublicAudience, isPublishedContent } from './contentAudience';
+import { isGuestSafePublicContent } from './contentAudience';
 import type { AudienceRow } from './contentAudience';
 
 export type SitemapContentRow = AudienceRow & {
@@ -159,8 +159,7 @@ export interface PublicContentSource {
 
 export function isIndexablePublicRow(row: SitemapContentRow): boolean {
   if (!row || typeof row !== 'object') return false;
-  if (!isPublishedContent(row)) return false;
-  if (!isGuestSafePublicAudience(row)) return false;
+  if (!isGuestSafePublicContent(row)) return false;
   // The audience predicate already guarantees a guest may read the row, but a
   // row with no id cannot be turned into a URL, and `publicContentPath`
   // rejecting it is the last gate before the XML.

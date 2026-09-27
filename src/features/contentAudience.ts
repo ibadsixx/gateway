@@ -84,40 +84,83 @@ export function resolveContentAudience(row: AudienceRow): string {
   return legacy;
 }
 
-// `public` is the only audience value that may be served to an unauthenticated
-// caller. Everything else - `friends`, `friends_except`, `specific`,
-// `custom_list`, `only_me`, `denied` - is restricted by definition, so this is
-// the predicate the public sitemap and the public-content page share. Note it
-// is NOT the same predicate as "an authenticated viewer can see this": a public
-// post can still be withheld from a specific individual via
-// `audience_excluded_user_ids`, which is a per-viewer rule and therefore cannot
-// apply to a guest who has no identity.
+// THE PUBLIC BOUNDARY.
+//
+// `audience === "public"` is the only thing that may cross the anonymous
+// boundary. This predicate deliberately does NOT reuse `resolveContentAudience`,
+// even though that is the right function for deciding what an AUTHENTICATED
+// viewer may read. The two answer different questions and must not share code:
+//
+//   authenticated: "may this viewer read this row?" -> viewer + audience +
+//                  relationship. A missing audience column can sensibly default
+//                  to public here, because the viewer still has an identity that
+//                  the per-viewer rules (ownership, friendship, exclusions) are
+//                  checked against.
+//
+//   public/search: "may ANY anonymous caller read this row?" -> audience only.
+//                  There is no identity to check, so the audience value is the
+//                  entire basis for the decision, and anything that is not
+//                  literally the word `public` has to fail closed.
+//
+// The three differences from the authenticated resolver, each of which used to
+// be a way for a row to be published without anybody having chosen `public`:
+//
+//   1. NO DEFAULT. `resolveContentAudience` returns 'public' when both audience
+//      columns are empty. A row with `audience_type = null` was therefore
+//      served to every guest and listed in the sitemap. The column is
+//      `text DEFAULT 'public'`, but a default only applies to an INSERT that
+//      omits the column: a row can still end up NULL, and so can any row written
+//      before the column existed. A NULL is not a decision, so it is not public.
+//      This matches RLS, where `can_view_post` is
+//      `WHEN post_audience_type = 'public' THEN true ... ELSE false` and a NULL
+//      falls to ELSE false.
+//
+//   2. NO ALIAS WIDENING. `canonicalAudienceType` maps 'Everyone', 'Anyone' and
+//      'All' onto 'public' (and 'followers' onto 'friends', etc.). Those are
+//      reasonable readings when the point is to understand a row's intent, but
+//      as a publish gate they mean "a value nobody has audited is treated as
+//      public". The requirement is the exact value.
+//
+//   3. NO CASE WIDENING. 'Public' and 'PUBLIC' are not the value the column
+//      documents. RLS compares literally and treats them as non-public, so the
+//      Gateway treating them as public made it strictly MORE permissive than the
+//      database it fronts - the opposite of the safe direction.
+//
+// A row that is genuinely public in the product has `audience_type = 'public'`,
+// which is what the composer writes and what all 24 production rows hold. The
+// cost of this strictness is therefore that a hand-edited or drifted row stops
+// being indexed until someone sets it to the real value; the benefit is that no
+// row is ever published by accident.
 export function isPublicAudience(row: AudienceRow): boolean {
-  return resolveContentAudience(row) === 'public';
+  return isExactlyPublic(row['audience_type']);
 }
 
-// The stricter guest predicate: BOTH audience columns must independently say
-// public before a row is served to someone with no identity.
+// The single definition of "this value says public", at the public boundary.
+// A string equal to `public` after trimming surrounding whitespace - the one
+// leniency, because a trailing space is a storage artifact rather than a
+// different audience, and it cannot be produced by any audience picker. Case is
+// NOT normalized: see note 3 above.
+function isExactlyPublic(value: unknown): boolean {
+  return typeof value === 'string' && value.trim() === 'public';
+}
+
+// The guest read gate. Two independent requirements, both mandatory:
 //
-// RLS's `can_view_post` receives only `audience_type`, so for a row whose legacy
-// `visibility` column DISAGREES with it, the database treats the row as public
-// while the guest read path historically treated it as restricted. Keeping the
-// disagreement deny-by-default is deliberate: the two columns are written by
-// different composers and legacy rows exist where they drifted, and a guest has
-// no identity that could be checked against the per-viewer rules. When in
-// doubt an anonymous caller is refused, which is the direction the requirement
-// "do not weaken existing privacy/security rules" requires. Content that is
-// genuinely public has both columns in agreement and is served normally.
+//   - the canonical `audience_type` column must be exactly `public`, and
+//   - the legacy `visibility` column must not CONTRADICT it.
 //
-// The values are compared through the canonical normalizer, so this is not a
-// case-sensitive string test: `Public`, `PUBLIC`, `Everyone` and `All` are all
-// public (the old raw `!== 'public'` comparison silently un-crawlable real
-// public content), and `Only Me`/`Private`/`only_me` are all restricted.
+// The second condition is about drifted rows. The two columns are written by
+// different composers, and legacy rows exist where they disagree. RLS only reads
+// `audience_type`, so the database would publish a row whose `visibility` says
+// `friends`. A guest has no identity against which the per-viewer rules could be
+// checked, so when the two columns disagree the anonymous read is refused and
+// the row is kept out of the sitemap. A `visibility` of `public`, absent, or
+// empty does not contradict anything and is fine.
 export function isGuestSafePublicAudience(row: AudienceRow): boolean {
   if (!isPublicAudience(row)) return false;
-  const legacy = canonicalAudienceType(row['visibility']);
-  if (legacy !== null && legacy !== 'public') return false;
-  return true;
+  const legacy = row['visibility'];
+  if (legacy === null || legacy === undefined) return true;
+  return isExactlyPublic(legacy);
 }
 
 // Unpublished content is author-only. `status` is absent on many legacy rows, so
@@ -127,4 +170,15 @@ export function isPublishedContent(row: AudienceRow): boolean {
   const status = row['status'];
   if (status === null || status === undefined) return true;
   return String(status).trim().toLowerCase() === 'published';
+}
+
+// The one predicate every public/anonymous surface must go through: a guest
+// read, a single-row `/post/:id` read, the profile content page, Explore, the
+// public sitemap, and the content page's own indexing signals. Each of those
+// already funnels into either `canViewerViewPost` (which delegates here for a
+// guest) or this module directly, so there is a single place to audit and a
+// single place to change if the rule ever moves.
+export function isGuestSafePublicContent(row: AudienceRow): boolean {
+  if (!row || typeof row !== 'object') return false;
+  return isPublishedContent(row) && isGuestSafePublicAudience(row);
 }
