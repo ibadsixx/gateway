@@ -37,6 +37,7 @@
 // into a deep page walk, and it keeps each child inside Google's 50,000-URL and
 // 50MB ceilings on its own.
 import { isGuestSafePublicContent } from './contentAudience';
+import { isSearchEngineIndexingOptIn } from './profileIndexing';
 import type { AudienceRow } from './contentAudience';
 
 export type SitemapRow = AudienceRow & {
@@ -274,7 +275,14 @@ function contentRowPath(section: SitemapSection, row: SitemapRow): string | null
 // whose users have never opened the privacy checkup.
 export function isIndexableProfileRow(row: SitemapRow): boolean {
   if (!row || typeof row !== 'object') return false;
-  if (row.search_engine_indexing !== 'true') return false;
+  // The SAME consent test the public profile page uses, imported rather than
+  // repeated. These two surfaces answer one question about one user, and do.md is
+  // explicit that a profile must be consistently in or out: if the page said
+  // "index me" while the sitemap said "do not list me", Google would be told to
+  // crawl a URL the sitemap had just stopped advertising. A duplicated literal
+  // here is how that disagreement starts - one side gets a tolerance the other
+  // does not, and the drift is invisible until a profile is published.
+  if (!isSearchEngineIndexingOptIn(row.search_engine_indexing)) return false;
   return profileUsernamePath(row.username) !== null;
 }
 

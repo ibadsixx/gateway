@@ -54,6 +54,7 @@
 // registered is not a failure: there is provably no content of that type in this
 // deployment, so an empty section is the truthful answer.
 import { projectManager } from '../project-manager';
+import { PROFILE_INDEXING_OPT_IN, PROFILE_INDEXING_SETTING } from './profileIndexing';
 import {
   cursorForRow,
   isIndexableSitemapRow,
@@ -80,8 +81,11 @@ const GROUPS_SELECT = 'id,privacy,created_at';
 const HASHTAGS_SELECT = 'tag,created_at';
 
 // §6: the profile search-engine opt-in, and only that one setting.
-const PROFILE_OPT_IN_SETTING = 'search_engine_indexing';
-const PROFILE_OPT_IN_VALUE = 'true';
+// The setting key comes from the one module that owns this question, so a rename
+// on the Privacy Checkup side cannot leave the sitemap querying a key that no
+// longer exists - which would fail closed and silently empty the profiles section.
+const PROFILE_OPT_IN_SETTING = PROFILE_INDEXING_SETTING;
+const PROFILE_OPT_IN_VALUE = PROFILE_INDEXING_OPT_IN;
 const PRIVACY_SETTINGS_SELECT = 'user_id';
 
 // `.in()` is sent as a query string, so the value list is bounded. 250 uuids is

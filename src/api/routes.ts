@@ -13,6 +13,7 @@ import {
   SitemapPageOutOfRange,
 } from '../features/sitemap';
 import { supabaseSitemapSource } from '../features/sitemapSource';
+import { isValidProfileUsername, readProfileIndexingOptIn } from '../features/profileIndexing';
 import { featureFlags } from '../features';
 import { configCenter } from '../config';
 import { rateLimiter } from '../rate-limiting';
@@ -2850,6 +2851,55 @@ router.get('/sitemap-:file', async (req: Request, res: Response) => {
     console.error('[Gateway] sitemap child failed:', (err as Error).message);
     res.status(500).json({ error: 'Failed to build sitemap' });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Public profile search-engine indexing (do.md "Fix Privacy Checkup")
+//
+// The public profile page needs one bit of information the browser cannot get for
+// itself: whether the profile's owner permits external indexing. That bit lives
+// in `privacy_settings`, which is deliberately NOT a guest-readable domain (a
+// logged-out caller may not read anybody's privacy configuration) and has no
+// foreign key to `profiles`, so it cannot be embedded in a profile select either.
+// Hence this endpoint: the Gateway performs the cross-table read with the
+// service-role client it already holds, and publishes ONLY the resulting boolean.
+//
+// It is a crawl directive, not content, and it is scoped as narrowly as the
+// question requires:
+//   - no session is required or consulted. A crawler has no session, and gating
+//     this on auth would mean the directive can only be produced for a signed-in
+//     viewer, which is precisely the case that must not need one.
+//   - it returns a boolean about indexing. No profile field, no email, no display
+//     name, and no other privacy setting is ever selected, so this cannot become
+//     a way to read a user's privacy configuration.
+//   - it is per user, resolved from the username, so there is no global switch.
+//
+// do.md is explicit that this must NOT be a global robots.txt rule: the setting is
+// per user, so the restriction belongs here, at the profile level, and in the
+// per-profile sitemap predicate. The site-wide robots.txt still allows /profile/.
+//
+// `found` is reported separately from `optIn` so a username that does not exist
+// can be a 404 while a real profile whose row is missing is a 200 with
+// optIn:false - "exists, and is not indexable" is the truthful answer, and
+// collapsing the two would hide a genuine user behind a 404.
+router.get('/public/profile-indexing', async (req: Request, res: Response) => {
+  const username = typeof req.query.username === 'string' ? req.query.username : '';
+  if (!isValidProfileUsername(username)) {
+    res.status(400).json({ error: 'Invalid username' });
+    return;
+  }
+  // Deliberately uncached. Every other public read here is shared for 5 minutes,
+  // but this one is the input to a privacy directive: a cached `true` would keep
+  // telling crawlers to index a profile whose owner has since opted out, for as
+  // long as the cache entry lived. The response is one indexed row, so the cost of
+  // not caching it is negligible next to the cost of caching it.
+  res.setHeader('Cache-Control', 'no-store');
+  const { found, optIn } = await readProfileIndexingOptIn(username);
+  if (!found) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  res.status(200).json({ search_engine_indexing: optIn });
 });
 
 router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
