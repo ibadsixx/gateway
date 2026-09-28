@@ -635,6 +635,151 @@ async function main(): Promise<void> {
       'the matching opt-out withholds the profile even when other rows are present');
 
     // =======================================================================
+    // do.md (profile sitemap) §3/§5/§6/§17 - the full add/change/remove
+    // lifecycle, each proven against an ALREADY-RUNNING server.
+    // =======================================================================
+    //
+    // Every case below is two successive GETs to the same process. Nothing is
+    // restarted, rebuilt, regenerated or redeployed between them; the only thing
+    // that changes is the rows the database returns. That is what makes these the
+    // tests that actually establish do.md §14 "the following must happen without
+    // deployment" and §17 K/L/M - a regeneration step anywhere in the path would
+    // make all three of them pass for the wrong reason.
+
+    // §17A/§3/§17K - a profile created AFTER the sitemap was already being served
+    // appears on the next request, with no manual step.
+    setTables({ profiles: [profile(1)], privacy_settings: [] });
+    const beforeNew = locs((await get('/api/sitemap.xml')).body);
+    assert.equal(beforeNew.some((l) => l.endsWith('/user1')), true,
+      '§3: the pre-existing profile is advertised before the new one exists');
+    assert.equal(beforeNew.some((l) => l.endsWith('/brandnew')), false,
+      '§3: the not-yet-created profile is absent, so the next assertion can only pass by creation');
+
+    setTables({ profiles: [profile(1), profile(2, { username: 'brandnew' })], privacy_settings: [] });
+    const afterNew = locs((await get('/api/sitemap.xml')).body);
+    assert.equal(afterNew.some((l) => l.endsWith('/brandnew')), true,
+      '§3/§17A/§17K: a newly created, public, search-engine-enabled profile appears automatically');
+    assert.equal(afterNew.some((l) => l.endsWith('/user1')), true,
+      '§3: and the existing profile is still there - the new one did not replace it');
+
+    // §17F - a missing or unusable username cannot become a URL. The column is
+    // NOT NULL in the real schema, so this is unreachable from Postgres; it is
+    // asserted anyway because a sitemap that emitted "/profile/undefined" or
+    // "/profile/null" for a malformed row would advertise a URL that 404s, and
+    // the predicate is the only thing standing between the two.
+    for (const [label, username] of [
+      ['missing', undefined],
+      ['null', null],
+      ['empty', ''],
+      ['whitespace only', '   '],
+      ['a dot', 'ada.lovelace'],
+      ['a space', 'ada lovelace'],
+      ['a slash', 'ada/evil'],
+      ['over 64 chars', 'a'.repeat(65)],
+    ] as const) {
+      const row = profile(1);
+      if (username === undefined) delete row.username;
+      else row.username = username as unknown as string;
+      setTables({ profiles: [row], privacy_settings: [] });
+      const got = locs((await get('/api/sitemap.xml')).body);
+      assert.equal(got.some((l) => l.includes('/profile/')), false,
+        `§17F/§1.5: a ${label} username must not produce a URL (got ${JSON.stringify(got)})`);
+    }
+
+    // §5/§17D/§17M - a deleted profile disappears automatically. Tone deletes
+    // profiles PHYSICALLY (`profiles.id REFERENCES auth.users(id) ON DELETE
+    // CASCADE`), so "deleted" is expressed by the row being gone - which is what
+    // is simulated here. There is no soft-delete column to test, and no status
+    // column either; see the eligibility-condition map in sitemap.ts.
+    setTables({ profiles: [profile(1), profile(2, { username: 'brandnew' })], privacy_settings: [] });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/brandnew')), true,
+      '§5: the profile exists and is advertised');
+    setTables({ profiles: [profile(1)], privacy_settings: [] });
+    const afterDelete = locs((await get('/api/sitemap.xml')).body);
+    assert.equal(afterDelete.some((l) => l.endsWith('/brandnew')), false,
+      '§5/§17D/§17M: a deleted profile disappears on the next request, with no regeneration step');
+    assert.equal(afterDelete.some((l) => l.endsWith('/user1')), true,
+      '§5: and deleting one profile does not disturb the others');
+
+    // §6/§17G/§17H - a username change. The SAME profile id moves from one
+    // username to another, which is the only faithful simulation: a rename is not
+    // a delete plus a create, and the sitemap is regenerated from the current
+    // `username` column, so both the new URL and the absence of the old one follow
+    // from the row rather than from any redirect or alias table (Tone has none).
+    const renamed = profile(1, { username: 'oldusername' });
+    setTables({ profiles: [renamed], privacy_settings: [] });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/oldusername')), true,
+      '§6: the profile is advertised under its current username');
+
+    setTables({ profiles: [profile(1, { username: 'newusername' })], privacy_settings: [] });
+    const afterRename = locs((await get('/api/sitemap.xml')).body);
+    assert.equal(afterRename.some((l) => l.endsWith('/newusername')), true,
+      '§6/§17G: after the rename the sitemap carries the current canonical URL');
+    assert.equal(afterRename.some((l) => l.includes('oldusername')), false,
+      '§17H: the obsolete username is not retained anywhere in the sitemap');
+    // ...and the id is unchanged, so this is a rename rather than a replacement.
+    assert.equal(afterRename.length, beforeNew.filter((l) => l.endsWith('/user1')).length,
+      '§6: a rename does not change how many URLs the profile contributes');
+
+    // A rename must not be a way to smuggle an opted-out profile back in, nor a
+    // way to shed an opt-out by renaming away. Both directions are the same
+    // predicate, so this is one case.
+    setTables({
+      profiles: [profile(1, { username: 'newusername' })],
+      privacy_settings: [{ user_id: uuid(5001), setting_name: 'search_engine_indexing', setting_value: 'false' }],
+    });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.includes('newusername')), false,
+      '§6: renaming does not launder an explicit opt-out - the setting is keyed on user_id, not username');
+
+    // §9/§16 - the profiles read must not carry a private column. The `profile()`
+    // fixture deliberately includes an `email`, so this asserts the SELECT rather
+    // than the fixture.
+    setTables({ profiles: [profile(1)], privacy_settings: [] });
+    await get('/api/sitemap.xml');
+    const profileQueries = db.queries.filter((q) => q.table === 'profiles');
+    assert.equal(profileQueries.length > 0, true, '§9: the profiles section was read');
+    for (const q of profileQueries) {
+      const cols = String(q.select).split(',').map((c) => c.trim());
+      for (const forbidden of [
+        'email', 'phone', 'phone_number', 'phone_country_code', 'about_you',
+        'birth_date', 'birth_year', 'gender', 'pronouns', 'company',
+        'display_name', 'bio', 'profile_pic', 'cover_pic', 'vault_pin', 'vault_recovery_code',
+      ]) {
+        assert.equal(cols.includes(forbidden), false,
+          `§16: the sitemap must not select ${forbidden} from profiles`);
+      }
+      // And it must still select what a URL needs, so the check above cannot pass
+      // by selecting nothing at all.
+      assert.equal(cols.includes('id') && cols.includes('username') && cols.includes('created_at'), true,
+        `§9: profiles select is ${JSON.stringify(cols)} - it must still carry id, username and created_at`);
+    }
+
+    // §1.5 - the sitemap and the endpoint must accept exactly the same username
+    // shapes, or the sitemap advertises a URL the endpoint 400s. Asserted
+    // behaviourally against both real routes rather than by comparing two
+    // constants, so it survives either one being edited.
+    for (const candidate of ['ada', 'ada_2', 'a', 'a'.repeat(64), 'Ada99', 'ada.lovelace', 'ada lovelace', '']) {
+      setTables({ profiles: [profile(1, { username: candidate })], privacy_settings: [] });
+      const inSitemap = locs((await get('/api/sitemap.xml')).body).some((l) => l.includes('/profile/'));
+      // The fixture row carries this exact username and no opt-out, so the
+      // endpoint should answer 200 when the shape is well-formed and 400 when it
+      // is not. The invariant is AGREEMENT IN BOTH DIRECTIONS, which is the point:
+      // a 400 alongside an advertised URL means the sitemap is handing crawlers a
+      // URL the API refuses, and a 200 alongside an absent URL means a profile the
+      // product treats as indexable is being withheld.
+      const endpoint = await get(`/api/public/profile-indexing?username=${encodeURIComponent(candidate)}`);
+      if (endpoint.status === 400) {
+        assert.equal(inSitemap, false,
+          `§1.5: ${JSON.stringify(candidate)} is malformed for the endpoint, so the sitemap must not advertise it`);
+      } else {
+        assert.equal(endpoint.status, 200,
+          `§1.5: the fixture holds a profile named ${JSON.stringify(candidate)}, so the endpoint must answer 200, got ${endpoint.status}`);
+        assert.equal(inSitemap, true,
+          `§1.5: the endpoint calls ${JSON.stringify(candidate)} indexable, so the sitemap must advertise it`);
+      }
+    }
+
+    // =======================================================================
     // §10/§13/§19/§20.21 - large corpus: an index, then followable children
     // =======================================================================
     const BIG = SITEMAP_PAGE_SIZE * 2 + 137;

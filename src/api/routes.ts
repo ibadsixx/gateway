@@ -2805,9 +2805,29 @@ router.get('/sitemap.xml', async (req: Request, res: Response) => {
     // re-query the database, and recently published content is still picked up
     // within minutes. No stale-while-revalidate: that would extend the window in
     // which a shared cache can still hold a URL whose audience has since changed.
-    // The residual is bounded and harmless - a public->private change can linger
-    // up to 5 minutes, but the URL then 404s for the crawler anyway, so the cost
-    // is one wasted fetch rather than a leak.
+    // Bounded, not indefinite, which is the whole of what do.md §15 requires.
+    //
+    // THE RESIDUAL, and the reason it is stated per case rather than as one
+    // reassuring sentence - because the original one sentence was only true of
+    // content and this round made it false as a general claim.
+    //
+    //   content, public -> restricted: the URL lingers in a shared cache for up
+    //     to 5 minutes, but the row is no longer guest-readable, so the URL 404s
+    //     for the crawler. Cost is one wasted fetch. The original reasoning.
+    //
+    //   profile, search-engine enabled -> disabled: the URL lingers for up to 5
+    //     minutes AND the page is still perfectly reachable - an opted-out profile
+    //     is public and viewable, it merely gains `noindex, nofollow`. So the
+    //     404 argument does NOT apply here and must not be reused. The cost is
+    //     still only a wasted fetch, for a different reason: the profile page
+    //     carries its own `noindex, nofollow`, and a crawler honours a page-level
+    //     directive over a sitemap listing. The sitemap can briefly disagree with
+    //     the page; the page wins.
+    //
+    // That is a real (if small) disagreement window and it is why the profile
+    // section's read is not cached in-process: the 5 minutes above is the entire
+    // revalidation delay, deliberately, and it is not configurable per section
+    // because all six sections share this one response.
     res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300');
     res.setHeader('Content-Type', 'application/xml; charset=utf-8');
     // Shape and size as headers, so an operator can tell "one small sitemap" from

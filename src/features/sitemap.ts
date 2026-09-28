@@ -255,6 +255,39 @@ function contentRowPath(section: SitemapSection, row: SitemapRow): string | null
   return publicContentPath(row);
 }
 
+// WHAT do.md's FIVE ELIGIBILITY CONDITIONS ACTUALLY MAP TO HERE, because four of
+// the five are structural and only one is a per-user gate. Established by reading
+// the schema, not assumed:
+//
+//   1. "the profile exists and is active"   -> row existence. STRUCTURAL: `profiles`
+//      has NO is_active / status / deleted_at / is_deleted column. There is nothing
+//      to test, and a row that came back from the query exists.
+//   2. "publicly accessible to unauthenticated visitors" -> unconditional. STRUCTURAL:
+//      the SELECT policy is `USING (NOT is_blocked(auth.uid(), id, 'full'))`, and for
+//      an anonymous caller `auth.uid()` is NULL so no block row matches and EVERY
+//      profile is guest-readable. Tone has no private/restricted profile state, so
+//      this condition is currently vacuous rather than enforced. Recorded rather
+//      than invented: adding a column to satisfy it would be a product change, not
+//      a sitemap fix, and a sitemap that silently ignored the new column would be
+//      worse than one that never had it.
+//   3. "the search-engine setting allows it" -> the ONLY per-user gate. See below.
+//   4. "not deleted, disabled, blocked from public access" -> physical only. STRUCTURAL:
+//      deletion cascades (`profiles.id REFERENCES auth.users(id) ON DELETE CASCADE`),
+//      so a deleted account's row is gone and the per-request regeneration drops the
+//      URL with nothing to do. The `blocks` table does NOT belong here: a block is
+//      per-viewer, and a guest who is not blocked still reads the profile, so
+//      excluding blocked users would de-list profiles the public can open.
+//   5. "a valid public username/URL" -> enforced, by `profileUsernamePath` below.
+//
+// THE TRAP FOR A LATER CHANGE, stated here because nothing else will say it:
+// conditions 1, 2 and 4 hold because the columns do not exist. If anyone later adds
+// soft deletion (`deleted_at`), a `status`, or a profile-level private flag, this
+// predicate will keep advertising those profiles - it reads only the search-engine
+// setting, and a new column is invisible to it. Nothing will fail: there is no test
+// that can fail, because the state is not expressible today. Whoever adds that column
+// must extend `isIndexableProfileRow` and `PROFILES_SELECT` in the same change, or the
+// sitemap will start publishing profiles the product considers gone.
+//
 // do.md §6. `privacy_settings` is a key/value table, and the setting is
 // DEFAULT-ON as of the Sep 28, 2026 correction: a profile with no stored
 // preference is in the sitemap, and only an explicit 'false' withholds it.
