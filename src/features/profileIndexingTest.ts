@@ -1,20 +1,27 @@
 // do.md "Fix Privacy Checkup - Search Engine Profile Indexing", Gateway side.
 //
-// Two things are under test and they are not equally important:
+// UPDATED Sep 28, 2026 for do.md "Search Engine Discovery Must Default to ON".
+// The default has been INVERTED: a profile with no stored preference is now
+// indexable, and only an explicit 'false' withholds it. Every assertion below
+// that used to prove "absent is not consent" now proves the opposite, and the
+// ones that survive unchanged are the ones that must survive: the route stays
+// unauthenticated, still selects one column, and still never leaks another
+// privacy setting.
 //
-//   1. The consent test. `search_engine_indexing` is opt-IN everywhere it is
-//      expressed, so the only value that may unlock indexing is the exact string
-//      the Privacy Checkup switch writes. Everything else - absent, 'false',
-//      'TRUE', a boolean, a number, a row that failed to load - must resolve to
-//      "not indexable". This is the assertion that would catch a future
-//      "let me be lenient about the value" change, which is the kind of change
-//      that looks like a robustness fix and is actually a privacy regression.
+// Three things are under test, in order of how badly a bug would hurt:
 //
-//   2. The route. It is unauthenticated (a crawler has no session), it answers
-//      for a single username, and it must never leak another privacy setting on
-//      the way past. The last point is asserted on the actual SELECT rather than
-//      trusted: `privacy_settings` holds a user's whole privacy configuration, so
-//      an endpoint that selected `*` here would be a new way to read it.
+//   1. The effective value. NULL/missing -> ON, 'true' -> ON, 'false' -> OFF.
+//      The 'false' case is the one that now carries all the weight, because it is
+//      the ONLY thing that withholds a profile. A regression that widened the
+//      comparison ('!= false' becoming '== false', or a trim/lowercase pass) would
+//      look like a robustness fix and would publish people who said no.
+//
+//   2. The read is three-state. A missing row and an unreadable table are
+//      different facts with different answers under a permissive default, and
+//      collapsing them - the way a two-state `unknown` forces you to - is how a
+//      database blip becomes a mass publication of opted-out profiles.
+//
+//   3. The route. Unauthenticated, one username, one column, no leakage.
 //
 // Run: npm run test:profile-indexing
 import assert from 'node:assert/strict';
@@ -25,10 +32,12 @@ import { projectManager } from '../project-manager';
 import { isIndexableProfileRow } from './sitemap';
 import {
   PROFILE_INDEXING_OPT_IN,
+  PROFILE_INDEXING_OPT_OUT,
   PROFILE_INDEXING_SETTING,
-  isSearchEngineIndexingOptIn,
+  isSearchEngineIndexingEnabled,
   isValidProfileUsername,
-  readProfileIndexingOptIn,
+  readProfileIndexing,
+  type IndexingRead,
   type ProfileIndexingDeps,
 } from './profileIndexing';
 
@@ -42,24 +51,44 @@ interface RecordedQuery {
 
 async function main(): Promise<void> {
   // -------------------------------------------------------------------------
-  // 1. The consent test
+  // 1. The effective value - do.md's required semantics, exactly
   // -------------------------------------------------------------------------
   assert.equal(PROFILE_INDEXING_SETTING, 'search_engine_indexing',
     'the setting key must stay equal to the literal PrivacyCheckup.tsx writes');
   assert.equal(PROFILE_INDEXING_OPT_IN, 'true',
-    'the only value that counts as consent is the exact string the switch writes');
+    "'true' is what the switch writes when the user permits indexing");
+  assert.equal(PROFILE_INDEXING_OPT_OUT, 'false',
+    "'false' is the ONLY value that withholds a profile");
 
-  assert.equal(isSearchEngineIndexingOptIn('true'), true, "'true' is consent");
+  // NULL / missing -> ON.  This is the change.
+  assert.equal(isSearchEngineIndexingEnabled(null), true, 'NULL/missing defaults to ON');
+  assert.equal(isSearchEngineIndexingEnabled(undefined), true, 'undefined defaults to ON');
+  // TRUE -> ON.
+  assert.equal(isSearchEngineIndexingEnabled('true'), true, "'true' is ON");
+  // FALSE -> OFF.  The one value that withholds.
+  assert.equal(isSearchEngineIndexingEnabled('false'), false, "'false' is the only OFF");
 
-  // Everything that is not consent. Each is a real possibility: drift in the
-  // column, a partial write, a different client, a JSON boolean arriving where a
-  // string was expected.
-  for (const notConsent of [
-    'false', 'TRUE', 'True', ' true', 'true ', 'yes', '1', 'on', '',
-    null, undefined, true, false, 1, 0, {}, [], ['true'],
+  // Everything else falls to the default. Each is a real possibility - drift in
+  // the column, a partial write, a different client, a JSON boolean where a
+  // string was expected - and under a default-ON rule none of them may be read
+  // as a refusal, because a refusal is something a person has to express and
+  // these are not expressions of one.
+  for (const fallsToDefault of [
+    'TRUE', 'True', ' true', 'true ', 'FALSE', 'False', ' false', 'false ',
+    'yes', 'no', '1', '0', 'on', 'off', '', true, false, 1, 0, {}, [], ['false'],
   ]) {
-    assert.equal(isSearchEngineIndexingOptIn(notConsent), false,
-      `${JSON.stringify(notConsent)} is NOT consent and must not index a profile`);
+    assert.equal(isSearchEngineIndexingEnabled(fallsToDefault), true,
+      `${JSON.stringify(fallsToDefault)} is not an explicit opt-out, so it takes the ON default`);
+  }
+
+  // The comparison on the OFF side is exact, and that is load-bearing rather than
+  // incidental: a lenient 'false' test would let 'FALSE' or ' false' through as
+  // an opt-out, de-listing a user who did not ask for it. The switch writes
+  // exactly 'false' (c.toString() on a boolean), so exactness costs nothing and
+  // removes a whole class of silent de-listing.
+  for (const notAnOptOut of ['FALSE', 'False', ' false', 'false ', 'no', '0', 'off', false, 0]) {
+    assert.equal(isSearchEngineIndexingEnabled(notAnOptOut), true,
+      `${JSON.stringify(notAnOptOut)} must not be treated as an opt-out`);
   }
 
   // -------------------------------------------------------------------------
@@ -78,37 +107,41 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   // 3. The reader, with injected deps
   // -------------------------------------------------------------------------
-  const depsFor = (rows: Array<{ user_id: string; setting_value: unknown }>): ProfileIndexingDeps => ({
+  // The three-state read, so each state can be driven on its own. A helper that
+  // returned the bare column value would make 'no row' and 'unreadable'
+  // indistinguishable, which is precisely the collapse this change has to avoid.
+  const depsFor = (read: IndexingRead): ProfileIndexingDeps => ({
     async findProfileIdsByUsername() {
       return ['user-1'];
     },
     async readIndexingSetting() {
-      const row = rows.find((r) => r.user_id === 'user-1');
-      return row ? row.setting_value : undefined;
+      return read;
     },
   });
+  const withValue = (setting_value: unknown): ProfileIndexingDeps =>
+    depsFor({ kind: 'value', value: setting_value });
 
   assert.deepEqual(
-    await readProfileIndexingOptIn('ada', depsFor([{ user_id: 'user-1', setting_value: 'true' }])),
-    { found: true, optIn: true },
-    'an explicit opt-in indexes the profile'
+    await readProfileIndexing('ada', withValue('true')),
+    { found: true, enabled: true },
+    'an explicit ON indexes the profile'
   );
 
-  // The important one: a real profile that never answered the question.
+  // The new default: a real profile that never answered the question.
   assert.deepEqual(
-    await readProfileIndexingOptIn('ada', depsFor([])),
-    { found: true, optIn: false },
-    'a profile with NO setting row exists but is not indexable - absent is not consent'
+    await readProfileIndexing('ada', depsFor({ kind: 'absent' })),
+    { found: true, enabled: true },
+    'a profile with NO setting row is indexable - do.md: existing user with no stored preference is ON'
   );
   assert.deepEqual(
-    await readProfileIndexingOptIn('ada', depsFor([{ user_id: 'user-1', setting_value: 'false' }])),
-    { found: true, optIn: false },
-    'an explicit opt-out does not index'
+    await readProfileIndexing('ada', withValue('false')),
+    { found: true, enabled: false },
+    'an explicit opt-out is the one thing that withholds, and it must always win'
   );
   assert.deepEqual(
-    await readProfileIndexingOptIn('ada', depsFor([{ user_id: 'user-1', setting_value: 'TRUE' }])),
-    { found: true, optIn: false },
-    'a wrong-case value is drift, not consent'
+    await readProfileIndexing('ada', withValue('TRUE')),
+    { found: true, enabled: true },
+    'a wrong-case value is drift, not an opt-out, so it takes the default'
   );
 
   // A username nobody has. The settings read must not even be attempted.
@@ -121,14 +154,31 @@ async function main(): Promise<void> {
     },
   };
   assert.deepEqual(
-    await readProfileIndexingOptIn('ghost', noProfile),
-    { found: false, optIn: false },
+    await readProfileIndexing('ghost', noProfile),
+    { found: false, enabled: false },
     'an unknown username is not found, and is still not indexable'
   );
 
   // Infrastructure failure. The profile is real, so `found` stays true, but the
-  // answer is unreadable and the safe reading of "I could not determine this" is
-  // "do not index".
+  // answer is unreadable - and this is the case the default-ON rule puts at
+  // risk. "I could not determine this" is NOT "there is no preference": a
+  // timeout while somebody holds an explicit 'false' would otherwise resolve to
+  // the ON default and publish them.
+  const unreadable: ProfileIndexingDeps = {
+    async findProfileIdsByUsername() {
+      return ['user-1'];
+    },
+    async readIndexingSetting() {
+      return { kind: 'unreadable' };
+    },
+  };
+  assert.deepEqual(
+    await readProfileIndexing('ada', unreadable),
+    { found: true, enabled: false },
+    'an UNREADABLE preference fails closed - it is not the same fact as an absent one'
+  );
+
+  // And the same for a thrown read, which is the shape a real timeout takes.
   const exploding: ProfileIndexingDeps = {
     async findProfileIdsByUsername() {
       return ['user-1'];
@@ -138,14 +188,31 @@ async function main(): Promise<void> {
     },
   };
   assert.deepEqual(
-    await readProfileIndexingOptIn('ada', exploding),
-    { found: true, optIn: false },
-    'a failed settings read fails CLOSED, not open'
+    await readProfileIndexing('ada', exploding),
+    { found: true, enabled: false },
+    'a thrown settings read fails CLOSED, not open'
+  );
+
+  // A failure resolving the PROFILE is a different problem: `found` is genuinely
+  // unknown, so 404 is the honest answer. Answering 200/false would let an
+  // outage be used as a username oracle; answering 200/true would publish.
+  const explodingProfile: ProfileIndexingDeps = {
+    async findProfileIdsByUsername() {
+      throw new Error('profiles timeout');
+    },
+    async readIndexingSetting() {
+      throw new Error('must not be reached');
+    },
+  };
+  assert.deepEqual(
+    await readProfileIndexing('ada', explodingProfile),
+    { found: false, enabled: false },
+    'a failed profile read reports not-found rather than leaking the existence of a real user'
   );
 
   assert.deepEqual(
-    await readProfileIndexingOptIn('not a username', depsFor([{ user_id: 'user-1', setting_value: 'true' }])),
-    { found: false, optIn: false },
+    await readProfileIndexing('not a username', withValue('true')),
+    { found: false, enabled: false },
     'a malformed username never reaches the database'
   );
 
@@ -169,19 +236,20 @@ async function main(): Promise<void> {
         search_engine_indexing: value,
       } as never);
     // The route's view of the same value, straight from the shared predicate.
-    const pageSaysIndexable = (value: unknown) => isSearchEngineIndexingOptIn(value);
+    const pageSaysIndexable = (value: unknown) => isSearchEngineIndexingEnabled(value);
 
-    for (const value of ['true', 'false', 'TRUE', 'True', ' true', 'true ', 'yes', '1', '',
-                         null, undefined, true, false, 1, 0]) {
+    for (const value of ['true', 'false', 'TRUE', 'True', ' true', 'true ', 'FALSE', 'false ',
+                         'yes', '1', '0', '', null, undefined, true, false, 1, 0]) {
       assert.equal(
         sitemapSaysIndexable(value),
         pageSaysIndexable(value),
         `the sitemap and the profile page must agree on ${JSON.stringify(value)}`
       );
     }
-    assert.equal(sitemapSaysIndexable('true'), true, 'and the one consenting value indexes both');
+    assert.equal(sitemapSaysIndexable('true'), true, 'and an explicit ON indexes both');
     assert.equal(sitemapSaysIndexable('false'), false, 'and an opt-out withdraws from both');
-    assert.equal(sitemapSaysIndexable(undefined), false, 'and an absent row withdraws from both');
+    assert.equal(sitemapSaysIndexable(undefined), true,
+      'and an absent row indexes both - the default is now ON on both surfaces');
 
     // A username the app could never link to is not listed, whatever the answer.
     for (const username of ['ada.lovelace', 'ada lovelace', '', 'a'.repeat(65)]) {
@@ -262,7 +330,18 @@ async function main(): Promise<void> {
   };
 
   try {
-    // --- the ON state, unauthenticated -------------------------------
+    // --- a brand-new user: no row at all, and the default is ON -------
+    // This is the do.md headline case. A user who has never opened the privacy
+    // checkup has no row, and the route must say ON - while still being a 200,
+    // because the profile demonstrably exists.
+    tables = { profiles: [{ id: 'user-1', username: 'ada' }], privacy_settings: [] };
+    queries.length = 0;
+    const fresh = await get('/api/public/profile-indexing?username=ada');
+    assert.equal(fresh.status, 200, `a brand-new user answers 200 (got ${fresh.status}: ${fresh.body})`);
+    assert.deepEqual(fresh.json, { search_engine_indexing: true },
+      'do.md: a brand-new user with no stored preference is ON, not OFF');
+
+    // --- an explicit ON, unauthenticated -----------------------------
     tables = {
       profiles: [{ id: 'user-1', username: 'ada' }],
       privacy_settings: [
@@ -272,13 +351,16 @@ async function main(): Promise<void> {
     queries.length = 0;
     const on = await get('/api/public/profile-indexing?username=ada');
     assert.equal(on.status, 200, `ON answers 200 logged out (got ${on.status}: ${on.body})`);
-    assert.deepEqual(on.json, { search_engine_indexing: true }, 'ON reports the opt-in');
+    assert.deepEqual(on.json, { search_engine_indexing: true }, 'ON reports the effective value');
 
     // No auth challenge: a crawler has no session, and gating this on one would
     // mean the directive can only be produced for a signed-in viewer.
     assert.equal(on.headers.get('www-authenticate'), null, 'and it is not an auth challenge');
 
     // --- it selects the minimum, and never another privacy setting ----
+    // Unchanged by this round, and asserted again because the permissive default
+    // makes a leak here worse: a wider SELECT is no longer merely untidy, it is a
+    // wider read on a record whose values now mostly resolve to "publish me".
     const settingsQuery = queries.find((q) => q.table === 'privacy_settings');
     assert.ok(settingsQuery, 'the setting was read');
     const selectedCols = String(settingsQuery.select).split(',').map((c) => c.trim());
@@ -303,27 +385,82 @@ async function main(): Promise<void> {
       'the profile is looked up by the requested username, not returned wholesale'
     );
 
-    // --- the OFF state, and every unresolved state, is not indexable -
+    // --- only an explicit 'false' withholds ---------------------------
+    // Every one of these is a 200 with enabled:true, including the ones that
+    // used to be the "not indexable" list. They are grouped with a comment
+    // because the point is that the set shrank to exactly one value.
     for (const [label, value] of [
-      ['explicit false', 'false'],
-      ['absent row', undefined],
-      ['wrong case', 'TRUE'],
+      ['wrong case TRUE', 'TRUE'],
+      ['wrong case FALSE', 'FALSE'],
+      ['padded false', ' false '],
       ['garbage', 'maybe'],
+      ['numeric', '0'],
+      ['boolean-ish', 'no'],
     ] as const) {
       tables = {
         profiles: [{ id: 'user-1', username: 'ada' }],
-        privacy_settings:
-          value === undefined
-            ? []
-            : [{ user_id: 'user-1', setting_name: 'search_engine_indexing', setting_value: value }],
+        privacy_settings: [{ user_id: 'user-1', setting_name: 'search_engine_indexing', setting_value: value }],
       };
-      const off = await get('/api/public/profile-indexing?username=ada');
-      assert.equal(off.status, 200, `${label}: the profile still exists, so 200 (got ${off.status})`);
-      assert.deepEqual(off.json, { search_engine_indexing: false },
-        `${label}: not indexable - this is the case that publishes someone who said no`);
+      const res = await get('/api/public/profile-indexing?username=ada');
+      assert.equal(res.status, 200, `${label}: the profile exists, so 200 (got ${res.status})`);
+      assert.deepEqual(res.json, { search_engine_indexing: true },
+        `${label}: not an explicit opt-out, so it takes the ON default`);
     }
 
-    // --- unknown username is 404, not a false "opted out" ------------
+    // The one that matters, asserted on its own and unmistakably.
+    tables = {
+      profiles: [{ id: 'user-1', username: 'ada' }],
+      privacy_settings: [{ user_id: 'user-1', setting_name: 'search_engine_indexing', setting_value: 'false' }],
+    };
+    const off = await get('/api/public/profile-indexing?username=ada');
+    assert.equal(off.status, 200, 'an explicit opt-out is still a 200: the profile exists');
+    assert.deepEqual(off.json, { search_engine_indexing: false },
+      "do.md: the user's explicit OFF must always take precedence over the default");
+
+    // --- the ON -> OFF -> OFF transition --------------------------------
+    // "old user changes ON -> OFF -> OFF" from do.md's test list. Kept separate
+    // from the OFF -> ON case below rather than folded into it, because the two
+    // start from different states and only one of them is dangerous.
+    //
+    // This is the transition that must not regress under a permissive default.
+    // A row that already says 'true' is the case where "the user said no" has to
+    // be distinguishable from "the user never said anything", and the whole rule
+    // is that the former always wins. The third step re-asserts the OFF, because
+    // a flip that stuck once can still be undone by a later defaulting pass - and
+    // the 'true' -> 'true' tail of the other transition proves the reverse
+    // (a re-asserted ON does not decay), so together the pair shows the value
+    // is read fresh in both directions rather than latched either way.
+    for (const [label, stored, expected] of [
+      ['from an explicit ON', 'true', true],
+      ['after turning OFF', 'false', false],
+      ['and it stays OFF', 'false', false],
+    ] as const) {
+      tables = {
+        profiles: [{ id: 'user-1', username: 'ada' }],
+        privacy_settings: [{ user_id: 'user-1', setting_name: 'search_engine_indexing', setting_value: stored }],
+      };
+      const res = await get('/api/public/profile-indexing?username=ada');
+      assert.deepEqual(res.json, { search_engine_indexing: expected }, `do.md transition: ${label}`);
+    }
+
+    // --- the OFF -> ON round trip -------------------------------------
+    // "user changes OFF -> ON -> ON again" from do.md's test list, driven
+    // through the route so it exercises the real read rather than the predicate.
+    // The stored row is what changes, never the code.
+    for (const [label, stored, expected] of [
+      ['after turning OFF', 'false', false],
+      ['after turning back ON', 'true', true],
+      ['and it stays ON', 'true', true],
+    ] as const) {
+      tables = {
+        profiles: [{ id: 'user-1', username: 'ada' }],
+        privacy_settings: [{ user_id: 'user-1', setting_name: 'search_engine_indexing', setting_value: stored }],
+      };
+      const res = await get('/api/public/profile-indexing?username=ada');
+      assert.deepEqual(res.json, { search_engine_indexing: expected }, `do.md round trip: ${label}`);
+    }
+
+    // --- unknown username is 404, not a fake "opted out" --------------
     tables = { profiles: [] };
     const ghost = await get('/api/public/profile-indexing?username=ghost');
     assert.equal(ghost.status, 404, `an unknown username is 404 (got ${ghost.status})`);
@@ -340,25 +477,43 @@ async function main(): Promise<void> {
     const repeated = await get('/api/public/profile-indexing?username=ada&username=bob');
     assert.equal(repeated.status, 400, 'a repeated username param is a 400, not an array being coerced');
 
-    // --- an unreadable table fails closed, and says nothing internals -
-    tables = { profiles: [{ id: 'user-1', username: 'ada' }] };
+    // --- an unreadable table does NOT become the default -------------
+    // The sharpest edge of this whole change. The profile exists, the table
+    // errors, and the two candidate answers are "no stored preference" (ON) and
+    // "I could not read the preference" (OFF). The second is correct: the user
+    // may well hold an explicit 'false', and resolving their timeout to ON
+    // publishes them. Asserted here over the real route because this is exactly
+    // where a two-state read would pass silently.
+    tables = {
+      profiles: [{ id: 'user-1', username: 'ada' }],
+      privacy_settings: [{ user_id: 'user-1', setting_name: 'search_engine_indexing', setting_value: 'false' }],
+    };
     failing = new Set(['privacy_settings']);
     const broken = await get('/api/public/profile-indexing?username=ada');
     assert.equal(broken.status, 200, 'a failed settings read still answers, so the client can render');
     assert.deepEqual(broken.json, { search_engine_indexing: false },
-      'and it fails CLOSED rather than reporting a default of true');
+      'an unreadable preference must NOT fall through to the ON default');
     assert.equal(/boom|supabase|error/i.test(broken.body), false,
       'and no internal error text is exposed in the response');
+
+    // A failed PROFILE read is a different failure: 404, because `found` is
+    // genuinely unknown and 200 would answer the existence question with a lie.
+    failing = new Set(['profiles']);
+    const brokenProfile = await get('/api/public/profile-indexing?username=ada');
+    assert.equal(brokenProfile.status, 404,
+      'a failed profile read is 404 - it must not claim a real user does not exist');
     failing = new Set();
 
     // --- it is not cached ---------------------------------------------
-    // Every other public read in the Gateway is shared for 5 minutes. This one is
-    // the input to a privacy directive, so a cached `true` would keep telling
-    // crawlers to index a profile whose owner has since opted out.
+    // Every other public read in the Gateway is shared for 5 minutes. Under the
+    // old rule a stale `true` could only withhold a URL; now it can PUBLISH one,
+    // so this is the assertion that matters most on this route.
     assert.equal(on.headers.get('cache-control'), 'no-store',
       `the directive source must not be cached (got ${on.headers.get('cache-control')})`);
     assert.equal((on.headers.get('cache-control') || '').includes('s-maxage'), false,
       'and specifically carries no shared-cache TTL');
+    assert.equal(fresh.headers.get('cache-control'), 'no-store',
+      'the default-ON answer is cached no more than the explicit one would be');
 
     // --- it is not the domain catch-all -------------------------------
     // A two-segment path, so `/:domain` cannot swallow it. Asserted so a future

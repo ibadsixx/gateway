@@ -37,7 +37,7 @@
 // into a deep page walk, and it keeps each child inside Google's 50,000-URL and
 // 50MB ceilings on its own.
 import { isGuestSafePublicContent } from './contentAudience';
-import { isSearchEngineIndexingOptIn } from './profileIndexing';
+import { isSearchEngineIndexingEnabled } from './profileIndexing';
 import type { AudienceRow } from './contentAudience';
 
 export type SitemapRow = AudienceRow & {
@@ -49,7 +49,8 @@ export type SitemapRow = AudienceRow & {
   privacy?: unknown;
   tag?: unknown;
   // Projected onto a profile row by the reader, which is the only place that
-  // can see another table. See isIndexableProfileRow for why it is opt-in.
+  // can see another table. Absent means "no stored preference", which is now the
+  // indexable default - see isIndexableProfileRow.
   search_engine_indexing?: unknown;
 };
 
@@ -254,35 +255,27 @@ function contentRowPath(section: SitemapSection, row: SitemapRow): string | null
   return publicContentPath(row);
 }
 
-// do.md §6. `privacy_settings` is a key/value table, and the setting is opt-IN:
-// PrivacyCheckup.tsx reads the toggle as `privacySettings.search_engine_indexing
-// === 'true'`, so a user with no row for it is rendered as "not permitted".
+// do.md §6. `privacy_settings` is a key/value table, and the setting is
+// DEFAULT-ON as of the Sep 28, 2026 correction: a profile with no stored
+// preference is in the sitemap, and only an explicit 'false' withholds it.
 //
-// The spec's two sentences pull opposite ways for the absent case - "if a user
-// has explicitly disabled ... do not include" (which reads as allow-by-default)
-// versus "do not assume every public profile should automatically be in the
-// sitemap" (which forbids it). This follows the second, because:
-//   - it is the codebase's OWN default: the toggle renders off when unset, so
-//     absent already means "not permitted" everywhere else in the product, and
-//     indexing a profile the product shows as opted-out would contradict it;
-//   - it fails closed, matching RLS's `ELSE false` and §2's audience rule; and
-//   - the failure is recoverable. Omitting a profile that opted in costs that
-//     profile its traffic; the alternative costs a user who said no the ability
-//     to be de-listed by editing one column.
-//
-// The consequence is deliberate and worth stating plainly: NO profile is in the
-// sitemap until its owner opts in, so this section is empty for a deployment
-// whose users have never opened the privacy checkup.
+// This reverses the previous reading, which required an opt-in. The reversal is
+// driven from the one predicate in ./profileIndexing rather than restated here,
+// and the important consequence is recorded rather than left implicit: an
+// EXPLICIT 'false' is what removes a profile, and because the opt-out query in
+// sitemapSource is an equality filter on that literal, a user who has never
+// opened the privacy checkup is advertised. That is the intended product
+// behaviour, not an oversight, and the withdrawal path is the same one row.
 export function isIndexableProfileRow(row: SitemapRow): boolean {
   if (!row || typeof row !== 'object') return false;
-  // The SAME consent test the public profile page uses, imported rather than
+  // The SAME predicate the public profile page uses, imported rather than
   // repeated. These two surfaces answer one question about one user, and do.md is
   // explicit that a profile must be consistently in or out: if the page said
   // "index me" while the sitemap said "do not list me", Google would be told to
   // crawl a URL the sitemap had just stopped advertising. A duplicated literal
   // here is how that disagreement starts - one side gets a tolerance the other
   // does not, and the drift is invisible until a profile is published.
-  if (!isSearchEngineIndexingOptIn(row.search_engine_indexing)) return false;
+  if (!isSearchEngineIndexingEnabled(row.search_engine_indexing)) return false;
   return profileUsernamePath(row.username) !== null;
 }
 

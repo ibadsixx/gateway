@@ -54,7 +54,7 @@
 // registered is not a failure: there is provably no content of that type in this
 // deployment, so an empty section is the truthful answer.
 import { projectManager } from '../project-manager';
-import { PROFILE_INDEXING_OPT_IN, PROFILE_INDEXING_SETTING } from './profileIndexing';
+import { PROFILE_INDEXING_OPT_OUT, PROFILE_INDEXING_SETTING } from './profileIndexing';
 import {
   cursorForRow,
   isIndexableSitemapRow,
@@ -80,12 +80,16 @@ const PAGES_SELECT = 'id,created_at';
 const GROUPS_SELECT = 'id,privacy,created_at';
 const HASHTAGS_SELECT = 'tag,created_at';
 
-// §6: the profile search-engine opt-in, and only that one setting.
-// The setting key comes from the one module that owns this question, so a rename
-// on the Privacy Checkup side cannot leave the sitemap querying a key that no
-// longer exists - which would fail closed and silently empty the profiles section.
-const PROFILE_OPT_IN_SETTING = PROFILE_INDEXING_SETTING;
-const PROFILE_OPT_IN_VALUE = PROFILE_INDEXING_OPT_IN;
+// §6: the profile search-engine preference, and only that one setting.
+// The setting key and the opt-out value both come from the one module that owns
+// this question, so a rename on the Privacy Checkup side cannot leave the sitemap
+// querying a key or a value that no longer exists. That failure mode has changed
+// with the default: under the old opt-in rule a stale key produced an empty
+// profiles section (obvious); now it would produce an empty OPT-OUT set, i.e. a
+// profiles section that lists everybody. Importing both literals is what keeps
+// the two impossible to drift apart.
+const PROFILE_OPT_OUT_SETTING = PROFILE_INDEXING_SETTING;
+const PROFILE_OPT_OUT_VALUE = PROFILE_INDEXING_OPT_OUT;
 const PRIVACY_SETTINGS_SELECT = 'user_id';
 
 // `.in()` is sent as a query string, so the value list is bounded. 250 uuids is
@@ -229,41 +233,50 @@ function asRows(result: SitemapResult): SitemapRow[] {
 }
 
 // ---------------------------------------------------------------------------
-// profiles: the §6 opt-in, which cannot be joined server-side
+// profiles: the §6 opt-out, which cannot be joined server-side
 // ---------------------------------------------------------------------------
 
 // `privacy_settings.user_id` REFERENCES auth.users(id), not public.profiles, so
-// PostgREST has no relationship to embed and the opt-in cannot be pushed into
-// the profiles query. The alternative - reading every opted-in id and then
-// `.in('id', ...)` - is O(whoever opted in), which is exactly the "load millions
-// of rows into memory unnecessarily" §9 rules out, and it grows with the user
-// base rather than with the page.
+// PostgREST has no relationship to embed and the preference cannot be pushed into
+// the profiles query. The alternative - reading every opted-OUT id and then
+// `.in('id', ...)` - is O(whoever opted out), which is exactly the "load millions
+// of rows into memory unnecessarily" §9 rules out, and it grows with the number
+// of people who declined rather than with the page.
 //
 // So it is read the other way round: take the page's profile ids (bounded by the
-// page size) and ask which of THOSE are opted in. Cost is one batched query per
-// page, not per profile, and the answer is read fresh on every request - which
-// §14 requires. A cached opt-in set would be the wrong trade precisely because
-// the failure has to be fail-closed: the risky direction is a profile that opted
-// OUT still being advertised, and a cache buys nothing that protects against it
-// that the fresh read does not already give.
-function profileOptInDomain(): string {
+// page size) and ask which of THOSE opted out. The direction of this query is
+// what the default-ON change turns on. Under the old opt-in rule the interesting
+// set was small (the people who said yes) and everything else had to be
+// excluded; now the interesting set is the people who said NO, and everyone else
+// is included by default. Inverting the query rather than the predicate is what
+// keeps the cost proportional to the page.
+//
+// The answer is read fresh on every request - §14 requires it. Under the old
+// rule a cache was safe to avoid because a stale answer could only withhold a
+// URL; now a stale answer can PUBLISH one, so a cache would be actively unsafe
+// and the fresh read is doing real work rather than being belt-and-braces.
+function profileOptOutDomain(): string {
   // Same resolution order peopleYouMayKnow.ts uses: the dedicated domain when
   // the live infra registers it, else the `users` host that owns the table in
   // the offline fallback topology.
   return readableProjects('privacy_settings').length > 0 ? 'privacy_settings' : 'users';
 }
 
-async function optedInUserIds(
+async function optedOutUserIds(
   section: SitemapSection,
   userIds: string[]
 ): Promise<Set<string>> {
-  const optedIn = new Set<string>();
-  if (userIds.length === 0) return optedIn;
-  const projects = readableProjects(profileOptInDomain());
+  const optedOut = new Set<string>();
+  if (userIds.length === 0) return optedOut;
+  const projects = readableProjects(profileOptOutDomain());
   if (projects.length === 0) {
-    // No table to ask. Failing closed (no profile indexed) is the same answer as
-    // "nobody opted in", and is the safe one.
-    return optedIn;
+    // No table to ask. An empty opt-out set means "nobody declined", which under
+    // the default-ON rule is the same as "index them all" - so this is now the
+    // PERMISSIVE answer, and it is reached only when the table is genuinely not
+    // registered. `throwIfError` below still turns a registered-but-failing
+    // read into a 500 rather than letting it through as "no opt-outs", which is
+    // what keeps a transient database error from publishing an explicit 'false'.
+    return optedOut;
   }
   for (let offset = 0; offset < userIds.length; offset += IN_CHUNK_SIZE) {
     const chunk = userIds.slice(offset, offset + IN_CHUNK_SIZE);
@@ -272,8 +285,8 @@ async function optedInUserIds(
         const query = project.client
           .from('privacy_settings')
           .select(PRIVACY_SETTINGS_SELECT)
-          .eq('setting_name', PROFILE_OPT_IN_SETTING)
-          .eq('setting_value', PROFILE_OPT_IN_VALUE)
+          .eq('setting_name', PROFILE_OPT_OUT_SETTING)
+          .eq('setting_value', PROFILE_OPT_OUT_VALUE)
           .in('user_id', chunk) as SitemapQuery;
         const result = throwIfError(section, await query, 'privacy_settings read');
         return asRows(result);
@@ -281,25 +294,26 @@ async function optedInUserIds(
     );
     for (const row of results.flat()) {
       const userId = row['user_id'];
-      if (typeof userId === 'string' && userId) optedIn.add(userId);
+      if (typeof userId === 'string' && userId) optedOut.add(userId);
     }
   }
-  return optedIn;
+  return optedOut;
 }
 
-// Project the resolved setting onto each profile row, so §6's opt-in decision
-// stays a pure predicate in ./sitemap (`isIndexableProfileRow`) instead of being
-// re-implemented here. Rows that did not opt in are marked explicitly rather
-// than dropped, so a future change to the predicate cannot accidentally widen
-// this into "only add the opted-in ones and pass everything else through".
-async function markProfileOptIns(section: SitemapSection, rows: SitemapRow[]): Promise<SitemapRow[]> {
+// Project the resolved preference onto each profile row, so §6's decision stays a
+// pure predicate in ./sitemap (`isIndexableProfileRow`) instead of being
+// re-implemented here. The projection is deliberately the same two literals the
+// predicate understands - a row in the opt-out set is marked 'false' and
+// everything else 'true' - so the DB prefilter and the in-memory predicate can
+// never disagree about what the column means.
+async function markProfileOptOuts(section: SitemapSection, rows: SitemapRow[]): Promise<SitemapRow[]> {
   const ids = rows
     .map((row) => row.id)
     .filter((id): id is string => typeof id === 'string' && id.length > 0);
-  const optedIn = await optedInUserIds(section, ids);
+  const optedOut = await optedOutUserIds(section, ids);
   return rows.map((row) => ({
     ...row,
-    search_engine_indexing: optedIn.has(String(row.id)) ? 'true' : 'false',
+    search_engine_indexing: optedOut.has(String(row.id)) ? 'false' : 'true',
   }));
 }
 
@@ -350,25 +364,23 @@ function mergeShards(section: SitemapSection, perProject: SitemapRow[][], limit:
 export function supabaseSitemapSource(): SitemapSource {
   return {
     async countSection(section: SitemapSection): Promise<number> {
-      // The profiles count is exact rather than a head count of profiles: the
-      // opt-in is a real filtered row count, and it is tighter than counting
-      // every profile (most of which have not opted in).
-      if (section === 'profiles') {
-        const projects = readableProjects(profileOptInDomain());
-        if (projects.length === 0) return 0;
-        const counts = await Promise.all(
-          projects.map(async (project) => {
-            const query = project.client
-              .from('privacy_settings')
-              .select(PRIVACY_SETTINGS_SELECT, { count: 'exact', head: true })
-              .eq('setting_name', PROFILE_OPT_IN_SETTING)
-              .eq('setting_value', PROFILE_OPT_IN_VALUE) as SitemapQuery;
-            const result = throwIfError(section, await query, 'privacy_settings count');
-            return typeof result.count === 'number' ? result.count : 0;
-          })
-        );
-        return counts.reduce((total, value) => total + value, 0);
-      }
+      // NOTE on the profiles count, which USED to be special-cased here and no
+      // longer is. It asked privacy_settings for the number of opt-ins. Under the
+      // default-ON rule that would report 0 for a deployment where nobody has ever
+      // opened the privacy checkup - and a count of 0 drops the section from the
+      // index entirely, which is the exact bug this round exists to remove.
+      //
+      // Subtracting a global opt-out count instead was implemented and is wrong,
+      // in the direction that matters. `privacy_settings.user_id` references
+      // auth.users, so an opt-out count necessarily includes users who have no
+      // profile row, and the subtraction under-counts. The caller derives
+      // `Math.ceil(count / pageSize)` from this number, so too few means real
+      // profile URLs are never advertised, while too many only produces a trailing
+      // child file that is empty - which the same doc comment below already calls
+      // an acceptable over-count. The over-estimate is therefore free and the
+      // under-estimate is not, so profiles fall through to the plain head count
+      // with no preference lookup at all. That also drops one table from the set
+      // that has to be reachable for the profiles section to render.
 
       const projects = projectsForSection(section);
       if (projects.length === 0) return 0;
@@ -418,7 +430,7 @@ export function supabaseSitemapSource(): SitemapSource {
       );
 
       const merged = mergeShards(section, perProject, limit);
-      return section === 'profiles' ? markProfileOptIns(section, merged) : merged;
+      return section === 'profiles' ? markProfileOptOuts(section, merged) : merged;
     },
   };
 }

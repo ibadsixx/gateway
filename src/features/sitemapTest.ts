@@ -315,27 +315,36 @@ async function main(): Promise<void> {
 
   // =========================================================================
   // §20.12/§20.13 - profiles follow the profile-level search-engine setting
+  //
+  // INVERTED Sep 28, 2026 for do.md's default-ON correction. A profile with no
+  // stored preference is now advertised, and only an explicit 'false' withholds
+  // it. The matrix below is the same set of values as before with the
+  // expectations reversed, so a reader can see exactly which way the rule moved:
+  // the "withholds" set shrank from sixteen values to one.
   // =========================================================================
-  assert.equal(isIndexableProfileRow(profile(1)), true, '§20.12: an opted-in profile is indexable');
-  for (const value of ['false', 'true ', 'TRUE', '1', 'yes', '', null, undefined, 1, true]) {
-    assert.equal(isIndexableProfileRow(profile(2, { search_engine_indexing: value })), false,
-      `§20.13: search_engine_indexing=${JSON.stringify(value)} does not permit indexing`);
+  assert.equal(isIndexableProfileRow(profile(1)), true, '§20.12: an explicit ON profile is indexable');
+  assert.equal(
+    isIndexableProfileRow(profile(2, { search_engine_indexing: 'false' })), false,
+    '§20.13: an explicit opt-out is the one value that withholds a profile'
+  );
+  for (const value of ['true ', 'TRUE', 'True', 'FALSE', ' false', '1', '0', 'yes', 'no', 'on', 'off',
+                       '', null, undefined, 1, 0, true, false]) {
+    assert.equal(isIndexableProfileRow(profile(2, { search_engine_indexing: value })), true,
+      `§20.13: ${JSON.stringify(value)} is not an opt-out, so the ON default applies`);
   }
-  // The deliberate §6 reading: no setting row at all is NOT permission. The
-  // PrivacyCheckup toggle renders off for an absent row, so the product already
-  // treats it as "not permitted" and the sitemap must agree.
+  // The new default, stated as its own case because it is the change.
   const { search_engine_indexing: _absent, ...noSetting } = profile(3);
-  assert.equal(isIndexableProfileRow(noSetting), false,
-    '§6: a profile that never set the option is not in the sitemap');
-  assert.equal(isIndexableProfileRow(profile(3, { search_engine_indexing: undefined })), false,
-    'an explicitly-undefined setting is not an opt-in');
+  assert.equal(isIndexableProfileRow(noSetting), true,
+    '§6 (default-ON): a profile that never set the option IS in the sitemap');
+  assert.equal(isIndexableProfileRow(profile(3, { search_engine_indexing: undefined })), true,
+    'an explicitly-undefined setting is an absent one, so it takes the default');
 
   const profileRoot = await buildSitemapRoot(
     fakeSource({ profiles: [profile(1), profile(2, { search_engine_indexing: 'false' }), noSetting] }),
     { baseUrl: BASE }
   );
-  assert.deepEqual(locs(profileRoot.xml), [`${BASE}/profile/user1`],
-    '§20.12/13: only the opted-in profile URL is advertised');
+  assert.deepEqual(locs(profileRoot.xml).sort(), [`${BASE}/profile/user1`, `${BASE}/profile/user3`],
+    '§20.12/13: the opt-out is withheld; the explicit ON and the unset profile are both advertised');
 
   // =========================================================================
   // §7 - the other public entities, gated by their own real rules
@@ -513,12 +522,19 @@ async function main(): Promise<void> {
     '§20.14: a deleted row disappears');
 
   // A profile opting out is the §14-critical transition, and it must take effect
-  // on the very next read - no cached opt-in set.
+  // on the very next read - no cached opt-out set. This matters more than it did
+  // under the old default: a stale answer can now PUBLISH a profile, not merely
+  // withhold one.
   assert.deepEqual(await childFor(fakeSource({ profiles: [profile(1)] }), 'profiles', 1), [`${BASE}/profile/user1`],
-    '§20.12: the profile is listed while opted in');
+    '§20.12: a profile with no stored preference is listed');
   assert.deepEqual(
     await childFor(fakeSource({ profiles: [profile(1, { search_engine_indexing: 'false' })] }), 'profiles', 1),
     [], '§20.13: opting out removes the profile URL immediately, not after a TTL');
+  // And the reverse transition, so the pair proves the set is read fresh rather
+  // than one-directional: a profile that turns indexing back ON comes back.
+  assert.deepEqual(
+    await childFor(fakeSource({ profiles: [profile(1, { search_engine_indexing: 'true' })] }), 'profiles', 1),
+    [`${BASE}/profile/user1`], 'the OFF -> ON transition re-advertises on the next read');
 
   // =========================================================================
   // Child request validation

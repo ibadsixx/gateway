@@ -321,8 +321,9 @@ async function main(): Promise<void> {
         post(6, { status: null }),
       ],
       profiles: [profile(1), profile(2), profile(3)],
-      // Only user1 opted in. user2 and user3 have no row at all.
-      privacy_settings: [{ id: uuid(1), user_id: uuid(5001), setting_name: 'search_engine_indexing', setting_value: 'true' }],
+      // Only user1 has an explicit opt-OUT, so it is withheld. user2 and user3
+      // have no row at all and are advertised by the default-ON rule.
+      privacy_settings: [{ id: uuid(1), user_id: uuid(5001), setting_name: 'search_engine_indexing', setting_value: 'false' }],
       pages: [{ id: uuid(6001), name: 'Tone', created_at: '2026-03-01T00:00:00Z' }],
       groups: [
         { id: uuid(7001), name: 'Open', privacy: 'public', created_at: '2026-04-01T00:00:00Z' },
@@ -369,12 +370,14 @@ async function main(): Promise<void> {
       'a public post stored as status=Published is NOT listed (RLS ELSE false denies it)');
     assert.equal(listed.includes(`https://tonesn.vercel.app/post/${uuid(6)}`), false,
       'a public post with status=NULL is NOT listed (RLS ELSE false denies it)');
-    // §20.12/13 - the profile section follows the real opt-in table.
-    assert.equal(listed.includes('https://tonesn.vercel.app/profile/user1'), true,
-      '§20.12: the opted-in profile is listed');
+    // §20.12/13 - the profile section follows the real preference table.
+    // INVERTED for the default-ON rule: user1 holds the explicit 'false' and is
+    // withheld; user2 and user3 have no row and are advertised.
+    assert.equal(listed.includes('https://tonesn.vercel.app/profile/user1'), false,
+      '§20.13: the profile with an explicit opt-out is withheld');
     for (const username of ['user2', 'user3']) {
-      assert.equal(listed.includes(`https://tonesn.vercel.app/profile/${username}`), false,
-        `§20.13: ${username} (no opt-in) is not advertised`);
+      assert.equal(listed.includes(`https://tonesn.vercel.app/profile/${username}`), true,
+        `§6 (default-ON): ${username}, which never set the option, is advertised`);
     }
     // §7 - the other public entities, each under its own rule.
     assert.equal(listed.includes(`https://tonesn.vercel.app/pages/${uuid(6001)}`), true, '§7: a page is listed');
@@ -566,23 +569,70 @@ async function main(): Promise<void> {
       'I: the control row is still listed, so the exclusions above are specific');
 
     // §20.13 - the profile opt-out transition, which is the §14-critical one.
+    // Driven through the REAL privacy_settings query rather than a projected row,
+    // so the default-ON inversion is exercised end to end: the reader now fetches
+    // the opt-OUT set, and a query still asking for the opt-IN set would return
+    // nothing and silently advertise everybody.
     setTables({
       profiles: [profile(1)],
       privacy_settings: [{ user_id: uuid(5001), setting_name: 'search_engine_indexing', setting_value: 'true' }],
     });
     assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/user1')), true,
-      'the profile is listed while opted in');
+      'the profile is listed while indexing is permitted');
     setTables({
       profiles: [profile(1)],
       privacy_settings: [{ user_id: uuid(5001), setting_name: 'search_engine_indexing', setting_value: 'false' }],
     });
     assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/user1')), false,
-      '§20.13: opting out removes the profile URL on the very next request, with no cached opt-in set');
+      '§20.13: opting out removes the profile URL on the very next request, with no cached opt-out set');
 
-    // A profile whose setting row is missing entirely is the §6 default.
+    // ...and back again, so the pair proves the set is genuinely read per request
+    // rather than latched in one direction.
+    setTables({
+      profiles: [profile(1)],
+      privacy_settings: [{ user_id: uuid(5001), setting_name: 'search_engine_indexing', setting_value: 'true' }],
+    });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/user1')), true,
+      'turning indexing back ON re-advertises the profile on the next request');
+
+    // A profile whose setting row is missing entirely is now the DEFAULT, and the
+    // inversion is the point: do.md requires an existing user who never answered
+    // to be treated as ON.
     setTables({ profiles: [profile(1)], privacy_settings: [] });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/user1')), true,
+      '§6 (default-ON): no stored preference means the profile IS advertised');
+
+    // Only the opt-out row withholds. A row holding anything else is not a
+    // refusal, so it must not silently de-list the profile.
+    for (const stored of ['TRUE', 'False', ' maybe ', '0']) {
+      setTables({
+        profiles: [profile(1)],
+        privacy_settings: [{ user_id: uuid(5001), setting_name: 'search_engine_indexing', setting_value: stored }],
+      });
+      assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/user1')), true,
+        `setting_value=${JSON.stringify(stored)} is not an opt-out, so the profile stays advertised`);
+    }
+
+    // Another user's opt-out must not withhold this profile. The reader is keyed
+    // on user_id, and the default-ON rule makes a key bug far more visible: an
+    // over-broad match would de-list everyone whenever anyone opted out.
+    setTables({
+      profiles: [profile(1)],
+      privacy_settings: [{ user_id: uuid(9999), setting_name: 'search_engine_indexing', setting_value: 'false' }],
+    });
+    assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/user1')), true,
+      "somebody else's opt-out does not withhold this profile");
+
+    // ...but this user's does, even alongside an unrelated one.
+    setTables({
+      profiles: [profile(1)],
+      privacy_settings: [
+        { user_id: uuid(5001), setting_name: 'search_engine_indexing', setting_value: 'false' },
+        { user_id: uuid(9999), setting_name: 'search_engine_indexing', setting_value: 'false' },
+      ],
+    });
     assert.equal(locs((await get('/api/sitemap.xml')).body).some((l) => l.endsWith('/user1')), false,
-      '§6: no setting row is not an opt-in');
+      'the matching opt-out withholds the profile even when other rows are present');
 
     // =======================================================================
     // §10/§13/§19/§20.21 - large corpus: an index, then followable children

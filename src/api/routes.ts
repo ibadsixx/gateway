@@ -13,7 +13,7 @@ import {
   SitemapPageOutOfRange,
 } from '../features/sitemap';
 import { supabaseSitemapSource } from '../features/sitemapSource';
-import { isValidProfileUsername, readProfileIndexingOptIn } from '../features/profileIndexing';
+import { isValidProfileUsername, readProfileIndexing } from '../features/profileIndexing';
 import { featureFlags } from '../features';
 import { configCenter } from '../config';
 import { rateLimiter } from '../rate-limiting';
@@ -2878,28 +2878,32 @@ router.get('/sitemap-:file', async (req: Request, res: Response) => {
 // per user, so the restriction belongs here, at the profile level, and in the
 // per-profile sitemap predicate. The site-wide robots.txt still allows /profile/.
 //
-// `found` is reported separately from `optIn` so a username that does not exist
+// `found` is reported separately from `enabled` so a username that does not exist
 // can be a 404 while a real profile whose row is missing is a 200 with
-// optIn:false - "exists, and is not indexable" is the truthful answer, and
-// collapsing the two would hide a genuine user behind a 404.
+// enabled:true - "exists, and is indexable by default" is the truthful answer,
+// and collapsing the two would hide a genuine user behind a 404. The split is
+// also the same shape as under the old opt-in rule, where it was 200/false
+// instead: what changed is the value, not the reason for keeping them apart.
 router.get('/public/profile-indexing', async (req: Request, res: Response) => {
   const username = typeof req.query.username === 'string' ? req.query.username : '';
   if (!isValidProfileUsername(username)) {
     res.status(400).json({ error: 'Invalid username' });
     return;
   }
-  // Deliberately uncached. Every other public read here is shared for 5 minutes,
-  // but this one is the input to a privacy directive: a cached `true` would keep
-  // telling crawlers to index a profile whose owner has since opted out, for as
-  // long as the cache entry lived. The response is one indexed row, so the cost of
-  // not caching it is negligible next to the cost of caching it.
+  // Deliberately uncached, and the reason is now sharper. Every other public read
+  // here is shared for 5 minutes; this one is the input to a crawl directive, and
+  // the only value that withholds a profile is an explicit 'false'. A cached
+  // `true` would keep telling crawlers to index a profile whose owner has since
+  // opted out, for as long as the cache entry lived - which under a default-ON
+  // rule is the one thing this endpoint must never do. The response is one
+  // indexed row, so not caching it costs nothing worth protecting.
   res.setHeader('Cache-Control', 'no-store');
-  const { found, optIn } = await readProfileIndexingOptIn(username);
+  const { found, enabled } = await readProfileIndexing(username);
   if (!found) {
     res.status(404).json({ error: 'Not found' });
     return;
   }
-  res.status(200).json({ search_engine_indexing: optIn });
+  res.status(200).json({ search_engine_indexing: enabled });
 });
 
 router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
