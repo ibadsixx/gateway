@@ -45,10 +45,52 @@
 // presence table, and no second heartbeat; the dot in the conversation list, the
 // ChatWindow header and the group-chat online count all continue to derive from
 // this one value, which is also why repairing the writer repaired all of them.
+//
+// LOGOUT. The heartbeat answers "is this user here now", which it can only answer
+// by freshness. It cannot answer "did this user just leave", because leaving and
+// staying look identical in a timestamp until the freshness window expires. So an
+// explicit sign-out used to be invisible: the row kept the timestamp from the
+// heartbeat up to one interval earlier, `isOnline()` kept answering true for the
+// whole window, and other users saw a green dot on somebody who had signed out.
+// See `PRESENCE_LOGGED_OUT_AT` and `writePresenceLogout`.
 
 import { projectManager } from '../project-manager';
 
 export const PRESENCE_PROFILE_DOMAINS = ['profiles', 'users'] as const;
+
+/**
+ * The value `last_seen_at` is set to when a user explicitly logs out.
+ *
+ * WHY A CONSTANT AND NOT `NULL`, which is the obvious choice and is wrong here
+ * for two independent reasons:
+ *
+ *   - The reader refuses to propagate a null. `useConversations` keeps a partner's
+ *     existing value when the server sends none, because that is the shape the
+ *     gateway returns for a partner whose presence it REDACTED - a non-friend with
+ *     a pending message request. A null written by logout is indistinguishable
+ *     from that redaction and is dropped on the floor, so the dot would stay
+ *     green until the freshness window expired: the bug, unchanged.
+ *   - `NULL` is also what `formatLastSeen` renders as the literal string
+ *     "Offline", so it would silently discard the user's real last-seen time.
+ *
+ * WHY NOT A BACKDATED TIMESTAMP (`now - threshold - margin`), which preserves
+ * last-seen precision: that couples the writer to the reader's
+ * `OFFLINE_THRESHOLD_MS`, which lives in a different repository. Raise the
+ * threshold past the margin and explicit logout silently stops working - the same
+ * class of invisible failure this module was written to eliminate, and one that
+ * would take a production incident to notice.
+ *
+ * The Unix epoch is used because it is the one instant that is unambiguously "not
+ * now", so the marker cannot rot as the reader's threshold is tuned: it is stale
+ * under any freshness window below its own age (~56 years), where a backdated
+ * value would go stale only while the threshold stayed below a margin chosen in
+ * another repository. It also round-trips - Postgres renders `TIMESTAMPTZ` as
+ * `1970-01-01T00:00:00+00:00`, which `Date.parse` still yields exactly 0 for, so
+ * the frontend matches it by PARSED TIME and never by string. See
+ * `isLoggedOutPresence` in `src/hooks/usePresence.ts`, which must recognise the
+ * same instant.
+ */
+export const PRESENCE_LOGGED_OUT_AT = '1970-01-01T00:00:00.000Z';
 
 /**
  * Minimal shape of the part of a Supabase client this uses. Loosely typed on
@@ -103,38 +145,91 @@ export async function writePresenceHeartbeat(
   deps: PresenceWriteDeps = defaultPresenceWriteDeps,
   now: () => Date = () => new Date(),
 ): Promise<PresenceWriteOutcome> {
+  return writePresenceTimestamp(userId, now().toISOString(), deps);
+}
+
+/**
+ * Remove the caller's presence because they explicitly signed out.
+ *
+ * This is the "untrack" step, and Tone has no other way to express it: there is
+ * no Realtime presence channel in this project - `GatewayChannel` in
+ * `src/lib/gateway.ts` is a local shim whose `subscribe()` connects to nothing
+ * and which implements neither `track()`, `untrack()`, `presenceState()` nor
+ * `presence_diff`, and whose `send({type:'broadcast'})` dispatches only to
+ * broadcast listeners in the SAME tab. A local broadcast cannot reach another
+ * user, so the marker has to be persisted, and persisting it is what the other
+ * user's existing presence refresh reads.
+ *
+ * Consequences of that, which the caller is responsible for honouring:
+ *
+ *   - The write is keyed on `userId` and MUST be the gateway-verified caller id,
+ *     exactly as for the heartbeat. Otherwise this endpoint would let any
+ *     signed-in user force any other account offline.
+ *   - It must run BEFORE the session is destroyed, while the bearer token still
+ *     authenticates it. See `endPresenceSession` in the frontend.
+ *   - It must be the LAST presence write for this session. A heartbeat that
+ *     lands after it overwrites the marker with `now` and the dot goes green
+ *     again for a full freshness window, which is why the caller pauses the
+ *     heartbeat first.
+ *
+ * The cost is that a user who logs out shows "a while ago" rather than the
+ * precise minute they left. That is the deliberate trade: the alternative is a
+ * green dot on someone who has signed out, which is the bug being fixed. The
+ * next heartbeat after they sign back in restores precision immediately.
+ */
+export async function writePresenceLogout(
+  userId: string,
+  deps: PresenceWriteDeps = defaultPresenceWriteDeps,
+): Promise<PresenceWriteOutcome> {
+  return writePresenceTimestamp(userId, PRESENCE_LOGGED_OUT_AT, deps);
+}
+
+/**
+ * The single place a presence value is persisted.
+ *
+ * Both writers differ only in the value, and sharing the query means the
+ * identity guarantee, the single-row match and the three-state outcome cannot
+ * drift apart between "mark me online" and "mark me offline".
+ */
+async function writePresenceTimestamp(
+  userId: string,
+  value: string,
+  deps: PresenceWriteDeps,
+): Promise<PresenceWriteOutcome> {
   if (typeof userId !== 'string' || userId.length === 0) {
-    // A heartbeat with no verified subject cannot be written, and guessing one
+    // A write with no verified subject cannot be persisted, and guessing one
     // would be the presence-spoofing primitive the route is written to avoid.
+    // For logout this is the same hole seen from the other side: it would mark an
+    // arbitrary account offline.
     return { status: 'failed', message: 'missing caller id' };
   }
 
-  let client: PresenceClient | null = null;
-  for (const domain of PRESENCE_PROFILE_DOMAINS) {
-    const candidate = deps.getWritableClient(domain);
-    if (candidate) {
-      client = candidate;
-      break;
-    }
-  }
+  const client = resolvePresenceClient(deps);
   if (!client) return { status: 'no-client' };
 
-  const lastSeenAt = now().toISOString();
   try {
     // `.eq('id', ...)` is a primary-key match, so this touches exactly one row.
     // `.select('id')` makes the UPDATE return the rows it wrote rather than
     // assuming it wrote one.
     const { data, error } = await client
       .from('profiles')
-      .update({ last_seen_at: lastSeenAt })
+      .update({ last_seen_at: value })
       .eq('id', userId)
       .select('id');
     if (error) {
       const message = typeof error?.message === 'string' ? error.message : 'unknown error';
       return { status: 'failed', message };
     }
-    return { status: 'written', updated: data?.length ?? 0, lastSeenAt };
+    return { status: 'written', updated: data?.length ?? 0, lastSeenAt: value };
   } catch (err) {
     return { status: 'failed', message: (err as Error)?.message ?? 'threw' };
   }
+}
+
+function resolvePresenceClient(deps: PresenceWriteDeps): PresenceClient | null {
+  for (const domain of PRESENCE_PROFILE_DOMAINS) {
+    const candidate = deps.getWritableClient(domain);
+    if (candidate) return candidate;
+  }
+  return null;
 }

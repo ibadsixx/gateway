@@ -14,7 +14,7 @@ import {
 } from '../features/sitemap';
 import { supabaseSitemapSource } from '../features/sitemapSource';
 import { isValidProfileUsername, readProfileIndexing } from '../features/profileIndexing';
-import { writePresenceHeartbeat } from '../features/presence';
+import { writePresenceHeartbeat, writePresenceLogout } from '../features/presence';
 import { featureFlags } from '../features';
 import { configCenter } from '../config';
 import { rateLimiter } from '../rate-limiting';
@@ -2318,6 +2318,69 @@ router.post('/presence/heartbeat', auth.authenticate.bind(auth), async (req: Req
   } catch (err) {
     console.error('[Gateway] presence heartbeat error:', (err as Error).message);
     res.status(500).json({ error: 'Presence update failed' });
+  }
+});
+
+// Presence removal on explicit sign-out (do.md "online presence indicator").
+//
+// THE BUG THIS EXISTS FOR. A heartbeat records that a user is here; it cannot
+// record that they have left, because in a single `last_seen_at` column "last
+// seen now" and "left a moment ago" are the same value. Sign-out therefore wrote
+// nothing at all: the row kept the timestamp from up to one interval earlier,
+// `isOnline()` answered true for the whole freshness window, and every other
+// user's conversation list kept showing a green dot on someone who had signed
+// out. Nothing timed out early and nothing errored - the presence row simply
+// described the last moment the heartbeat happened to run.
+//
+// There is no Realtime presence channel in Tone to `untrack()` from.
+// `GatewayChannel` on the frontend is a local shim: `subscribe()` resolves
+// 'SUBSCRIBED' without connecting anywhere, `postgres_changes` listeners are
+// stored and never dispatched, and `send({ type: 'broadcast' })` only reaches
+// broadcast listeners in the SAME tab. There is no `track()`, `untrack()`,
+// `presenceState()` or `presence_diff` to use, and adding a transport would be
+// the second presence system this codebase deliberately does not have. So the
+// removal is persisted, which is exactly what the other user's existing
+// `last_seen_at` refresh already reads - no new channel, no new poll, no
+// per-conversation request.
+//
+// The value written is `PRESENCE_LOGGED_OUT_AT`, not `NULL`: the reader
+// deliberately refuses to propagate a null, because a null is also the shape a
+// REDACTED presence takes for a non-friend with a pending message request. A
+// null would be dropped by the reader and the dot would stay green - the same bug,
+// wearing a different hat.
+//
+// This route is authenticated and reads the id from `req.user` only. That is
+// load-bearing here in the opposite direction from the heartbeat: reading a
+// body-supplied id would let any signed-in user force any other account
+// offline, which is a denial-of-presence primitive rather than a spoofing one.
+router.post('/presence/logout', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ error: 'Not authenticated' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const outcome = await writePresenceLogout(userId);
+    if (outcome.status === 'no-client') {
+      console.error('[Gateway] presence logout: no writable project for profiles');
+      res.status(503).json({ error: 'Presence unavailable' });
+      return;
+    }
+    if (outcome.status === 'failed') {
+      console.error('[Gateway] presence logout failed:', outcome.message);
+      res.status(500).json({ error: 'Presence removal failed' });
+      return;
+    }
+    if (outcome.updated === 0) {
+      // A signed-in account with no profile row has no presence to remove, so
+      // there is nothing wrong here - but it is logged so the case stays findable.
+      console.warn('[Gateway] presence logout matched no profile row for user', userId);
+    }
+    res.status(200).json({ ok: true, updated: outcome.updated, last_seen_at: outcome.lastSeenAt });
+  } catch (err) {
+    console.error('[Gateway] presence logout error:', (err as Error).message);
+    res.status(500).json({ error: 'Presence removal failed' });
   }
 });
 

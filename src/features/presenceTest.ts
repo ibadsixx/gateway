@@ -41,8 +41,10 @@ import express from 'express';
 import { router } from '../api/routes';
 import { projectManager } from '../project-manager';
 import {
+  PRESENCE_LOGGED_OUT_AT,
   PRESENCE_PROFILE_DOMAINS,
   writePresenceHeartbeat,
+  writePresenceLogout,
   type PresenceClient,
   type PresenceWriteDeps,
 } from './presence';
@@ -314,24 +316,210 @@ async function main(): Promise<void> {
         (authModule.auth as any).verifyToken = originalVerify;
       }
     }
+
+    // -----------------------------------------------------------------------
+    // The logout endpoint, over HTTP
+    // -----------------------------------------------------------------------
+    // Unauthenticated: must write nothing. This is the assertion that matters
+    // most for logout, because an unauthenticated caller being allowed through
+    // would mean anyone could mark a stranger offline by guessing an id.
+    {
+      writes.length = 0;
+      projectManager.getWritableProject = (() => ({ client: stubClient })) as any;
+      const res = await fetch(`${base}/api/presence/logout`, { method: 'POST' });
+      const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      assert.equal(res.status, 401, 'presence removal must require the caller\'s own session');
+      assert.equal(writes.length, 0, 'an unauthenticated logout must write nothing');
+      assert.equal(body.updated, undefined, 'and must not report a write');
+    }
+
+    {
+      const authModule = await import('../auth');
+      const originalVerify = authModule.auth.verifyToken;
+      (authModule.auth as any).verifyToken = async (token: string) =>
+        token === 'good' ? { id: USER } : null;
+      try {
+        projectManager.getWritableProject = (() => ({ client: stubClient })) as any;
+
+        // A body-supplied id must be ignored, in the offline direction too.
+        {
+          writes.length = 0;
+          const res = await fetch(`${base}/api/presence/logout`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer good', 'Content-Type': 'application/json' },
+            body: JSON.stringify({ user_id: 'victim', id: 'victim' }),
+          });
+          const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+          assert.equal(res.status, 200, `expected 200, got ${res.status}: ${JSON.stringify(body)}`);
+          assert.equal(writes.length, 1);
+          assert.deepEqual(writes[0].filters, [['id', USER]],
+            'the row marked offline must be the VERIFIED caller, never a body-supplied id');
+          assert.notEqual(writes[0].filters[0][1], 'victim',
+            'a body-supplied user_id must never reach the logout write');
+          assert.equal(writes[0].values['last_seen_at'], PRESENCE_LOGGED_OUT_AT,
+            'the response path must write the explicit offline marker');
+          assert.equal(body.ok, true);
+          assert.equal(body.last_seen_at, PRESENCE_LOGGED_OUT_AT,
+            'the response must report the marker it wrote, so the client can verify it');
+          assert.equal(res.headers.get('cache-control'), 'no-store',
+            'a cached logout would outlive the presence it removed');
+        }
+
+        // An invalid token must not be treated as an allowed caller.
+        {
+          writes.length = 0;
+          const res = await fetch(`${base}/api/presence/logout`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer not.a.real.jwt' },
+          });
+          assert.equal(res.status, 401, 'an invalid token must 401, not fall through to a write');
+          assert.equal(writes.length, 0, 'and must still write nothing');
+        }
+
+        // No writable project -> 503, never a 200 claiming a removal.
+        {
+          writes.length = 0;
+          projectManager.getWritableProject = (() => null) as any;
+          const res = await fetch(`${base}/api/presence/logout`, {
+            method: 'POST',
+            headers: { Authorization: 'Bearer good' },
+          });
+          const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+          assert.equal(res.status, 503, 'a missing writable project is a deployment fault, not a success');
+          assert.equal(body.updated, undefined, 'and must not report rows written');
+          assert.equal(res.headers.get('cache-control'), 'no-store');
+        }
+      } finally {
+        (authModule.auth as any).verifyToken = originalVerify;
+      }
+    }
   } finally {
     projectManager.getWritableProject = originalGetWritableProject;
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 
   // -------------------------------------------------------------------------
-  // 4. The route must not be shadowed by the dynamic domain routes
+  // 4. Explicit sign-out removes presence
+  // -------------------------------------------------------------------------
+  //
+  // The reported bug: two users online, both green, User A logs out, and B keeps
+  // seeing A green. The cause is that sign-out wrote NOTHING about presence - the
+  // row kept the timestamp from the last heartbeat, `isOnline()` kept answering
+  // true for the rest of the freshness window, and nothing errored. So the write
+  // is asserted here rather than the timeout being shortened.
+  {
+    const { client, calls } = recordingClient({ data: [{ id: USER }] });
+    const outcome = await writePresenceLogout(USER, depsFor(client));
+
+    assert.equal(outcome.status, 'written');
+    assert.equal(outcome.status === 'written' && outcome.updated, 1);
+    assert.equal(calls.length, 1, 'one caller, one row - a logout is not a batch');
+    assert.equal(calls[0].table, 'profiles',
+      'it must write the EXISTING presence column, not a second store');
+    assert.deepEqual(calls[0].filters, [['id', USER]],
+      'only the caller\'s own row may be marked offline');
+    assert.deepEqual(calls[0].values, { last_seen_at: PRESENCE_LOGGED_OUT_AT });
+  }
+
+  // The marker must NOT be `null`, because the reader treats a null as a
+  // REDACTED presence (non-friend + pending message request) and deliberately
+  // refuses to overwrite the held value with it. A null here would be dropped by
+  // the reader and the dot would stay green - the same bug, wearing a new hat.
+  {
+    const { client, calls } = recordingClient({ data: [{ id: USER }] });
+    await writePresenceLogout(USER, depsFor(client));
+    const written = calls[0].values['last_seen_at'];
+    assert.notEqual(written, null, 'a null marker is indistinguishable from a redaction');
+    assert.equal(typeof written, 'string');
+    assert.equal(new Date(written as string).getTime(), 0,
+      'the marker must be an instant no positive freshness window can call fresh');
+  }
+
+  // The marker has to survive the round trip through Postgres' own rendering of
+  // TIMESTAMPTZ, which is `1970-01-01T00:00:00+00:00` - a different string from
+  // the one written. Recognition is by parsed time for exactly this reason, so
+  // this asserts the two representations agree.
+  {
+    const postgresRendering = '1970-01-01T00:00:00+00:00';
+    assert.equal(new Date(postgresRendering).getTime(),
+      new Date(PRESENCE_LOGGED_OUT_AT).getTime(),
+      'every rendering of the marker must parse to the same instant');
+  }
+
+  // A logout must be idempotent and unconditional: repeated sign-outs must not
+  // drift or error, and the value must not depend on a clock reading.
+  {
+    const { client, calls } = recordingClient({ data: [{ id: USER }] });
+    const first = await writePresenceLogout(USER, depsFor(client));
+    const second = await writePresenceLogout(USER, depsFor(client));
+    assert.equal(first.status, 'written');
+    assert.equal(second.status, 'written');
+    assert.deepEqual(calls[0].values, calls[1].values,
+      'the marker is a constant, so a second logout must write the same value');
+  }
+
+  // Identity, in the direction that matters for logout: reading an id from the
+  // body would let any signed-in user force any other account OFFLINE. That is a
+  // denial-of-presence primitive, the mirror image of the heartbeat's spoofing
+  // hole, and the route's `req.user?.id`-only read is what prevents it.
+  {
+    const { client, calls } = recordingClient({ data: [{ id: USER }] });
+    for (const bad of ['', undefined as unknown as string, null as unknown as string]) {
+      const outcome = await writePresenceLogout(bad, depsFor(client));
+      assert.equal(outcome.status, 'failed',
+        `a logout with caller id ${JSON.stringify(bad)} must be refused`);
+    }
+    assert.equal(calls.length, 0, 'a refused logout must not touch the database at all');
+  }
+
+  // A failed logout write must not be silently indistinguishable from a good
+  // one - the same invisibility that let the original bug go unreported.
+  {
+    const { client } = recordingClient({ error: { message: 'permission denied' } });
+    const outcome = await writePresenceLogout(USER, depsFor(client));
+    assert.equal(outcome.status, 'failed');
+    assert.equal(outcome.status === 'failed' && outcome.message, 'permission denied');
+
+    const noClient = await writePresenceLogout(USER, depsFor(null));
+    assert.equal(noClient.status, 'no-client',
+      'no writable project must stay distinguishable from a rejected write');
+  }
+
+  // Both writers must go through the same single-row, single-column query. If
+  // they ever diverged, "mark me online" and "mark me offline" could disagree
+  // about which row or which column presence lives in.
+  {
+    const hb = recordingClient({ data: [{ id: USER }] });
+    const lo = recordingClient({ data: [{ id: USER }] });
+    await writePresenceHeartbeat(USER, depsFor(hb.client), () => new Date(AT));
+    await writePresenceLogout(USER, depsFor(lo.client));
+    assert.equal(hb.calls[0].table, lo.calls[0].table);
+    assert.deepEqual(hb.calls[0].filters, lo.calls[0].filters,
+      'both writers must match the row identically');
+    assert.deepEqual(Object.keys(hb.calls[0].values), Object.keys(lo.calls[0].values),
+      'both writers must touch exactly one column');
+    assert.equal(lo.calls[0].values['last_seen_at'], PRESENCE_LOGGED_OUT_AT);
+    assert.notEqual(lo.calls[0].values['last_seen_at'], AT,
+      'a logout must not leave the last heartbeat\'s timestamp in place');
+  }
+
+  // -------------------------------------------------------------------------
+  // 5. The route must not be shadowed by the dynamic domain routes
   // -------------------------------------------------------------------------
   {
     const source = readFileSync(join(__dirname, '..', 'api', 'routes.ts'), 'utf8');
     const presenceAt = source.indexOf("router.post('/presence/heartbeat'");
     assert.ok(presenceAt > -1, 'the heartbeat route must exist');
+    const logoutAt = source.indexOf("router.post('/presence/logout'");
+    assert.ok(logoutAt > -1, 'the logout route must exist');
     const dynamicPost = source.indexOf("router.post('/:domain'");
     const dynamicGet = source.indexOf("router.get('/:domain'");
     assert.ok(dynamicGet > -1 && dynamicPost > -1, 'the dynamic domain routes must still exist');
     assert.ok(presenceAt < dynamicGet && presenceAt < dynamicPost,
       'the heartbeat must be registered BEFORE the catch-all domain routes, ' +
       'or a future single-segment change would be swallowed by them');
+    assert.ok(logoutAt < dynamicGet && logoutAt < dynamicPost,
+      'the logout route must be registered BEFORE the catch-all domain routes too');
   }
 
   console.log('  presence: all assertions passed');
