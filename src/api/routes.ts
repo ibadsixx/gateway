@@ -14,6 +14,7 @@ import {
 } from '../features/sitemap';
 import { supabaseSitemapSource } from '../features/sitemapSource';
 import { isValidProfileUsername, readProfileIndexing } from '../features/profileIndexing';
+import { writePresenceHeartbeat } from '../features/presence';
 import { featureFlags } from '../features';
 import { configCenter } from '../config';
 import { rateLimiter } from '../rate-limiting';
@@ -2246,6 +2247,79 @@ projectHealthRouter.get('/run', requireProbeToken, runHandler);
 router.use('/project-health', projectHealthRouter);
 /** @deprecated legacy alias — use /api/project-health instead. */
 router.use('/keep-alive', projectHealthRouter);
+
+// Presence heartbeat (do.md "online presence indicator").
+//
+// WHY THIS EXISTS, because the obvious-looking version is the one that shipped
+// and it never worked once. `usePresence` heartbeat by calling the database
+// function `update_last_seen()`, which is SECURITY DEFINER and does
+// `UPDATE profiles SET last_seen_at = NOW() WHERE id = auth.uid()`. That path
+// depends on `auth.uid()` resolving INSIDE PostgREST, i.e. on the caller's JWT
+// being accepted by the users project's own GoTrue as well as by this gateway's
+// verifier. It silently does not: in production 28 of 29 profiles have
+// `last_seen_at` exactly equal to `created_at`, which is the column's INSERT
+// default. Nobody has ever been marked online, and because a failed heartbeat
+// produced no error the frontend had nothing to report - `gateway.rpc()` resolves
+// to `{ data, error }` and the caller ignored `error`, so a permanently broken
+// write path looked exactly like a permanently idle user.
+//
+// There are two ways that can fail without erroring: the function is not present
+// in the deployed database (the migration is dated but, as with several others in
+// this repo, need not have been applied), or `auth.uid()` is NULL and the UPDATE
+// matches zero rows. Both are invisible from here, and there is no working
+// behaviour to preserve, so this endpoint deliberately does not depend on either.
+//
+// It uses the two things the gateway can prove: `req.user.id`, verified from the
+// caller's own bearer token, and the service-role client it already holds for the
+// project that hosts `profiles` (resolved from the same registry, and with the
+// same `profiles`-then-`users` domain fallback, that the profile-indexing read
+// and the other service-role writers use). The write is therefore unconditional
+// and deterministic - it does not consult auth.uid(), does not depend on any
+// database function existing, and cannot be defeated by RLS. One row, matched on
+// the primary key.
+//
+// Deliberately NOT cached: a cached heartbeat would let a stale "ok" outlive the
+// presence it reports, which is the same failure mode as the sitemap's cached
+// opt-out, one layer up.
+router.post('/presence/heartbeat', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
+  // `authenticate` has already rejected a missing or invalid token, so req.user
+  // is set; the id is read from the verified token and never from the body,
+  // because a body-supplied id would be a presence-spoofing primitive.
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ error: 'Not authenticated' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const outcome = await writePresenceHeartbeat(userId);
+    if (outcome.status === 'no-client') {
+      // Distinguishable from "write failed": there is no project registered that
+      // could accept the write at all, which is a deployment problem and not a
+      // user problem.
+      console.error('[Gateway] presence heartbeat: no writable project for profiles');
+      res.status(503).json({ error: 'Presence unavailable' });
+      return;
+    }
+    if (outcome.status === 'failed') {
+      // The upstream message can name the project or a column, none of which
+      // belong in a body the browser keeps; log it, return a generic failure.
+      console.error('[Gateway] presence heartbeat failed:', outcome.message);
+      res.status(500).json({ error: 'Presence update failed' });
+      return;
+    }
+    if (outcome.updated === 0) {
+      // Not an error the heartbeat can fix, and not one the user should see a
+      // red state over: their token is valid, they just have no profile row yet.
+      // Logged so an account stuck in this state is findable rather than silent.
+      console.warn('[Gateway] presence heartbeat matched no profile row for user', userId);
+    }
+    res.status(200).json({ ok: true, updated: outcome.updated, last_seen_at: outcome.lastSeenAt });
+  } catch (err) {
+    console.error('[Gateway] presence heartbeat error:', (err as Error).message);
+    res.status(500).json({ error: 'Presence update failed' });
+  }
+});
 
 router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainMiddleware, async (req, res) => {
   const { domain } = req.params;
