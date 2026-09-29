@@ -119,6 +119,7 @@ import { evaluatePinPolicy, evaluatePinDeletePolicy } from '../features/channelP
 import { resolveChannelContext, isChannel, isOwnerOf, isModeratorOf } from '../features/channelContext';
 import { computeChannelStats } from '../features/channelStats';
 import { computePeopleYouMayKnow } from '../features/peopleYouMayKnow';
+import { getUnreadConversationIds } from '../features/unreadConversations';
 
 // Applies the gateway-owned category to a `message_requests` insert body when
 // the request is created (messages.md). The Gateway classifies because friends
@@ -2082,6 +2083,29 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
       const rows = await computePeopleYouMayKnow(req.user?.id, { limit: requestedLimit });
       res.status(200).json(rows);
       return;
+    }
+
+    // get_unread_conversation_ids: the global Messages-nav badge is the number
+    // of the caller's conversations that currently contain unread messages.
+    // Computed gateway-side (see features/unreadConversations.ts): the
+    // aggregate runs on the conversations host (`get_unread_conversation_ids`
+    // SQL function, same `message_reads` predicate as the per-chat badges),
+    // then the set is intersected with the blocking host so a blocked peer's
+    // messages never light the badge. The caller id is the gateway-verified
+    // identity, never the client body.
+    if (rpcName === 'get_unread_conversation_ids') {
+      const result = await getUnreadConversationIds(req.user?.id);
+      switch (result.status) {
+        case 'ok':
+          res.status(200).json(result.conversationIds);
+          return;
+        case 'no-client':
+          res.status(503).json({ error: 'No readable conversations project registered' });
+          return;
+        case 'failed':
+          res.status(502).json({ error: result.message });
+          return;
+      }
     }
 
     const url = `${credentials.project_url}/rest/v1/rpc/${encodeURIComponent(rpcName)}`;
