@@ -2087,12 +2087,13 @@ rpcRouter.post('/:function', auth.authenticate.bind(auth), async (req: Request, 
 
     // get_unread_conversation_ids: the global Messages-nav badge is the number
     // of the caller's conversations that currently contain unread messages.
-    // Computed gateway-side (see features/unreadConversations.ts): the
-    // aggregate runs on the conversations host (`get_unread_conversation_ids`
-    // SQL function, same `message_reads` predicate as the per-chat badges),
-    // then the set is intersected with the blocking host so a blocked peer's
-    // messages never light the badge. The caller id is the gateway-verified
-    // identity, never the client body.
+    // Computed gateway-side (see features/unreadConversations.ts): it reuses
+    // the already-deployed `get_conversations_with_info`, whose per-conversation
+    // `unread_count` is exactly the product's existing definition of unread,
+    // and then drops DMs whose peer is blocked (the block list lives on another
+    // project host, so that rule cannot live in the same SQL). One RPC, no
+    // second query. The caller id is the gateway-verified identity, never the
+    // client body.
     if (rpcName === 'get_unread_conversation_ids') {
       const result = await getUnreadConversationIds(req.user?.id);
       switch (result.status) {

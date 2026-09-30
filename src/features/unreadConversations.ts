@@ -1,5 +1,5 @@
 // Global Messages-badge unread source, Gateway side (do.md "Fix the Messages
-// unread notification badge").
+// unread notification badge" / mobile-badge round).
 //
 // The badge on the Messages icon in global navigation is defined as:
 //
@@ -8,29 +8,49 @@
 // (NOT the total number of unread messages, and NOT the read state inside the
 // Messages page). The read-state architecture is `message_reads` (a row per
 // message per reader): a message sent by someone else that the current user has
-// no `message_reads` row for is unread. This is exactly the predicate the
-// existing per-chat unread badges already derive from, just aggregated across
-// every conversation the viewer participates in instead of one list.
+// no `message_reads` row for is unread.
 //
-// WHY GATEWAY-SIDE AND NOT A CLIENT QUERY:
+// WHY THIS USES THE EXISTING `get_conversations_with_info`
 //
-//   - The requirement is an efficient aggregate, not "fetch every message from
-//     every conversation". PostgREST cannot express "the set of conversation
-//     ids with at least one unread message" in one request, so the aggregation
-//     runs in the database (`get_unread_conversation_ids`) and this module is
-//     the only caller that produces it.
-//   - `blocks` lives on the blocking host, not the conversations host, so "a
-//     blocked peer's messages must never light the badge" cannot be enforced in
-//     the same SQL. The conversation set is intersected with the viewer's block
-//     list here, where both hosts are reachable — the same split the
-//     suggestions feature uses for its cross-project rules.
+// The obvious implementation is a purpose-built `SELECT DISTINCT conversation_id`
+// table function — lean, minimal payload, one row per unread conversation. It
+// was written for exactly this and lives in
+// supabase/migrations/20260929000000_get_unread_conversation_ids.sql. It is not
+// used, because it requires a migration to be applied before the badge works at
+// all, and until that happens the count is silently 0 on every layout.
 //
-// The route (api/routes.ts) intercepts `rpc('get_unread_conversation_ids')`
-// and calls this module with the gateway-verified caller id, never a
-// client-supplied value. The caller id is required: a body-supplied id would
-// let any signed-in user read any other user's unread state.
+// `get_conversations_with_info` already exists in the deployed database and
+// already computes `unread_count` per conversation with precisely the predicate
+// this badge needs — `sender_id <> p_user_id`, no `message_reads` row, and
+// nothing at or before the user's `conversation_clears.cleared_at` (see
+// supabase/migrations/20260603000006_add_group_conversations.sql). It also
+// already returns `type` and `other_user_id`. So the badge is a filter over a
+// function that is already the product's own definition of "unread":
+//
+//     unread conversation == unread_count > 0
+//
+// The trade is honest and stated: this transfers one row per conversation the
+// viewer participates in, with the profile join and last-message columns the
+// inbox already needs, instead of one bare uuid per unread conversation. It is
+// one RPC call either way, and it removes a deployment dependency. The lean
+// function is still worth revisiting if the conversation count grows large.
+//
+// Block filtering stays here rather than in SQL, because `blocks` lives on a
+// different project host than the conversations tables. The rule mirrors the
+// app's own `filterRequestConversations`: a DM whose single other participant is
+// in the viewer's block set is dropped; groups and channels keep their
+// participant-based visibility, so a blocked member does not hide them.
+//
+// The route (api/routes.ts) intercepts `rpc('get_unread_conversation_ids')` and
+// calls this module with the gateway-verified caller id, never a client-supplied
+// value. That matters more than usual here: the underlying function takes a
+// `p_user_id` argument, so a body-supplied id would let any signed-in user read
+// any other user's unread state.
 
 import { projectManager } from '../project-manager';
+
+/** The pre-existing database function that already carries the unread count. */
+const CONVERSATIONS_RPC = 'get_conversations_with_info';
 
 /**
  * Minimal shape of the parts of a Supabase client this feature uses. Loosely
@@ -66,7 +86,7 @@ export const defaultUnreadConversationsDeps: UnreadConversationsDeps = {
   getConversationsClient() {
     // What the conversation tables are fronted by changes across environments
     // (dedicated `conversations` project, or the pre-split `users` host). Try
-    // readable first, then writable, then the users host — mirroring
+    // readable first, then the users host, then writable — mirroring
     // `resolveChannelMembers`. A single source of truth for "where do the
     // conversation tables live" would be better, but this is the same ladder
     // every other cross-host read here climbs.
@@ -100,12 +120,30 @@ export const defaultUnreadConversationsDeps: UnreadConversationsDeps = {
         }
       } catch {
         // An unreachable block host contributes nothing rather than failing the
-        // whole badge read; the SQL aggregate is authoritative on its own host.
+        // whole badge read; the conversation read is authoritative on its own.
       }
     }
     return ids;
   },
 };
+
+/**
+ * A row of `get_conversations_with_info`, as far as the badge cares.
+ * `unread_count` is a SQL `COUNT(*)`, which PostgREST may hand back as a
+ * number or as a string depending on the bigint path, so it is coerced rather
+ * than compared directly.
+ */
+interface ConversationRow {
+  conversation_id?: unknown;
+  type?: unknown;
+  other_user_id?: unknown;
+  unread_count?: unknown;
+}
+
+function hasUnread(row: ConversationRow): boolean {
+  const n = typeof row.unread_count === 'string' ? Number(row.unread_count) : row.unread_count;
+  return typeof n === 'number' && Number.isFinite(n) && n > 0;
+}
 
 /**
  * The set of `userId`'s conversations that currently contain unread messages.
@@ -125,27 +163,26 @@ export async function getUnreadConversationIds(
 
   let data: unknown;
   try {
-    const res = await client.rpc('get_unread_conversation_ids', { p_user_id: userId });
+    const res = await client.rpc(CONVERSATIONS_RPC, { p_user_id: userId });
     if (res.error) return { status: 'failed', message: res.error.message };
     data = res.data;
   } catch (err) {
     return {
       status: 'failed',
-      message: (err as Error)?.message ?? 'conversations aggregate threw',
+      message: (err as Error)?.message ?? 'conversations read threw',
     };
   }
 
-  const ids = (Array.isArray(data) ? data : [])
-    .map((row) => (row as { conversation_id?: unknown })?.conversation_id)
-    .filter((id): id is string => typeof id === 'string' && id.length > 0);
+  const rows: ConversationRow[] = Array.isArray(data) ? (data as ConversationRow[]) : [];
+  const unread = rows.filter((row) => typeof row.conversation_id === 'string' && hasUnread(row));
+  const ids = unread.map((row) => row.conversation_id as string);
 
   if (ids.length === 0) return { status: 'ok', conversationIds: [] };
 
-  // Blocked peers must not light the badge (do.md §5). A DM whose single other
-  // participant is in the viewer's block set is dropped; groups and channels
-  // keep the same participant-based visibility the inbox already uses. Fail
-  // open on the block-filter reads: a transient block-host outage must not
-  // wipe a user's badge, and the SQL set is authoritative on its own host.
+  // Blocked peers must not light the badge. A DM has exactly one other
+  // participant, which the function already returns as `other_user_id`, so this
+  // needs no further query. Fail open: a block-host outage must not blank a
+  // badge the user can already see, and the conversation read is authoritative.
   let blocked: Set<string>;
   try {
     blocked = await deps.getBlockedPeerIds(userId);
@@ -154,39 +191,14 @@ export async function getUnreadConversationIds(
   }
   if (blocked.size === 0) return { status: 'ok', conversationIds: ids };
 
-  try {
-    const [convsRes, partsRes] = await Promise.all([
-      client.from('conversations').select('id, type').in('id', ids),
-      client
-        .from('conversation_participants')
-        .select('conversation_id, user_id')
-        .in('conversation_id', ids)
-        .neq('user_id', userId),
-    ]);
-
-    const typeById = new Map<string, string | undefined>();
-    for (const c of (convsRes?.data as Array<{ id?: string; type?: string }>) ?? []) {
-      if (typeof c.id === 'string') typeById.set(c.id, c.type);
-    }
-    // A DM always has exactly one other participant; the first row wins.
-    const otherPerConv = new Map<string, string>();
-    for (const p of (partsRes?.data as Array<{ conversation_id?: string; user_id?: string }>) ?? []) {
-      if (typeof p.conversation_id === 'string' && typeof p.user_id === 'string') {
-        if (!otherPerConv.has(p.conversation_id)) otherPerConv.set(p.conversation_id, p.user_id);
-      }
-    }
-
-    return {
-      status: 'ok',
-      conversationIds: ids.filter((id) => {
-        if (typeById.get(id) !== 'dm') return true;
-        const otherId = otherPerConv.get(id);
-        return !(otherId && blocked.has(otherId));
-      }),
-    };
-  } catch {
-    // Enrichment for the block filter failed — return the SQL set unfiltered
-    // rather than an empty badge, and let the next refresh retry.
-    return { status: 'ok', conversationIds: ids };
-  }
+  return {
+    status: 'ok',
+    conversationIds: unread
+      .filter((row) => {
+        if (row.type !== 'dm') return true;
+        const otherId = row.other_user_id;
+        return !(typeof otherId === 'string' && blocked.has(otherId));
+      })
+      .map((row) => row.conversation_id as string),
+  };
 }

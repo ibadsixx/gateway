@@ -1,27 +1,29 @@
-// do.md "Fix the Messages unread notification badge", Gateway side.
+// do.md "Fix the Messages unread notification badge" + mobile-badge round,
+// Gateway side.
 //
-// The global Messages-nav badge is defined as the number of the caller's
-// conversations that currently contain unread messages (NOT the total number
-// of unread messages). This module owns the server side of that count:
-//
-//   - the aggregate itself runs in the database on the conversations host
-//     (`get_unread_conversation_ids`, same `message_reads` predicate the
-//     per-chat badges already use), reached through a service-role client;
-//   - the set is then intersected with the blocking host so a DM whose peer
-//     is blocked can never light the badge;
-//   - the caller id always comes from the gateway-verified request identity,
-//     never from the client body.
+// The global Messages-nav badge is the number of the caller's conversations
+// that contain unread messages. This module owns the server side of that count:
+// it reads the deployed `get_conversations_with_info`, which already computes a
+// per-conversation `unread_count` with exactly the predicate the badge needs,
+// keeps the conversations whose count is above zero, and then drops DMs whose
+// peer is blocked (the block list lives on another project host, so that rule
+// cannot live in the same SQL).
 //
 // Asserted here, in order:
 //
-//   1. Shape of the aggregate call: table-function name, `p_user_id` argument.
-//   2. Empty set short-circuits: zero conversation rows means zero badge, and
-//      no block reads are needed.
-//   3. Blocked DMs are dropped; groups/channels survive with a blocked member.
-//   4. No client registered -> distinguishable 'no-client', not a fake success.
-//   5. Aggregate failure -> 'failed', not an empty badge.
-//   6. Identity: a missing caller id is refused and nothing is read.
-//   7. The route intercept exists and is registered before the generic proxy.
+//   1. One call, the right function, and the VERIFIED caller as the argument.
+//   2. The badge counts conversations, not messages: unread_count 0 drops out,
+//      a large unread_count still contributes exactly one conversation, and a
+//      bigint returned as a string is coerced rather than silently dropped.
+//   3. Blocked DMs are dropped; groups/channels survive a blocked member, and
+//      the filter costs NO extra query (other_user_id is already in the row).
+//   4. A failing block read fails OPEN (a badge the user can see is not worse
+//      than an empty one that lies).
+//   5. No client registered -> distinguishable 'no-client', not a fake success.
+//   6. A failed read -> 'failed', not an empty badge that reads as "all read".
+//   7. Identity: a missing caller id is refused and nothing is read.
+//   8. The route intercept exists, is registered before the generic proxy, and
+//      resolves the caller from the verified request identity.
 //
 // Run: npm run test:unread-conversations
 import assert from 'node:assert/strict';
@@ -35,59 +37,27 @@ import {
 } from './unreadConversations';
 
 const USER = '00000000-0000-4000-8000-000000000001';
-const OTHER = '00000000-0000-4000-8000-000000000002';
 const BLOCKED = '00000000-0000-4000-8000-000000000003';
+const PEER = '00000000-0000-4000-8000-000000000004';
 
-type TableResult = { data: unknown; error: { message: string } | null };
-/** Plan literals may omit `data`/`error`; they are normalized on read-out. */
 type PlanResult = { data?: unknown; error?: { message: string } | null } | 'throws';
 
 /**
- * A recording stand-in for the service-role client. Models `rpc` and the two
- * reading queries the block filter makes, recording the exact call shape so a
- * test can assert what was asked rather than that nothing threw.
+ * A recording stand-in for the service-role client. It models ONLY the rpc
+ * call, and throws on any table read: the whole point of the current design is
+ * that one conversation read is enough, so a stray second query fails loudly
+ * here instead of quietly costing a request in production.
  */
-function recordingClient(plan: {
-  rpc?: PlanResult;
-  tables?: Record<string, Array<{ data?: unknown; error?: { message: string } | null }>>;
-}): {
-  client: UnreadConversationsClient;
-  calls: Array<{ kind: 'rpc' | 'query'; table?: string; name?: string; params?: unknown; columns?: string; filters?: Array<[string, unknown]> }>;
-} {
-  const calls: Array<{ kind: 'rpc' | 'query'; table?: string; name?: string; params?: unknown; columns?: string; filters?: Array<[string, unknown]> }> = [];
-  const resultFor = (table: string, order: number): TableResult => {
-    const list = plan.tables?.[table];
-    const r = list ? list[Math.min(order, list.length - 1)] : undefined;
-    return { data: r?.data ?? [], error: r?.error ?? null };
-  };
-  const tableOrder: Record<string, number> = {};
-
+function recordingClient(plan: { rpc?: PlanResult }) {
+  const calls: Array<{ name: string; params: unknown }> = [];
   const client: UnreadConversationsClient = {
     async rpc(name: string, params?: Record<string, unknown>) {
-      calls.push({ kind: 'rpc', name, params });
+      calls.push({ name, params });
       if (plan.rpc === 'throws') throw new Error('socket hang up');
       return { data: plan.rpc?.data ?? [], error: plan.rpc?.error ?? null };
     },
     from(table: string) {
-      const order = tableOrder[table] ?? 0;
-      tableOrder[table] = order + 1;
-      const builder: Record<string, unknown> = {
-        select(columns: string) {
-          calls.push({ kind: 'query', table, columns, filters: [] });
-          // supabase-js builders are thenable AND chainable: `.in(...)` resolves
-          // (feature awaits it directly) while `.in(...).neq(...)` must too.
-          const result = () => Promise.resolve(resultFor(table, order));
-          return {
-            in: (_col: string, _values: unknown[]) => {
-              const p = result();
-              return Object.assign(p, {
-                neq: (_c2: string, _v2: unknown) => result(),
-              });
-            },
-          };
-        },
-      };
-      return builder;
+      throw new Error(`unexpected table read: ${table} (the badge must need one rpc only)`);
     },
   };
   return { client, calls };
@@ -103,9 +73,12 @@ function depsFor(
   };
 }
 
-function idsOf(rows: Array<{ conversation_id: string }>): string[] {
-  return rows.map((r) => r.conversation_id);
-}
+const conv = (
+  conversation_id: string,
+  unread_count: number | string,
+  type = 'dm',
+  other_user_id: string | null = PEER
+) => ({ conversation_id, unread_count, type, other_user_id });
 
 async function main(): Promise<void> {
   const A = 'aaaaaaaa-0000-4000-8000-00000000000a';
@@ -113,144 +86,197 @@ async function main(): Promise<void> {
   const C = 'cccccccc-0000-4000-8000-00000000000c';
 
   // -------------------------------------------------------------------------
-  // 1. The aggregate call
+  // 1. One call, the deployed function, the verified caller.
   // -------------------------------------------------------------------------
   {
     const { client, calls } = recordingClient({
-      rpc: { data: [{ conversation_id: A }, { conversation_id: B }] },
+      rpc: { data: [conv(A, 1), conv(B, 4)] },
     });
     const result = await getUnreadConversationIds(USER, depsFor(client));
     assert.equal(result.status, 'ok');
-    assert.deepEqual(result.status === 'ok' && result.conversationIds, [A, B],
-      'the conversation ids must come straight from the aggregate');
-    assert.equal(calls.length, 1, 'happy path is exactly ONE database call');
-    assert.equal(calls[0].kind, 'rpc');
-    assert.equal(calls[0].name, 'get_unread_conversation_ids');
-    assert.deepEqual(calls[0].params, { p_user_id: USER },
-      'the aggregate must run with the VERIFIED caller id');
+    assert.deepEqual(result.status === 'ok' && result.conversationIds, [A, B]);
+    assert.equal(calls.length, 1, 'the happy path is exactly ONE database call');
+    assert.equal(calls[0].name, 'get_conversations_with_info');
+    assert.deepEqual(
+      calls[0].params,
+      { p_user_id: USER },
+      'the read must run as the VERIFIED caller, never a body-supplied id'
+    );
   }
 
-  // 2. Empty set short-circuits: no badge, and no block reads at all.
+  // -------------------------------------------------------------------------
+  // 2. The badge counts CONVERSATIONS, not messages.
+  // -------------------------------------------------------------------------
   {
-    const { client, calls } = recordingClient({ rpc: { data: [] } });
+    const { client, calls } = recordingClient({
+      rpc: {
+        data: [
+          conv(A, 7), // 7 unread messages, but ONE conversation
+          conv(B, 0), // fully read -> must not appear
+          conv(C, '3'), // bigint arriving as a string still counts
+        ],
+      },
+    });
+    const result = await getUnreadConversationIds(USER, depsFor(client));
+    assert.equal(result.status, 'ok');
+    assert.deepEqual(
+      result.status === 'ok' && result.conversationIds,
+      [A, C],
+      '5 unread messages in one conversation is 1, a read conversation is 0, ' +
+        'and a stringified bigint must not be lost'
+    );
+    assert.equal(calls.length, 1);
+  }
+
+  {
+    // Every conversation read -> badge 0, and no block lookup is even needed.
+    const { client, calls } = recordingClient({ rpc: { data: [conv(A, 0), conv(B, 0)] } });
     const result = await getUnreadConversationIds(USER, depsFor(client));
     assert.equal(result.status, 'ok');
     assert.deepEqual(result.status === 'ok' && result.conversationIds, []);
-    assert.equal(calls.length, 1, 'an empty aggregate must not read blocks/tables');
+    assert.equal(calls.length, 1, 'an all-read inbox must not trigger a block read');
   }
 
-  // 3a. A DM whose peer is blocked is dropped.
+  // -------------------------------------------------------------------------
+  // 3. Block filtering, at no extra query cost.
+  // -------------------------------------------------------------------------
   {
-    const { client } = recordingClient({
-      rpc: { data: [{ conversation_id: A }, { conversation_id: B }] },
-      tables: {
-        conversations: [
-          {
-            data: [
-              { id: A, type: 'dm' },
-              { id: B, type: 'dm' },
-            ],
-          },
-        ],
-        conversation_participants: [
-          {
-            data: [
-              { conversation_id: A, user_id: OTHER },
-              { conversation_id: B, user_id: BLOCKED },
-            ],
-          },
+    const { client, calls } = recordingClient({
+      rpc: {
+        data: [
+          conv(A, 1, 'dm', PEER), // peer is fine
+          conv(B, 1, 'dm', BLOCKED), // peer is blocked
         ],
       },
     });
-    const result = await getUnreadConversationIds(
-      USER,
-      depsFor(client, new Set([BLOCKED]))
-    );
+    const result = await getUnreadConversationIds(USER, depsFor(client, new Set([BLOCKED])));
     assert.equal(result.status, 'ok');
-    assert.deepEqual(result.status === 'ok' && result.conversationIds, [A],
-      'a DM from a blocked peer must never light the badge; an unblocked DM stays');
+    assert.deepEqual(
+      result.status === 'ok' && result.conversationIds,
+      [A],
+      "a blocked peer's DM must never light the badge; an unblocked DM stays"
+    );
+    assert.equal(
+      calls.length,
+      1,
+      'other_user_id is already on the row: the filter must not add a second read'
+    );
   }
 
-  // 3b. Groups/channels survive even when a member is blocked (the inbox keeps
-  // those visible by participation, and so does the badge).
   {
+    // Groups/channels keep participant-based visibility, matching the inbox.
     const { client } = recordingClient({
-      rpc: { data: [{ conversation_id: A }, { conversation_id: B }] },
-      tables: {
-        conversations: [
-          {
-            data: [
-              { id: A, type: 'group' },
-              { id: B, type: 'channel' },
-            ],
-          },
-        ],
-        conversation_participants: [
-          {
-            data: [
-              { conversation_id: A, user_id: BLOCKED },
-              { conversation_id: B, user_id: BLOCKED },
-            ],
-          },
+      rpc: {
+        data: [
+          conv(A, 1, 'group', BLOCKED),
+          conv(B, 1, 'channel', BLOCKED),
         ],
       },
     });
-    const result = await getUnreadConversationIds(
-      USER,
-      depsFor(client, new Set([BLOCKED]))
-    );
+    const result = await getUnreadConversationIds(USER, depsFor(client, new Set([BLOCKED])));
     assert.equal(result.status, 'ok');
-    assert.deepEqual(result.status === 'ok' && result.conversationIds, [A, B],
-      'group/channel visibility is participant-based; a blocked member is not a DM peer');
+    assert.deepEqual(
+      result.status === 'ok' && result.conversationIds,
+      [A, B],
+      'a blocked member is not a DM peer, so groups/channels stay'
+    );
   }
 
-  // 4. No conversations client registered is its own outcome, not a fake 0.
+  {
+    // A DM row with no resolvable peer cannot be attributed to a block.
+    const { client } = recordingClient({ rpc: { data: [conv(A, 1, 'dm', null)] } });
+    const result = await getUnreadConversationIds(USER, depsFor(client, new Set([BLOCKED])));
+    assert.deepEqual(result.status === 'ok' && result.conversationIds, [A]);
+  }
+
+  // -------------------------------------------------------------------------
+  // 4. A failing block read fails OPEN.
+  // -------------------------------------------------------------------------
+  {
+    const { client } = recordingClient({ rpc: { data: [conv(A, 1), conv(B, 1)] } });
+    const result = await getUnreadConversationIds(USER, {
+      getConversationsClient: () => client,
+      getBlockedPeerIds: async () => {
+        throw new Error('blocking host down');
+      },
+    });
+    assert.equal(result.status, 'ok');
+    assert.deepEqual(
+      result.status === 'ok' && result.conversationIds,
+      [A, B],
+      'a block-host outage must not blank a badge the user is already looking at'
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // 5. No client registered is its own outcome, not a fake 0.
+  // -------------------------------------------------------------------------
   {
     const result = await getUnreadConversationIds(USER, depsFor(null));
-    assert.equal(result.status, 'no-client',
-      'a missing project must be distinguishable from a true empty badge');
+    assert.equal(
+      result.status,
+      'no-client',
+      'a missing project must be distinguishable from a true empty badge'
+    );
   }
 
-  // 5a. Aggregate error propagates.
+  // -------------------------------------------------------------------------
+  // 6. A failed read must not read as "all conversations are read".
+  // -------------------------------------------------------------------------
   {
-    const { client } = recordingClient({ rpc: { error: { message: 'function missing' } } });
+    const { client } = recordingClient({ rpc: { error: { message: 'boom' } } });
     const result = await getUnreadConversationIds(USER, depsFor(client));
     assert.equal(result.status, 'failed');
-    assert.equal(result.status === 'failed' && result.message, 'function missing');
+    assert.equal(result.status === 'failed' && result.message, 'boom');
   }
 
-  // 5b. Aggregate throw propagates too.
   {
     const { client } = recordingClient({ rpc: 'throws' });
     const result = await getUnreadConversationIds(USER, depsFor(client));
     assert.equal(result.status, 'failed');
   }
 
-  // 6. Identity: no caller id -> refused, nothing read.
+  {
+    // A non-array payload is not silently treated as "nothing is unread".
+    const { client } = recordingClient({ rpc: { data: { unexpected: true } } });
+    const result = await getUnreadConversationIds(USER, depsFor(client));
+    assert.equal(result.status, 'ok');
+    assert.deepEqual(result.status === 'ok' && result.conversationIds, []);
+  }
+
+  // -------------------------------------------------------------------------
+  // 7. Identity: no caller id -> refused, nothing read.
+  // -------------------------------------------------------------------------
   {
     const { client, calls } = recordingClient({ rpc: { data: [] } });
     for (const bad of ['', undefined as unknown as string, null as unknown as string]) {
       const result = await getUnreadConversationIds(bad, depsFor(client));
-      assert.equal(result.status, 'failed',
-        `a caller id of ${JSON.stringify(bad)} must be refused`);
+      assert.equal(result.status, 'failed', `a caller id of ${JSON.stringify(bad)} must be refused`);
     }
     assert.equal(calls.length, 0, 'a refused read must not touch the database');
   }
 
-  // 7. The route intercept is wired: the rpc handler must answer
-  // `get_unread_conversation_ids` BEFORE the generic proxied fallthrough, and
-  // must resolve the verified request identity (never a body-supplied p_user_id).
+  // -------------------------------------------------------------------------
+  // 8. The route intercept is wired and identity-bound.
+  // -------------------------------------------------------------------------
   {
     const source = readFileSync(join(__dirname, '..', 'api', 'routes.ts'), 'utf8');
     const intercept = source.indexOf("rpcName === 'get_unread_conversation_ids'");
     assert.ok(intercept > -1, 'the gateway must intercept get_unread_conversation_ids');
-    const afterIntercept = source.slice(intercept);
-    const proxyCall = afterIntercept.indexOf('RPC_CALLER_ID_PARAM');
-    const urlBuild = afterIntercept.indexOf('rest/v1/rpc');
-    assert.ok(proxyCall === -1 || urlBuild === -1 || afterIntercept.indexOf("req.user?.id") > -1,
-      'the intercept must resolve the caller from the verified request identity');
-    assert.ok(afterIntercept.indexOf('getUnreadConversationIds(') > -1,
-      'the intercept must call the feature module');
+    const after = source.slice(intercept);
+    assert.ok(
+      after.indexOf('getUnreadConversationIds(') > -1,
+      'the intercept must call the feature module'
+    );
+    assert.ok(
+      after.indexOf('getUnreadConversationIds(req.user?.id)') > -1,
+      'the intercept must pass the verified request identity, never a body id'
+    );
+    const proxyUrl = after.indexOf('rest/v1/rpc');
+    const handler = after.indexOf('rpcRouter.post');
+    if (proxyUrl > -1) {
+      assert.ok(proxyUrl > handler, 'the intercept must precede the generic proxy fallthrough');
+    }
   }
 
   console.log('  unread-conversations: all assertions passed');
