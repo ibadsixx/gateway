@@ -15,6 +15,11 @@ import {
 import { supabaseSitemapSource } from '../features/sitemapSource';
 import { isValidProfileUsername, readProfileIndexing } from '../features/profileIndexing';
 import { writePresenceHeartbeat, writePresenceLogout } from '../features/presence';
+import {
+  getOnlineFriendStatus,
+  publishPresenceToFriends,
+  readOwnPresenceStamp,
+} from '../features/onlineFriends';
 import { featureFlags } from '../features';
 import { configCenter } from '../config';
 import { rateLimiter } from '../rate-limiting';
@@ -2317,6 +2322,12 @@ router.post('/presence/heartbeat', auth.authenticate.bind(auth), async (req: Req
   }
   res.setHeader('Cache-Control', 'no-store');
   try {
+    // Sampled BEFORE the write, because "did this beat follow an offline period"
+    // is only visible in the value the write is about to overwrite. One
+    // primary-key read, and it pays for itself below by keeping the steady state at
+    // zero broadcasts: `publishPresenceToFriends` does nothing at all unless the
+    // caller had aged out. See features/onlineFriends.ts.
+    const previousStamp = await readOwnPresenceStamp(userId);
     const outcome = await writePresenceHeartbeat(userId);
     if (outcome.status === 'no-client') {
       // Distinguishable from "write failed": there is no project registered that
@@ -2338,6 +2349,18 @@ router.post('/presence/heartbeat', auth.authenticate.bind(auth), async (req: Req
       // red state over: their token is valid, they just have no profile row yet.
       // Logged so an account stuck in this state is findable rather than silent.
       console.warn('[Gateway] presence heartbeat matched no profile row for user', userId);
+    } else {
+      // The write landed, so anyone who needs to re-read "is a friend of mine
+      // online" can safely be told the answer may have changed. This runs only on
+      // an offline->online transition (`skipped` otherwise) and the payload is
+      // empty, so it discloses nothing: it is a wake-up, not an announcement.
+      // Awaited, because on Vercel the response can freeze the instance and a
+      // fire-and-forget fan-out would be lost exactly when it matters most.
+      // Never throws, so it cannot fail a heartbeat that already succeeded.
+      const fanout = await publishPresenceToFriends(userId, previousStamp);
+      if (fanout.status === 'published' && fanout.friendIds > 0) {
+        console.log('[Gateway] presence online: announced to', fanout.friendIds, 'friends');
+      }
     }
     res.status(200).json({ ok: true, updated: outcome.updated, last_seen_at: outcome.lastSeenAt });
   } catch (err) {
@@ -2406,6 +2429,55 @@ router.post('/presence/logout', auth.authenticate.bind(auth), async (req: Reques
   } catch (err) {
     console.error('[Gateway] presence logout error:', (err as Error).message);
     res.status(500).json({ error: 'Presence removal failed' });
+  }
+});
+
+// "Is at least one of my accepted friends currently online?" (do.md "green
+// online-friends indicator on the mobile Messages icon").
+//
+// The answer is a BOOLEAN plus the instant it can first become false, and that is
+// the entire response. The roster is deliberately not returned: which friend is
+// online is more online-status information than a nav dot needs, and the client
+// already has every other means of asking for it - this endpoint exists so it does
+// not have to. See features/onlineFriends.ts for why the two fields are the
+// minimum a non-polling client can be given.
+//
+// The freshness and friendship rules are the app's existing ones, not new ones:
+// `acceptedFriendIds`/`blockedPeerIds` are the gateway's existing
+// accepted-friendship and blocking logic, and freshness is the same window
+// `isOnline()` applies, so this cannot disagree with the dots in the conversation
+// list. Presence ages out silently, so there is no event for "a friend went
+// offline" - `offlineAt` exists so the client can arm one timeout instead of
+// polling to find out.
+//
+// Not cached, for the same reason the heartbeat is not: a cached "yes, somebody
+// is online" would keep a green dot on somebody who left. And it needs no rate
+// limit of its own - it inherits the global `'*'` budget in api/middleware.ts,
+// the same one every other authenticated read here lives under.
+router.post('/presence/online-friends', auth.authenticate.bind(auth), async (req: Request, res: Response) => {
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ error: 'Not authenticated' });
+    return;
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const outcome = await getOnlineFriendStatus(userId);
+    if (outcome.status === 'failed') {
+      // The upstream message can name a project or a column, neither of which
+      // belongs in a body the browser keeps. The caller keeps whatever it already
+      // had: an error must not read as "nobody is online".
+      console.error('[Gateway] presence online-friends read failed:', outcome.message);
+      res.status(500).json({ error: 'Presence read failed' });
+      return;
+    }
+    res.status(200).json({
+      hasOnlineFriend: outcome.hasOnlineFriend,
+      offlineAt: outcome.offlineAt,
+    });
+  } catch (err) {
+    console.error('[Gateway] presence online-friends error:', (err as Error).message);
+    res.status(500).json({ error: 'Presence read failed' });
   }
 });
 

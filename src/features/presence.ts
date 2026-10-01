@@ -93,6 +93,35 @@ export const PRESENCE_PROFILE_DOMAINS = ['profiles', 'users'] as const;
 export const PRESENCE_LOGGED_OUT_AT = '1970-01-01T00:00:00.000Z';
 
 /**
+ * How stale a `last_seen_at` may be and still mean "this user is here now".
+ *
+ * WHY IT LIVES HERE, which is where it is most likely to be wrong: the value
+ * that actually decides whether a dot is green is `isOnline()` in
+ * `src/hooks/usePresence.ts` (a different repository), and this constant is a
+ * COPY of the threshold inside it, for the two reads the gateway has to make on
+ * its own — deciding whether a heartbeat is an offline->online TRANSITION
+ * (features/onlineFriends.ts, which is what makes the mobile online-friends dot
+ * appear without polling), and answering the "is any accepted friend online"
+ * boolean for that same dot.
+ *
+ * It was deliberately not left as "whatever the reader decides": the two
+ * endpoints here cannot import the frontend's constant, and a reader-side-only
+ * implementation would have to publish the whole online-friend roster to the
+ * browser so the client could apply `isOnline()` itself, which is precisely the
+ * "expose additional online-status information to the client" that this feature
+ * is meant to avoid.
+ *
+ * The cost of the copy is that the two repositories can drift: raise
+ * `OFFLINE_THRESHOLD_MS` in `src/hooks/usePresence.ts` without raising this and
+ * a friend stays green in the conversation list for longer than the nav dot
+ * says. The value is therefore asserted to be identical in
+ * `features/onlineFriendsTest.ts`, which fails the build if either side changes
+ * alone. The `PRESENCE_LOGGED_OUT_AT` note above applies here too and is the
+ * reason the marker is an absolute instant rather than a backdated one.
+ */
+export const PRESENCE_OFFLINE_THRESHOLD_MS = 150000;
+
+/**
  * Minimal shape of the part of a Supabase client this uses. Loosely typed on
  * purpose, matching the same convention as `profileIndexing.ProfileIndexingProject`:
  * the gateway's registry hands back a client whose row types resolve to `never`
