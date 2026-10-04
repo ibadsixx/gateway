@@ -57,8 +57,11 @@ export interface BackfillReport {
   /** Writes actually performed (always 0 on a dry run). */
   written: { tags: number; links: number };
   /**
-   * Every failure, by operation. NON-EMPTY MEANS THE BACKFILL DID NOT COMPLETE —
-   * this is the signal that must not be swallowed, given the bug this exists to
+   * Every failure and every blocker found, including whether the target domains
+   * are writable at all — reported on dry runs too, so a dry run can predict a
+   * write run. NON-EMPTY MEANS THE BACKFILL COULD NOT COMPLETE: the registry may
+   * still be incomplete, so the run should be repeated once the cause is fixed.
+   * This is the signal that must not be swallowed, given the bug this exists to
    * fix was itself a swallowed failure.
    */
   failures: Array<{ operation: string; detail: string }>;
@@ -230,6 +233,34 @@ export async function runHashtagBackfill(
     failures,
   };
 
+  // --- can this deployment write at all? ------------------------------------
+  // Resolved FIRST, and reported on every run including a dry one, because it is
+  // the single most valuable unknown before the first successful write.
+  //
+  // `hashtags` reads fine as a guest yet has never had an app-written row, which
+  // is exactly the signature of a domain that is readable but NOT writable (no
+  // `write_enabled`, or over the capacity threshold). A dry run that skipped this
+  // would report a clean, plausible-looking backlog, and the operator would only
+  // discover they were not ready on the mutating run — after asking for the
+  // change to be made. A dry run that answers "would this actually work?" is
+  // worth the two extra lines.
+  const hashtagsDomain = 'hashtags';
+  const linksDomain = 'hashtag_links';
+  const writableHashtags = projectManager.getWritableProject(hashtagsDomain);
+  const writableLinks = projectManager.getWritableProject(linksDomain);
+  if (!writableHashtags) {
+    failures.push({
+      operation: 'resolve writable project',
+      detail: `No writable project for domain: ${hashtagsDomain}`,
+    });
+  }
+  if (!writableLinks) {
+    failures.push({
+      operation: 'resolve writable project',
+      detail: `No writable project for domain: ${linksDomain}`,
+    });
+  }
+
   // --- read the sources -----------------------------------------------------
   const postRows = await readAllShards('posts', 'posts', POSTS_SELECT, pageSize, maxPages, failures);
   const commentRows = await readAllShards(
@@ -254,9 +285,6 @@ export async function runHashtagBackfill(
   if (allTags.length === 0) return report;
 
   // --- read what already exists --------------------------------------------
-  const hashtagsDomain = 'hashtags';
-  const linksDomain = 'hashtag_links';
-
   const existingTagRows = await readAllShards(
     hashtagsDomain,
     'hashtags',
@@ -321,39 +349,23 @@ export async function runHashtagBackfill(
   }
   report.linksToCreate = pendingLinks.length;
 
+  // Resolve writability BEFORE the dry-run return, so a dry run answers "would
+  // this actually work?" and not merely "what would change?". See the top of
+  // this function: this is the check that matters most while no write has ever
+  // succeeded.
   if (dryRun || failures.length > 0) {
-    // A read failure means the diff above is computed from an incomplete view,
-    // so writing now would create a partial — and misleading — registry. Report
-    // and stop; the caller re-runs once the cause is fixed.
+    // Either the caller asked for a dry run, or something is already known to be
+    // wrong: a read failure means the diff above was computed from an incomplete
+    // view, so writing would create a partial — and misleading — registry.
+    // Report and stop; the caller re-runs once the cause is fixed.
     return report;
   }
 
   // --- write ----------------------------------------------------------------
-  const writableHashtagShards = projectManager
-    .getWritableProject(hashtagsDomain)
-    ? [projectManager.getWritableProject(hashtagsDomain)!.client]
-    : [];
-  const writableLinkShards = projectManager
-    .getWritableProject(linksDomain)
-    ? [projectManager.getWritableProject(linksDomain)!.client]
-    : [];
-
-  if (writableHashtagShards.length === 0) {
-    failures.push({
-      operation: 'resolve writable project',
-      detail: `No writable project for domain: ${hashtagsDomain}`,
-    });
-    return report;
-  }
-  if (writableLinkShards.length === 0) {
-    failures.push({
-      operation: 'resolve writable project',
-      detail: `No writable project for domain: ${linksDomain}`,
-    });
-    return report;
-  }
-  const hashtagsClient = writableHashtagShards[0] as ShardClient;
-  const linksClient = writableLinkShards[0] as ShardClient;
+  // Both resolved above, and both known non-null because any failure here would
+  // have returned already.
+  const hashtagsClient = writableHashtags!.client as ShardClient;
+  const linksClient = writableLinks!.client as ShardClient;
 
   // 1. Create the missing tag rows. `onConflict: 'tag'` matches the frontend's
   //    `saveHashtags` and makes this safe to re-run.

@@ -365,6 +365,71 @@ async function testCommentsIncluded(): Promise<void> {
   }
 }
 
+async function testDryRunReportsUnwritableDomain(): Promise<void> {
+  // A dry run must answer "would this actually work?", not just "what would
+  // change?". `hashtags` currently reads fine as a guest yet has never had an
+  // app-written row, so whether it is writable is the open question — and it is
+  // only answerable without mutating. A dry run that returned before resolving
+  // writability would report a clean backlog and let the operator believe they
+  // were ready, when the failure would only surface on the mutating run.
+  const posts = fakeClient([{ id: 'p1', content: '#POV', status: 'published' }]);
+  const comments = fakeClient([]);
+  const hashtags = fakeClient([]);
+  const links = fakeClient([]);
+  // Readable, but no writable project registered — the live asymmetry.
+  const restore = withShards({
+    posts: [posts],
+    comments: [comments],
+    hashtags: [hashtags],
+    hashtag_links: [links],
+  });
+  try {
+    const report = await runHashtagBackfill();
+    assert.equal(report.dryRun, true, 'this was a dry run');
+    assert.ok(
+      report.failures.some((f) => /No writable project for domain: hashtags/.test(f.detail)),
+      'a DRY run reports that the hashtags domain is not writable'
+    );
+    assert.ok(
+      report.failures.some((f) => /No writable project for domain: hashtag_links/.test(f.detail)),
+      'a DRY run reports that the hashtag_links domain is not writable'
+    );
+    assert.equal(report.written.tags, 0);
+    assert.equal(report.written.links, 0);
+    console.log('  ok a dry run reports writability, so it predicts the write run');
+  } finally {
+    restore();
+  }
+}
+
+async function testDryRunReportsWritabilityOnAnEmptyCorpus(): Promise<void> {
+  // Same guarantee with nothing to backfill: the open question "can this
+  // deployment write hashtags at all?" is answered regardless of the backlog, so
+  // the answer does not change from one run to the next with nothing to
+  // distinguish them.
+  const posts = fakeClient([{ id: 'p1', content: 'plain', status: 'published' }]);
+  const comments = fakeClient([]);
+  const hashtags = fakeClient([]);
+  const links = fakeClient([]);
+  const restore = withShards({
+    posts: [posts],
+    comments: [comments],
+    hashtags: [hashtags],
+    hashtag_links: [links],
+  });
+  try {
+    const report = await runHashtagBackfill();
+    assert.equal(report.taggedSources, 0);
+    assert.ok(
+      report.failures.some((f) => /No writable project/.test(f.detail)),
+      'writability is reported even with an empty backlog'
+    );
+    console.log('  ok writability is reported even when there is nothing to backfill');
+  } finally {
+    restore();
+  }
+}
+
 async function testEmptyRegistryIsANoOp(): Promise<void> {
   const posts = fakeClient([{ id: 'p1', content: 'plain caption', status: 'published' }]);
   const comments = fakeClient([{ id: 'c1', content: 'also plain' }]);
@@ -444,6 +509,8 @@ async function main(): Promise<void> {
   await testExistingLinksWithoutAnIdColumn();
   await testWriteFailureIsReported();
   await testNoWritableProjectIsReported();
+  await testDryRunReportsUnwritableDomain();
+  await testDryRunReportsWritabilityOnAnEmptyCorpus();
   await testReadFailureBlocksWriting();
   await testReadsEveryShard();
   await testPaginates();
