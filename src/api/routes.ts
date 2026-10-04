@@ -15,6 +15,7 @@ import {
 import { supabaseSitemapSource } from '../features/sitemapSource';
 import { isValidProfileUsername, readProfileIndexing } from '../features/profileIndexing';
 import { writePresenceHeartbeat, writePresenceLogout } from '../features/presence';
+import { isHashtagBackfillAuthorized, parseBackfillDryRun, runHashtagBackfill } from '../features/hashtagBackfill';
 import {
   getOnlineFriendStatus,
   publishPresenceToFriends,
@@ -871,6 +872,53 @@ v1.delete('/messages/:messageId', async (req, res) => {
     res.status(204).send();
   } catch (error) {
     console.error(`[gateway] DELETE /api/v1/messages/${messageId} failed:`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Hashtag backfill (post-hashtag-fix). Reconciles posts/comments published
+// BEFORE the renderer and Editor-publish fixes, which produced captions with
+// `#tags` but no `hashtags` / `hashtag_links` rows at all.
+//
+// Two gates beyond the `v1` auth middleware, because this is a cross-table bulk
+// write and "any authenticated user" is too broad a blast radius:
+//
+//   1. Denied unless HASHTAG_BACKFILL_ADMIN_IDS names the caller. An unset or
+//      empty list denies EVERYONE, so deploying this without configuring it
+//      cannot expose a write path.
+//   2. Dry run unless the body explicitly opts in with `"dryRun": false`. The
+//      first call after deploy should size the backlog, not mutate it.
+//
+// Both decisions live in the feature module so they can be tested directly; the
+// route below only wires them to a status code.
+//
+// Registered BEFORE the generic `/:domain` routes, and on a two-segment path
+// whose first segment is a literal, so it can never be captured by (or shadow)
+// them.
+v1.post('/hashtags/backfill', async (req: Request, res: Response) => {
+  if (!isHashtagBackfillAuthorized(process.env.HASHTAG_BACKFILL_ADMIN_IDS, req.user?.id)) {
+    res.status(403).json({ error: 'Not authorized to run the hashtag backfill' });
+    return;
+  }
+
+  const dryRun = parseBackfillDryRun(req.body);
+
+  try {
+    const report = await runHashtagBackfill({ dryRun });
+    console.log(
+      `[hashtags] backfill (${dryRun ? 'dry run' : 'WRITE'}): ` +
+        `scanned ${report.scanned.posts} posts / ${report.scanned.comments} comments, ` +
+        `${report.taggedSources} tagged, ${report.distinctTags} distinct tags, ` +
+        `+${report.tagsToCreate.length} tags, +${report.linksToCreate} links, ` +
+        `wrote ${report.written.tags}/${report.written.links}, ` +
+        `${report.failures.length} failures`
+    );
+    // `failures` is returned rather than logged only, so the caller can tell a
+    // completed run from a partial one. A non-empty array means the registry is
+    // still incomplete and the run should be repeated.
+    res.status(200).json(report);
+  } catch (error) {
+    console.error('[hashtags] backfill failed:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

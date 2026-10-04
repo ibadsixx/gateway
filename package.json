@@ -32,7 +32,8 @@
     "test:profile-indexing": "ts-node src/features/profileIndexingTest.ts",
     "test:presence": "ts-node src/features/presenceTest.ts",
     "test:online-friends": "ts-node src/features/onlineFriendsTest.ts",
-    "test:unread-conversations": "ts-node src/features/unreadConversationsTest.ts"
+    "test:unread-conversations": "ts-node src/features/unreadConversationsTest.ts",
+    "test:hashtag-backfill": "ts-node src/features/hashtagBackfillTest.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.0",
