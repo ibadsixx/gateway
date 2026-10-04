@@ -349,15 +349,12 @@ export async function runHashtagBackfill(
   }
   report.linksToCreate = pendingLinks.length;
 
-  // Resolve writability BEFORE the dry-run return, so a dry run answers "would
-  // this actually work?" and not merely "what would change?". See the top of
-  // this function: this is the check that matters most while no write has ever
-  // succeeded.
+  // Writability was already resolved and reported at the top of this function, so
+  // reaching here with a non-empty `failures` means either the caller wanted a
+  // dry run, or a read failed and the diff above was computed from an incomplete
+  // view. Both mean the same thing: stop and report, because writing now would
+  // create a partial — and misleading — registry.
   if (dryRun || failures.length > 0) {
-    // Either the caller asked for a dry run, or something is already known to be
-    // wrong: a read failure means the diff above was computed from an incomplete
-    // view, so writing would create a partial — and misleading — registry.
-    // Report and stop; the caller re-runs once the cause is fixed.
     return report;
   }
 
