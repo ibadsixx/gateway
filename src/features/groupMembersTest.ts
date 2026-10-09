@@ -33,6 +33,13 @@ const MODERATOR = 'moderator-uuid';
 const MEMBER = 'member-uuid';
 const NONMEMBER = 'nobody-uuid';
 const STRANGER = 'stranger-uuid';
+// Friends-only invitation fixtures (message.md): FRIEND and MOD_FRIEND are
+// accepted friends of the owner / moderator, PENDING is only a pending request,
+// and FOLLOWER is a follow edge (never a friendship).
+const FRIEND = 'friend-uuid';
+const MOD_FRIEND = 'mod-friend-uuid';
+const PENDING = 'pending-uuid';
+const FOLLOWER = 'follower-uuid';
 
 const G1 = 'group-member-test';
 const G1_PRIVATE = 'group-private';
@@ -56,6 +63,17 @@ function makeDb(): Db {
       { id: G1_RULE, group_id: G1, rule_text: 'Be kind', position: 0, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' },
     ],
     group_posts: [],
+    // The `friends` domain is queried by the invite authorization (only rows
+    // with status 'accepted' count as a friendship). FOLLOWER only follows the
+    // owner, so it must never satisfy the friend check.
+    friends: [
+      { id: 'f-owner-friend', requester_id: OWNER, receiver_id: FRIEND, status: 'accepted' },
+      { id: 'f-mod-friend', requester_id: MOD_FRIEND, receiver_id: MODERATOR, status: 'accepted' },
+      { id: 'f-owner-pending', requester_id: PENDING, receiver_id: OWNER, status: 'pending' },
+    ],
+    followers: [
+      { id: 'fol-owner', follower_id: OWNER, following_id: FOLLOWER },
+    ],
   };
 }
 
@@ -65,6 +83,7 @@ function makeDb(): Db {
 // exercised here.
 class Query {
   private filters: Array<[string, unknown]> = [];
+  private orExprs: string[] = [];
   constructor(
     private db: Db,
     private table: string,
@@ -75,6 +94,23 @@ class Query {
   eq(col: string, val: unknown): Query {
     this.filters.push([col, val]);
     return this;
+  }
+
+  // Supports the PostgREST OR form the friendship lookup uses:
+  //   "requester_id.eq.X,receiver_id.eq.X"
+  or(expr: string): Query {
+    this.orExprs.push(expr);
+    return this;
+  }
+
+  private matchesOr(row: Row): boolean {
+    if (this.orExprs.length === 0) return true;
+    return this.orExprs.every((expr) =>
+      expr.split(',').some((clause) => {
+        const m = clause.match(/^([^.]+)\.eq\.(.*)$/);
+        return m ? String(row[m[1]]) === m[2] : false;
+      })
+    );
   }
 
   order(_col: string, _opts?: unknown): Query {
@@ -98,8 +134,8 @@ class Query {
 
   private matched(): Row[] {
     if (!this.db[this.table]) this.db[this.table] = [];
-    return this.db[this.table].filter((r) =>
-      this.filters.every(([c, v]) => String(r[c]) === String(v))
+    return this.db[this.table].filter(
+      (r) => this.filters.every(([c, v]) => String(r[c]) === String(v)) && this.matchesOr(r)
     );
   }
 
@@ -217,11 +253,41 @@ async function main() {
     });
     count++;
 
-    await run('TEST 8: owner invites a non-member', async () => {
-      const r = await addGroupMembers(G1, OWNER, { user_ids: [STRANGER] }, projects);
+    await run('TEST 8: owner invites an accepted friend who is not a member', async () => {
+      const r = await addGroupMembers(G1, OWNER, { user_ids: [FRIEND] }, projects);
       assert.equal(r.status, 'ok');
       if (r.status !== 'ok') return;
       assert.equal(r.added, 1);
+      assert.ok(db.group_members.some((m) => m.group_id === G1 && m.user_id === FRIEND));
+    });
+    count++;
+
+    await run('TEST 8b: moderator invites their own accepted friend', async () => {
+      const r = await addGroupMembers(G1, MODERATOR, { user_ids: [MOD_FRIEND] }, projects);
+      assert.equal(r.status, 'ok');
+      if (r.status !== 'ok') return;
+      assert.equal(r.added, 1);
+    });
+    count++;
+
+    await run('TEST 8c: a manipulated invite to a non-friend is rejected by the backend', async () => {
+      const r = await addGroupMembers(G1, OWNER, { user_ids: [STRANGER] }, projects);
+      assert.equal(r.status, 'not_allowed');
+      assert.equal(db.group_members.some((m) => m.user_id === STRANGER), false);
+    });
+    count++;
+
+    await run('TEST 8d: a pending friend request never qualifies', async () => {
+      const r = await addGroupMembers(G1, OWNER, { user_ids: [PENDING] }, projects);
+      assert.equal(r.status, 'not_allowed');
+      assert.equal(db.group_members.some((m) => m.user_id === PENDING), false);
+    });
+    count++;
+
+    await run('TEST 8e: a follower who is not a friend never qualifies', async () => {
+      const r = await addGroupMembers(G1, OWNER, { user_ids: [FOLLOWER] }, projects);
+      assert.equal(r.status, 'not_allowed');
+      assert.equal(db.group_members.some((m) => m.user_id === FOLLOWER), false);
     });
     count++;
 

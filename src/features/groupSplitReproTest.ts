@@ -71,6 +71,12 @@ function makeFullDataset(): Record<string, Row[]> {
       { id: TARGET, username: 'target', display_name: 'Tgt', profile_pic: null, last_seen_at: null },
     ],
     notifications: [],
+    // Friends-only invitations (message.md): the `friends` domain lives on its
+    // own project in the deployed registry, so the invite authorization must
+    // resolve it there rather than on the groups host.
+    friends: [
+      { id: 'friend-mod-target', requester_id: MODERATOR, receiver_id: TARGET, status: 'accepted' },
+    ],
   };
 }
 
@@ -79,6 +85,7 @@ const MISSING_TABLES: Record<string, string> = {};
 // Query builder for the tables a client OWNS.
 class Query {
   private filters: Array<[string, unknown]> = [];
+  private orExprs: string[] = [];
   constructor(
     private db: Record<string, Row[]>,
     private table: string,
@@ -89,6 +96,19 @@ class Query {
   eq(col: string, val: unknown): Query {
     this.filters.push([col, val]);
     return this;
+  }
+  or(expr: string): Query {
+    this.orExprs.push(expr);
+    return this;
+  }
+  private matchesOr(row: Row): boolean {
+    if (this.orExprs.length === 0) return true;
+    return this.orExprs.every((expr) =>
+      expr.split(',').some((clause) => {
+        const m = clause.match(/^([^.]+)\.eq\.(.*)$/);
+        return m ? String(row[m[1]]) === m[2] : false;
+      })
+    );
   }
   order(_col: string, _opts?: unknown): Query {
     return this;
@@ -107,7 +127,9 @@ class Query {
   }
   private matched(): Row[] {
     if (!this.db[this.table]) this.db[this.table] = [];
-    return this.db[this.table].filter((r) => this.filters.every(([c, v]) => String(r[c]) === String(v)));
+    return this.db[this.table].filter(
+      (r) => this.filters.every(([c, v]) => String(r[c]) === String(v)) && this.matchesOr(r)
+    );
   }
   private async execute(): Promise<{ data: unknown; error: null }> {
     const matched = this.matched();
@@ -147,6 +169,7 @@ function errorQuery(table: string): any {
     update: () => chain,
     delete: () => chain,
     eq: () => chain,
+    or: () => chain,
     order: () => chain,
     limit: () => chain,
     range: () => chain,

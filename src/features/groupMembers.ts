@@ -37,6 +37,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { randomUUID } from 'node:crypto';
 import { projectManager } from '../project-manager';
 import { groupReadClient, groupWriteClient, type GroupProjects } from './groupHosts';
+import { getAcceptedFriendIds, type ReactionProject } from './reactionUsers';
 
 export const GROUP_RESTRICTION_TYPES = ['posting', 'all'] as const;
 export type GroupRestrictionType = (typeof GROUP_RESTRICTION_TYPES)[number];
@@ -155,6 +156,15 @@ const GROUP_MODERATION_ACTIONS = new Set(['remove', 'ban', 'unban', 'restrict', 
 // its OWN project in the deployed registry and is resolved per-domain — see
 // groupReadClient / groupWriteClient.
 type HostContext = { client: SupabaseClient; group: GroupRecord; projects?: GroupProjects | null };
+
+// The `friends` domain can be sharded onto a different project than the group
+// hosts. Offline harnesses inject a single mock client that serves every table,
+// so the injected list wins there; otherwise the existing registry resolves the
+// readable `friends` projects. This never reads friendships from a group host.
+function friendProjects(projects?: GroupProjects | null): ReactionProject[] {
+  if (projects && projects.length > 0) return projects as unknown as ReactionProject[];
+  return projectManager.getReadableProjects('friends') as unknown as ReactionProject[];
+}
 
 async function resolveGroupHost(
   groupId: string | null | undefined,
@@ -466,6 +476,21 @@ export async function addGroupMembers(
 
   const membersClient = groupWriteClient('group_members', ctx.projects);
   const toInsert = ids.filter((id) => !existingSet.has(id));
+
+  // Invitations are friends-only (message.md): a caller may add only people
+  // they are actually accepted friends with. Only the people who would really
+  // be added are checked, so re-inviting an existing member stays a no-op and a
+  // self-join (which is not an invitation) is unaffected. This reuses the
+  // Gateway's single accepted-friendship definition, and is enforced here so a
+  // manipulated request can never add a non-friend by bypassing the dialog.
+  const newInvitees = toInsert.filter((id) => id !== callerUserId);
+  if (newInvitees.length > 0) {
+    const friendIds = await getAcceptedFriendIds(friendProjects(ctx.projects), callerUserId);
+    if (newInvitees.some((id) => !friendIds.has(id))) {
+      return { status: 'not_allowed', message: 'You can only invite your friends to this group.' };
+    }
+  }
+
   let added = 0;
   for (const id of toInsert) {
     const { error } = await membersClient.from('group_members').insert({
