@@ -10,6 +10,7 @@
     "test:channel-moderator": "ts-node src/features/channelModeratorTest.ts",
     "test:group-settings": "ts-node src/features/groupSettingsTest.ts",
     "test:group-members": "ts-node src/features/groupMembersTest.ts",
+    "test:group-join-resilience": "ts-node src/features/groupJoinResilienceTest.ts",
     "verify:message-requests": "ts-node src/features/verifyMessageRequestCategory.ts",
     "test:channel-permissions": "ts-node src/features/channelPermissionsTest.ts",
     "test:scheduled-privacy": "ts-node src/features/scheduledPostPrivacyTest.ts",

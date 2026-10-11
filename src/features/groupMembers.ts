@@ -466,7 +466,17 @@ export async function addGroupMembers(
 
   const existing = await fetchMembers(ctx);
   const existingSet = new Set(existing.map((m) => m.user_id));
-  const bans = await fetchBans(ctx);
+  // Ban lookup is best-effort: the dedicated `group_member_bans` domain may not
+  // be registered in a split deployment (it lives on its own project, and the
+  // production registry currently registers groups/group_members/group_posts/
+  // group_pins/group_follows only). Resolving it unconditionally made EVERY
+  // self-join throw "No readable projects for domain: group_member_bans" ->
+  // 500 GROUP_OPERATION_FAILED, so no membership row was ever created and the
+  // caller's "Joined" list stayed empty. With no readable ban table there is no
+  // ban to honor; when the domain IS registered the bans are still enforced
+  // here, and the `group_members_block_banned_join` DB trigger remains the last
+  // line of defense on the write path.
+  const bans = await bestEffortModeration(ctx, 'group_member_bans', fetchBans, [] as GroupBanRow[]);
 
   // A banned user must not rejoin — enforced here and by the DB trigger.
   const banned = bans.find((b) => ids.includes(b.user_id) && isBanActive(b));
