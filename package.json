@@ -19,6 +19,7 @@
     "test:story-privacy": "ts-node src/features/storyPrivacyTest.ts",
     "test:highlight-privacy": "ts-node src/features/highlightPrivacyTest.ts",
     "test:guest-access": "ts-node src/features/guestAccessTest.ts",
+    "test:page-posts": "ts-node src/features/pagePostsTest.ts",
     "test:relationship-counts": "ts-node src/features/relationshipCountsTest.ts",
     "test:reaction-counts": "ts-node src/features/reactionCountsTest.ts",
     "test:reaction-users": "ts-node src/features/reactionUsersTest.ts",

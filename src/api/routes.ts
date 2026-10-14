@@ -54,6 +54,7 @@ import {
   bumpStoryViewsCount,
 } from '../features/storyPrivacy';
 import { highlightItemWriteDenied } from '../features/highlightPrivacy';
+import { pagePostWriteDenied, stampPagePostSharedBy } from '../features/pagePosts';
 import {
   isGuestReadableDomain,
   applyGuestReadPolicy,
@@ -2621,6 +2622,22 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
     // caller's own user_id, never attributed to another user.
     if (domain === 'story_highlights' && req.user?.id && req.body && typeof req.body === 'object') {
       (req.body as Record<string, unknown>).user_id = req.user.id;
+    }
+    // Page posts: the generic service-role write bypasses the
+    // `page_posts_insert_admin` RLS policy, so enforce it here — only the
+    // page's admin may associate a post with that page, and `shared_by` is
+    // always the authenticated caller (never a client-supplied id).
+    if (domain === 'page_posts') {
+      const pagePostDenied = await pagePostWriteDenied(
+        req.body,
+        projectManager.getReadableProjects('pages').map((p) => p.client),
+        req.user?.id
+      );
+      if (pagePostDenied) {
+        res.status(403).json({ error: pagePostDenied });
+        return;
+      }
+      stampPagePostSharedBy(req.body, req.user?.id);
     }
     // Re-recording an already recorded view (unique story_id + viewer_id) is
     // not an error: the view simply stays counted once.
