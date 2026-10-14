@@ -54,7 +54,7 @@ import {
   bumpStoryViewsCount,
 } from '../features/storyPrivacy';
 import { highlightItemWriteDenied } from '../features/highlightPrivacy';
-import { pagePostWriteDenied, stampPagePostSharedBy } from '../features/pagePosts';
+import { pagePostWriteDenied, stampPagePostSharedBy, collectPagePostIds, publishLinkedPagePosts } from '../features/pagePosts';
 import {
   isGuestReadableDomain,
   applyGuestReadPolicy,
@@ -2659,6 +2659,21 @@ router.post('/:domain', auth.authenticate.bind(auth), validation.validateDomainM
     }
     if (domain === 'message_requests') {
       console.log('[MessageRequest] request_created', { id: Array.isArray(result) ? result[0]?.id : result?.id });
+    }
+    // A page post is public (a Page is public by design). The shared creation
+    // path already sends `public`, but the service-role write bypasses any RLS
+    // audience rule, so the invariant is re-established here for any writer that
+    // links one of its own posts to a page it administers. Only the caller's own
+    // post is touched (see `publishLinkedPagePosts`) and it never fails the link.
+    if (domain === 'page_posts') {
+      await publishLinkedPagePosts(
+        req.user?.id,
+        collectPagePostIds(req.body),
+        (postId) => database.read('posts', postId) as Promise<Record<string, unknown> | null>,
+        async (postId, patch) => {
+          await database.update('posts', postId, patch);
+        }
+      );
     }
     res.status(201).json(result);
   } catch (error) {

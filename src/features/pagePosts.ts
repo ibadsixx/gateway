@@ -98,3 +98,62 @@ export function stampPagePostSharedBy(body: unknown, requesterId: string | undef
     if (row && typeof row === 'object') row['shared_by'] = requesterId;
   }
 }
+
+/**
+ * The post ids a `page_posts` write (single row or array) links to a page.
+ * Used to enforce the page-post audience invariant after the link is stored.
+ */
+export function collectPagePostIds(body: unknown): string[] {
+  if (!body || typeof body !== 'object') return [];
+  const rows = Array.isArray(body) ? (body as Array<Record<string, unknown>>) : [body as Record<string, unknown>];
+  const ids: string[] = [];
+  for (const row of rows) {
+    if (row && typeof row === 'object' && typeof row['post_id'] === 'string' && row['post_id']) {
+      ids.push(row['post_id'] as string);
+    }
+  }
+  return [...new Set(ids)];
+}
+
+/**
+ * Enforce the page-post audience invariant after a `page_posts` link is stored.
+ *
+ * A post linked to a Page belongs to that Page, and a Page is public by design
+ * (the Gateway serves `pages` and `page_posts` to guests). Persisting the
+ * personal composer default (`friends`) on a page post made the Gateway's
+ * audience enforcement hide it from every viewer but the admin, so the page
+ * showed nothing. The shared creation path already sends `public`; this keeps
+ * the invariant server-side for every writer of this route.
+ *
+ * Only the caller's OWN post is touched: the insert policy does not restrict the
+ * linked post to the caller, so forcing someone else's post public would escalate
+ * access. Anything whose `user_id` is not the caller is left as-is.
+ *
+ * Best-effort: the link is already stored, so a failed update is logged only.
+ */
+export async function publishLinkedPagePosts(
+  sharedBy: string | undefined,
+  postIds: string[],
+  readPost: (id: string) => Promise<Record<string, unknown> | null>,
+  updatePost: (id: string, patch: Record<string, unknown>) => Promise<void>
+): Promise<void> {
+  if (!sharedBy || postIds.length === 0) return;
+  for (const postId of postIds) {
+    try {
+      const post = await readPost(postId);
+      if (!post || post['user_id'] !== sharedBy) continue;
+      if (post['audience_type'] === 'public') continue;
+      await updatePost(postId, {
+        audience_type: 'public',
+        audience_user_ids: null,
+        audience_excluded_user_ids: null,
+        audience_list_id: null,
+      });
+    } catch (error) {
+      console.warn(
+        `[pagePosts] could not publish linked post ${postId}:`,
+        error instanceof Error ? error.message : error
+      );
+    }
+  }
+}

@@ -6,7 +6,7 @@
 //
 // Run: npm run test:page-posts
 import assert from 'node:assert/strict';
-import { evaluatePagePostCreate, pagePostWriteDenied, stampPagePostSharedBy } from './pagePosts';
+import { evaluatePagePostCreate, pagePostWriteDenied, stampPagePostSharedBy, collectPagePostIds, publishLinkedPagePosts } from './pagePosts';
 
 const ADMIN = 'admin-uuid';
 const OTHER = 'other-uuid';
@@ -101,6 +101,80 @@ async function main() {
   const bulk: Array<Record<string, unknown>> = [{ page_id: PAGE, shared_by: OTHER }];
   stampPagePostSharedBy(bulk, ADMIN);
   assert.equal(bulk[0].shared_by, ADMIN, 'array rows are stamped too');
+
+  // --- page-post audience invariant -----------------------------------------
+  // A page post is public (a Page is public by design), so linking one of the
+  // caller's own posts to a page makes that post public. This is what stops the
+  // Gateway's audience enforcement from hiding the page's own post from every
+  // viewer but the admin.
+
+  // collectPagePostIds: single, array, dedupe, ignores junk.
+  assert.deepEqual(collectPagePostIds({ post_id: 'p1' }), ['p1'], 'single body id is collected');
+  assert.deepEqual(
+    collectPagePostIds([{ post_id: 'p1' }, { post_id: 'p2' }, { post_id: 'p1' }, {}]),
+    ['p1', 'p2'],
+    'array ids are collected and deduped'
+  );
+  assert.deepEqual(collectPagePostIds(null), [], 'null body yields no ids');
+
+  {
+    const updated: Array<{ id: string; patch: Record<string, unknown> }> = [];
+    const posts: Record<string, Record<string, unknown>> = {
+      mine: { id: 'mine', user_id: ADMIN, audience_type: 'friends' },
+      alreadyPublic: { id: 'alreadyPublic', user_id: ADMIN, audience_type: 'public' },
+      theirs: { id: 'theirs', user_id: OTHER, audience_type: 'friends' },
+    };
+    await publishLinkedPagePosts(
+      ADMIN,
+      ['mine', 'alreadyPublic', 'theirs', 'missing'],
+      async (id) => posts[id] ?? null,
+      async (id, patch) => {
+        updated.push({ id, patch });
+      }
+    );
+    assert.deepEqual(
+      updated.map((u) => u.id),
+      ['mine'],
+      'only the caller\'s own non-public post is published'
+    );
+    assert.deepEqual(
+      updated[0].patch,
+      {
+        audience_type: 'public',
+        audience_user_ids: null,
+        audience_excluded_user_ids: null,
+        audience_list_id: null,
+      },
+      'the published post gets a public audience with no personal targeting'
+    );
+  }
+
+  {
+    // A failed update (post host down) must never fail the already-stored link.
+    let threw = false;
+    try {
+      await publishLinkedPagePosts(
+        ADMIN,
+        ['mine'],
+        async () => ({ id: 'mine', user_id: ADMIN, audience_type: 'friends' }),
+        async () => {
+          throw new Error('posts host down');
+        }
+      );
+    } catch {
+      threw = true;
+    }
+    assert.equal(threw, false, 'a failed audience update is swallowed');
+  }
+
+  {
+    // No authenticated caller => nothing is published.
+    const updated: string[] = [];
+    await publishLinkedPagePosts(undefined, ['mine'], async () => ({ id: 'mine', user_id: ADMIN }), async (id) => {
+      updated.push(id);
+    });
+    assert.deepEqual(updated, [], 'an unauthenticated link publishes nothing');
+  }
 
   console.log('page posts authorization: all assertions passed');
 }
