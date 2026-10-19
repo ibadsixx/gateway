@@ -217,7 +217,15 @@ function project(tables: Record<string, ReactionRow[]>): { client: FakeClient } 
 }
 
 function deps(tables: Record<string, ReactionRow[]>): ProfileContentDeps {
-  return { posts: [project(tables)], friends: [], profiles: [project(tables)] };
+  return {
+    posts: [project(tables)],
+    friends: [],
+    profiles: [project(tables)],
+    // The `pages` domain carries the `page_posts` link table. Wiring the same
+    // fake tables keeps the page-exclusion path exercised by default; a table
+    // that is absent reads as empty.
+    pagePosts: [project(tables)],
+  };
 }
 
 // --- fixtures ---------------------------------------------------------------
@@ -619,6 +627,97 @@ async function main() {
     const tables = { posts: rows, profiles: profileTable() };
     const walked = await walkAll(tables, 'posts', undefined, new Set());
     check('rows are scoped to the requested profile', walked.map((i) => i.content), ['mine']);
+  }
+
+  // --- a Page post belongs to the Page, never to the author's profile -----
+  {
+    // THE ROOT CAUSE: a Page has no `profiles` row, so a Page post is authored
+    // by the admin (`posts.user_id = OWNER`) and tied to the Page only by its
+    // `page_posts` row. The author's personal profile read filters on
+    // `user_id`, so without this exclusion the Page's post leaks onto the
+    // owner's personal profile. A non-linked post beside it must be unaffected.
+    const normal = post({ content: 'normal personal post' });
+    const pagePost = post({ content: 'page cover update', type: 'cover_photo_update', media_url: 'c.png' });
+    const tables = {
+      posts: [normal, pagePost],
+      profiles: profileTable(),
+      page_posts: [{ id: 'link-1', page_id: 'page-1', post_id: pagePost.id, shared_by: OWNER }],
+    };
+    const walked = await walkAll(tables, 'posts', OWNER, new Set());
+    check('a page-linked post is withheld from the personal profile', walked.map((i) => i.content), [
+      'normal personal post',
+    ]);
+    check('the page-linked post is not served to the owner either', walked.some((i) => i.id === pagePost.id), false);
+
+    // Every viewer of the personal profile is protected, not just the author.
+    const guest = await walkAll(tables, 'posts', undefined, new Set());
+    check('a guest does not receive a page post on the personal profile', guest.map((i) => i.content), [
+      'normal personal post',
+    ]);
+    const friend = await walkAll(tables, 'posts', FRIEND, new Set([OWNER]));
+    check('a friend does not receive a page post on the personal profile', friend.map((i) => i.content), [
+      'normal personal post',
+    ]);
+
+    const page = await getProfileContentPage(deps(tables), OWNER, OWNER, new Set(), 'posts', { limit: 20 });
+    check('the withheld page post is reported as withheld', page.withheld_count, 1);
+
+    // The OTHER profile's page post does not affect this profile's read.
+    const otherPagePost = post({ user_id: OTHER, content: 'other page post' });
+    const mixed = {
+      posts: [normal, pagePost, otherPagePost],
+      profiles: profileTable(),
+      page_posts: [
+        { id: 'link-1', page_id: 'page-1', post_id: pagePost.id, shared_by: OWNER },
+      ],
+    };
+    const ownerWalk = await walkAll(mixed, 'posts', OWNER, new Set());
+    check('only this profile is read', ownerWalk.map((i) => i.content), ['normal personal post']);
+  }
+
+  // --- the page exclusion is optional and does not narrow a wired read -----
+  {
+    // Without the `pages` deps the read is unchanged (the exclusion is simply
+    // not applied). This is the offline/local-registry fallback, not a leak:
+    // the live route always wires `pagePosts`.
+    const pagePost = post({ content: 'page post' });
+    const tables = {
+      posts: [pagePost],
+      profiles: profileTable(),
+      page_posts: [{ id: 'link-1', page_id: 'page-1', post_id: pagePost.id, shared_by: OWNER }],
+    };
+    const withoutPages: ProfileContentDeps = {
+      posts: [project(tables)],
+      friends: [],
+      profiles: [project(tables)],
+    };
+    const page = await getProfileContentPage(withoutPages, OWNER, OWNER, new Set(), 'posts', { limit: 20 });
+    check('without page deps the read is not narrowed', page.items.map((i) => i.content), ['page post']);
+  }
+
+  // --- a head run of page posts is walked past, not starved ---------------
+  {
+    // Page posts are withheld like private ones, so the skip-and-advance path
+    // has to walk past a whole scan batch of them to reach the personal post
+    // behind them.
+    const personal = post({ content: 'the one personal post' });
+    const pagePosts = Array.from({ length: 14 }, (_, i) =>
+      post({ content: `page post ${i}`, type: 'cover_photo_update' })
+    );
+    const tables = {
+      posts: [personal, ...pagePosts],
+      profiles: profileTable(),
+      page_posts: pagePosts.map((p, i) => ({
+        id: `link-${i}`,
+        page_id: `page-${i}`,
+        post_id: p.id,
+        shared_by: OWNER,
+      })),
+    };
+    const walked = await walkAll(tables, 'posts', OWNER, new Set());
+    check('a head run of page posts does not starve the personal post', walked.map((i) => i.content), [
+      'the one personal post',
+    ]);
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);

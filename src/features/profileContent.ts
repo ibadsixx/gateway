@@ -85,6 +85,12 @@ export interface ProfileContentDeps {
   posts: ReactionProject[];
   friends: ReactionProject[];
   profiles: ReactionProject[];
+  /**
+   * The `pages` domain, used to read the `page_posts` link table. Optional so a
+   * caller that does not wire it still reads a personal profile (the page
+   * exclusion is then simply not applied) instead of crashing.
+   */
+  pagePosts?: ReactionProject[];
 }
 
 /**
@@ -373,6 +379,45 @@ async function enrichSharedPosts(
 }
 
 /**
+ * Post ids on `rows` that belong to a Page through the `page_posts` link table.
+ *
+ * A Page has no `profiles` row. A Page post is authored by the admin who
+ * uploaded it (`posts.user_id` is NOT NULL and references `profiles(id)`) and is
+ * tied to the Page ONLY by its `page_posts` row (page_id, post_id, shared_by).
+ * So `posts.user_id` alone cannot tell a Page post from the author's personal
+ * post — the link is the whole representation. A linked post belongs to its
+ * Page, not to the author's personal profile, and is withheld here even though
+ * the `user_id` filter matched it.
+ *
+ * Best-effort and additive: a project that does not carry `page_posts`
+ * contributes nothing (so the wrong domain can never hide a personal post), and
+ * with no `pagePosts` deps wired the exclusion is simply not applied.
+ */
+async function readPageLinkedPostIds(
+  deps: ProfileContentDeps,
+  rows: ReactionRow[]
+): Promise<Set<string>> {
+  const ids = [
+    ...new Set(rows.map((row) => str(row, 'id')).filter((id): id is string => id !== null)),
+  ];
+  const linked = new Set<string>();
+  if (!deps.pagePosts || deps.pagePosts.length === 0 || ids.length === 0) return linked;
+
+  await Promise.all(
+    deps.pagePosts.map(async (project) => {
+      const links = await queryRows(project.client, 'page_posts', (query) =>
+        query.select('post_id').in('post_id', ids)
+      );
+      for (const link of links) {
+        const id = str(link, 'post_id');
+        if (id) linked.add(id);
+      }
+    })
+  );
+  return linked;
+}
+
+/**
  * Authorize `rows` for this viewer.
  *
  * `canViewerViewPost` already encodes the owner bypass, the guest rule and the
@@ -433,7 +478,22 @@ export async function getProfileContentPage(
       return { items: [], has_more: false, next_cursor: null, kind, withheld_count: withheld };
     }
 
-    const authorized = authorizedRows(round.rows, viewerId, friendIds);
+    // Drop rows that belong to a Page before the viewer is considered. Such a
+    // row is authored by the (admin) user so the `user_id` filter matched it,
+    // but its ownership is the Page: it is published on the Page's feed, never
+    // on the author's personal profile. Counting it as withheld keeps the
+    // diagnostics honest and lets the skip-and-advance path below walk past a
+    // run of page posts exactly like a run of private ones.
+    const pageLinkedIds = await readPageLinkedPostIds(deps, round.rows);
+    const candidates =
+      pageLinkedIds.size === 0
+        ? round.rows
+        : round.rows.filter((row) => {
+            const id = str(row, 'id');
+            return !id || !pageLinkedIds.has(id);
+          });
+
+    const authorized = authorizedRows(candidates, viewerId, friendIds);
     withheld += round.rows.length - authorized.length;
 
     if (authorized.length > 0) {

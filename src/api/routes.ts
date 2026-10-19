@@ -2969,6 +2969,11 @@ router.get(
           posts: readableReactionProjects('posts'),
           friends: readableReactionProjects('friends'),
           profiles: readableReactionProjects('profiles'),
+          // A Page post is tied to its Page by the `page_posts` link table
+          // (there is no page column on `posts`), and `page_posts` is its own
+          // domain, not part of `pages`. The personal profile read needs it to
+          // keep page-authored posts off the author's personal feed.
+          pagePosts: readableReactionProjects('page_posts'),
         },
         profileId,
         viewerId,
