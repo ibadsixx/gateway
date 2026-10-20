@@ -55,6 +55,7 @@ import {
 } from '../features/storyPrivacy';
 import { highlightItemWriteDenied } from '../features/highlightPrivacy';
 import { pagePostWriteDenied, stampPagePostSharedBy, collectPagePostIds, publishLinkedPagePosts } from '../features/pagePosts';
+import { attachPageIdentity } from '../features/pageAuthorship';
 import {
   isGuestReadableDomain,
   applyGuestReadPolicy,
@@ -3395,6 +3396,16 @@ router.get('/:domain', auth.authenticateOptional.bind(auth), validation.validate
       // friend set is resolved once per request.
       const friendIds = await resolveViewerFriendIds(requesterId, readableReactionProjects('friends'));
       responseRows = filterContentRowsForViewer(responseRows, requesterId, friendIds);
+      // do.md "Page Posts Must Display the Page Name": a post published as a Page
+      // is stored as a row authored by the admin's PERSONAL id plus a `page_posts`
+      // link, so every generic-post surface (home feed, Explore, Saved, Hashtag,
+      // Group, search, a direct /post/:id link) resolved the admin as the author.
+      // Attach the owning Page from the existing stable link so the shared card can
+      // render the Page identity. Purely additive; personal posts are untouched.
+      responseRows = await attachPageIdentity(responseRows, {
+        pagePosts: readableReactionProjects('page_posts'),
+        pages: readableReactionProjects('pages'),
+      });
       // do.md: the response is now viewer-specific, so it must never be stored
       // in a shared cache or prefetched for a different viewer.
       res.setHeader('Cache-Control', 'private, no-store, max-age=0');
@@ -3547,6 +3558,17 @@ router.get('/:domain/:id', auth.authenticateOptional.bind(auth), validation.vali
     // through a single-row read (do.md scenario H).
     if (domain === 'stories') {
       res.json(restrictStoryRowsRead([result], req.user?.id)[0]);
+      return;
+    }
+    // A direct /post/:id read must show the Page too (do.md "Page Posts Must
+    // Display the Page Name"), resolved from the same stable `page_posts` link
+    // the list read uses. Additive only.
+    if (domain === 'posts') {
+      const [withPage] = await attachPageIdentity([result as Record<string, unknown>], {
+        pagePosts: readableReactionProjects('page_posts'),
+        pages: readableReactionProjects('pages'),
+      });
+      res.json(withPage ?? result);
       return;
     }
     res.json(result);
