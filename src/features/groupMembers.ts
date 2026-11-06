@@ -157,6 +157,12 @@ const GROUP_MODERATION_ACTIONS = new Set(['remove', 'ban', 'unban', 'restrict', 
 // groupReadClient / groupWriteClient.
 type HostContext = { client: SupabaseClient; group: GroupRecord; projects?: GroupProjects | null };
 
+// Chat-based groups (created via the Messages flow) live in the `conversations`
+// table with `type = 'group'`, and their members live in `conversation_participants`.
+// They use the same authorized /api/v1/groups/:groupId/members endpoint, so we
+// resolve the `conversations` host as a fallback when the id is not in `groups`.
+type ConversationHostContext = { client: SupabaseClient; conversation: { id: string; name: string | null; created_by: string | null }; projects?: GroupProjects | null };
+
 // The `friends` domain can be sharded onto a different project than the group
 // hosts. Offline harnesses inject a single mock client that serves every table,
 // so the injected list wins there; otherwise the existing registry resolves the
@@ -185,6 +191,54 @@ async function resolveGroupHost(
     }
   }
   return null;
+}
+
+// Resolve a chat-based group via the `conversations` table. Chat groups created
+// through the Messages flow live in `conversations` (type = 'group') with their
+// members in `conversation_participants`, not in `groups`/`group_members`.
+async function resolveConversationHost(
+  conversationId: string | null | undefined,
+  projects?: GroupProjects | null
+): Promise<ConversationHostContext | null> {
+  if (!conversationId) return null;
+  const hosts: GroupProjectEntry[] = projects ?? projectManager.getReadableProjects('conversations');
+  for (const entry of hosts) {
+    try {
+      const { data } = await entry.client
+        .from('conversations')
+        .select('id, name, created_by')
+        .eq('id', conversationId)
+        .eq('type', 'group')
+        .maybeSingle();
+      if (data) return { client: entry.client, conversation: data as { id: string; name: string | null; created_by: string | null }, projects: projects ?? null };
+    } catch {
+      // Try the next readable host (sharded deployments).
+    }
+  }
+  return null;
+}
+
+// Resolve the caller's role in a chat-based group from `conversation_participants`.
+async function resolveChatGroupAccess(
+  ctx: ConversationHostContext,
+  conversation: { id: string; created_by: string | null },
+  userId: string
+): Promise<ModeratorAccess> {
+  if (conversation.created_by && conversation.created_by === userId) return 'owner';
+  try {
+    const { data } = await ctx.client
+      .from('conversation_participants')
+      .select('role')
+      .eq('conversation_id', conversation.id)
+      .eq('user_id', userId)
+      .maybeSingle();
+    const role = (data as { role?: string | null } | null)?.role ?? null;
+    if (!role) return 'none';
+    if (role === 'admin') return 'moderator';
+    return 'member';
+  } catch {
+    return 'none';
+  }
 }
 
 // The caller's role comes from `group_members`, which lives on its own project.
@@ -530,9 +584,26 @@ export async function removeGroupMember(
   if (!callerUserId) return { status: 'not_authenticated' };
   if (!targetUserId) return { status: 'target_not_found' };
 
-  const ctx = await resolveGroupHost(groupId, projects);
-  if (!ctx) return { status: 'group_not_found' };
+  // Try standalone Groups first (groups/group_members tables), then fall back
+  // to chat-based groups (conversations/conversation_participants tables).
+  const groupCtx = await resolveGroupHost(groupId, projects);
+  if (groupCtx) {
+    return removeStandaloneGroupMember(groupCtx, callerUserId, targetUserId, options);
+  }
 
+  const convCtx = await resolveConversationHost(groupId, projects);
+  if (!convCtx) return { status: 'group_not_found' };
+  return removeChatGroupMember(convCtx, callerUserId, targetUserId, options);
+}
+
+// --- Standalone Groups (groups / group_members tables) ---
+
+async function removeStandaloneGroupMember(
+  ctx: HostContext,
+  callerUserId: string,
+  targetUserId: string,
+  options: { reason?: unknown }
+): Promise<MemberActionResult> {
   const yourAccess = await resolveModeratorAccess(ctx, ctx.group, callerUserId);
 
   // Self-removal = leave. Any authenticated member may leave at any time.
@@ -587,9 +658,7 @@ export async function removeGroupMember(
 
   // Record the moderation action best-effort: the membership row has already
   // been deleted, which is the critical operation. A missing moderation-actions
-  // domain (e.g. production registry registers groups/group_members/group_posts/
-  // group_pins/group_follows only) must not turn a successful removal into
-  // GROUP_OPERATION_FAILED. The original error is logged, never silently dropped.
+  // domain must not turn a successful removal into GROUP_OPERATION_FAILED.
   try {
     await recordModerationAction(ctx, ctx.group.id, {
       action: 'remove',
@@ -611,6 +680,102 @@ export async function removeGroupMember(
     actor_id: callerUserId,
     type: 'group_member_removed',
     message: `You were removed from ${ctx.group.name}.`,
+  });
+
+  return { status: 'ok', affected: targetUserId };
+}
+
+// --- Chat-based groups (conversations / conversation_participants tables) ---
+
+async function removeChatGroupMember(
+  ctx: ConversationHostContext,
+  callerUserId: string,
+  targetUserId: string,
+  options: { reason?: unknown }
+): Promise<MemberActionResult> {
+  const yourAccess = await resolveChatGroupAccess(ctx, ctx.conversation, callerUserId);
+
+  // Self-removal = leave. Any authenticated member may leave at any time.
+  if (targetUserId === callerUserId) {
+    const exists = await ctx.client
+      .from('conversation_participants')
+      .select('user_id')
+      .eq('conversation_id', ctx.conversation.id)
+      .eq('user_id', callerUserId)
+      .maybeSingle();
+    if (!exists.data) return { status: 'invalid', message: 'You are not a member of this group.' };
+    const { error } = await ctx.client
+      .from('conversation_participants')
+      .delete()
+      .eq('conversation_id', ctx.conversation.id)
+      .eq('user_id', callerUserId);
+    if (error) throw new Error(`Failed to leave group: ${error.message}`);
+    return { status: 'ok', left: true };
+  }
+
+  // Removing someone else requires owner/admin. Authorize before touching the
+  // write client so unauthorized callers get a proper permission error.
+  if (yourAccess !== 'owner' && yourAccess !== 'moderator') {
+    return { status: 'not_allowed', message: 'Only the group owner or admins can remove members.' };
+  }
+
+  const target = await ctx.client
+    .from('conversation_participants')
+    .select('*')
+    .eq('conversation_id', ctx.conversation.id)
+    .eq('user_id', targetUserId)
+    .maybeSingle();
+  if (!target.data) return { status: 'target_not_found' };
+  const targetRow = target.data as { role: string | null };
+
+  // Chat roles: 'admin' maps to moderator access; owner (created_by) cannot be
+  // removed; an admin cannot remove another admin (only the owner can).
+  if (targetRow.role === 'admin' && yourAccess !== 'owner') {
+    return { status: 'not_allowed', message: 'You cannot remove this member.' };
+  }
+  if (ctx.conversation.created_by && ctx.conversation.created_by === targetUserId) {
+    return { status: 'not_allowed', message: 'You cannot remove the group owner.' };
+  }
+
+  const reason = normalizeOptionalText(options?.reason) ?? null;
+
+  const { error } = await ctx.client
+    .from('conversation_participants')
+    .delete()
+    .eq('conversation_id', ctx.conversation.id)
+    .eq('user_id', targetUserId);
+  if (error) throw new Error(`Failed to remove group member: ${error.message}`);
+
+  // Record the moderation action best-effort.
+  try {
+    await recordModerationAction(
+      {
+        client: ctx.client,
+        group: { id: ctx.conversation.id, name: ctx.conversation.name ?? '', privacy: '', created_by: ctx.conversation.created_by } as GroupRecord,
+        projects: ctx.projects,
+      },
+      ctx.conversation.id,
+      {
+        action: 'remove',
+        target_user_id: targetUserId,
+        actor_id: callerUserId,
+        reason,
+        rule_id: null,
+        ends_at: null,
+        created_at: new Date().toISOString(),
+      }
+    );
+  } catch (err) {
+    console.error(
+      `[groupMembers] removeGroupMember: recorded removal of ${targetUserId} from ${ctx.conversation.id} but moderation-history write failed:`,
+      (err as Error).message
+    );
+  }
+  await notifyGroupMember(ctx.conversation.id, ctx.conversation.name ?? 'the group', {
+    user_id: targetUserId,
+    actor_id: callerUserId,
+    type: 'group_member_removed',
+    message: `You were removed from ${ctx.conversation.name ?? 'the group'}.`,
   });
 
   return { status: 'ok', affected: targetUserId };
