@@ -534,10 +534,10 @@ export async function removeGroupMember(
   if (!ctx) return { status: 'group_not_found' };
 
   const yourAccess = await resolveModeratorAccess(ctx, ctx.group, callerUserId);
-  const membersClient = groupWriteClient('group_members', ctx.projects);
 
   // Self-removal = leave. Any authenticated member may leave at any time.
   if (targetUserId === callerUserId) {
+    const membersClient = groupWriteClient('group_members', ctx.projects);
     const exists = await membersClient
       .from('group_members')
       .select('user_id')
@@ -554,7 +554,14 @@ export async function removeGroupMember(
     return { status: 'ok', left: true };
   }
 
-  // Removing someone else requires owner/moderator.
+  // Removing someone else requires owner/moderator. Authorize before touching
+  // the write client so unauthorized callers get a proper permission error
+  // instead of a generic GROUP_OPERATION_FAILED when a group table domain is
+  // not writable.
+  if (yourAccess !== 'owner' && yourAccess !== 'moderator') {
+    return { status: 'not_allowed', message: 'Only the group owner or moderators can remove members.' };
+  }
+
   const target = await groupReadClient('group_members', ctx.group.id, ctx.projects)
     .from('group_members')
     .select('*')
@@ -564,15 +571,13 @@ export async function removeGroupMember(
   if (!target.data) return { status: 'target_not_found' };
   const targetRow = target.data as GroupMemberRow;
 
-  if (yourAccess !== 'owner' && yourAccess !== 'moderator') {
-    return { status: 'not_allowed', message: 'Only the group owner or moderators can remove members.' };
-  }
   if (!canModerate(yourAccess, targetUserId, targetRow.role, ctx.group)) {
     return { status: 'not_allowed', message: 'You cannot remove this member.' };
   }
 
   const reason = normalizeOptionalText(options?.reason) ?? null;
 
+  const membersClient = groupWriteClient('group_members', ctx.projects);
   const { error } = await membersClient
     .from('group_members')
     .delete()
@@ -580,15 +585,27 @@ export async function removeGroupMember(
     .eq('user_id', targetUserId);
   if (error) throw new Error(`Failed to remove group member: ${error.message}`);
 
-  await recordModerationAction(ctx, ctx.group.id, {
-    action: 'remove',
-    target_user_id: targetUserId,
-    actor_id: callerUserId,
-    reason,
-    rule_id: null,
-    ends_at: null,
-    created_at: new Date().toISOString(),
-  });
+  // Record the moderation action best-effort: the membership row has already
+  // been deleted, which is the critical operation. A missing moderation-actions
+  // domain (e.g. production registry registers groups/group_members/group_posts/
+  // group_pins/group_follows only) must not turn a successful removal into
+  // GROUP_OPERATION_FAILED. The original error is logged, never silently dropped.
+  try {
+    await recordModerationAction(ctx, ctx.group.id, {
+      action: 'remove',
+      target_user_id: targetUserId,
+      actor_id: callerUserId,
+      reason,
+      rule_id: null,
+      ends_at: null,
+      created_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error(
+      `[groupMembers] removeGroupMember: recorded removal of ${targetUserId} from ${ctx.group.id} but moderation-history write failed:`,
+      (err as Error).message
+    );
+  }
   await notifyGroupMember(ctx.group.id, ctx.group.name, {
     user_id: targetUserId,
     actor_id: callerUserId,
