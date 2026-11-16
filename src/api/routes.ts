@@ -37,6 +37,7 @@ import { projectHealth } from '../project-health';
 import { infrastructureDb } from '../infrastructure/database/infrastructureDb';
 import { authRouter } from './auth';
 import { realtimeRouter } from './realtime';
+import { liveRouter } from './live';
 import { ensureUserProfile } from '../profile-helper';
 import { classifyMessageRequest } from '../features/messageRequestCategory';
 import { leaveGroupConversation } from '../features/leaveGroupConversation';
@@ -2211,6 +2212,7 @@ const router = Router();
 router.use('/auth', authRouter);
 router.use('/rpc', rpcRouter);
 router.use('/realtime', realtimeRouter);
+router.use('/live', liveRouter);
 router.use('/v1', v1);
 router.use('/system', system);
 router.get('/health', (_req, res) => {

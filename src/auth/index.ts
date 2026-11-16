@@ -88,13 +88,22 @@ function constantTimeCompare(a: string, b: string): boolean {
 class AuthService {
   async authenticate(req: Request, res: Response, next: NextFunction): Promise<void> {
     const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith('Bearer ')) {
+    let token: string | null = null;
+
+    if (authHeader?.startsWith('Bearer ')) {
+      token = authHeader.split(' ')[1];
+    } else if (req.query.access_token && typeof req.query.access_token === 'string') {
+      // SSE and WebSocket endpoints cannot set custom headers, so the token
+      // is passed as a query parameter. This is only used by live signaling
+      // SSE connections.
+      token = req.query.access_token;
+    }
+
+    if (!token) {
       console.warn(`[Auth] Missing Bearer token for ${req.method} ${req.originalUrl}`);
       res.status(401).json({ error: 'Missing authorization header' });
       return;
     }
-
-    const token = authHeader.split(' ')[1];
     try {
       const user = await this.verifyToken(token);
       if (!user) {
