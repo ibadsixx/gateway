@@ -1,6 +1,7 @@
 import { database } from '../infrastructure/database';
 import { projectManager } from '../project-manager';
 import { auth } from '../auth';
+import { notificationQueue } from '../notifications';
 
 export type LiveStreamType = 'video' | 'audio';
 export type LiveSessionStatus = 'scheduled' | 'live' | 'ended';
@@ -102,19 +103,6 @@ export interface LiveEventRow {
 const LIVE_DOMAIN = 'live-1';
 
 /**
- * Resolve the live-1 writable project. The eight live tables are hosted on the
- * live-1 Supabase project and reached through the Gateway's database layer,
- * which routes per-domain to the registered project.
- */
-async function getLiveClient() {
-  const writable = projectManager.getWritableProject(LIVE_DOMAIN);
-  if (!writable) {
-    throw new Error(`No writable project for domain: ${LIVE_DOMAIN}`);
-  }
-  return writable.client;
-}
-
-/**
  * Verify the caller's bearer token and return the authenticated user id.
  * Throws on missing/invalid token so routes never authorize an anonymous
  * caller for a write path.
@@ -145,39 +133,29 @@ export async function authorizeSessionAccess(
   userId: string,
   requiredRole?: LiveParticipantRole
 ): Promise<{ session: LiveSessionRow; participant: LiveParticipantRow | null }> {
-  const client = await getLiveClient();
-
-  // Read the session
-  const sessionRes = await database.query(LIVE_DOMAIN, {
-    table: 'live_sessions',
-    filters: [{ column: 'id', op: 'eq', value: sessionId }],
-  } as any);
-  const sessions = (sessionRes as any[]) || [];
-  const session = sessions[0] as unknown as LiveSessionRow | undefined;
+  // Read the session by id
+  const session = await database.read(LIVE_DOMAIN, sessionId);
   if (!session) {
     throw new Error('Session not found');
   }
+  const sessionRow = session as unknown as LiveSessionRow;
 
-  // Audience enforcement: public sessions are readable by anyone; friends-only
-  // sessions require the viewer to be a friend of the host.
-  if (session.audience_type === 'friends' && session.host_id !== userId) {
-    const hostFriends = await getFriendIds(session.host_id);
+  // Audience enforcement: public sessions are readable by anyone;
+  // friends-only sessions require the viewer to be a friend of the host.
+  if (sessionRow.audience_type === 'friends' && sessionRow.host_id !== userId) {
+    const hostFriends = await getFriendIds(sessionRow.host_id);
     if (!hostFriends.includes(userId)) {
       throw new Error('Access denied: friends-only session');
     }
   }
 
-  // Read the caller's participant row (if any)
-  const participantRes = await database.query(LIVE_DOMAIN, {
-    table: 'live_participants',
-    filters: [
-      { column: 'session_id', op: 'eq', value: sessionId },
-      { column: 'user_id', op: 'eq', value: userId },
-      { column: 'left_at', op: 'is', value: null },
-    ],
-  } as any);
-  const participants = (participantRes as any[]) || [];
-  const participant = participants[0] as unknown as LiveParticipantRow | null;
+  // Read the caller's participant row (if joined)
+  const participants = await database.query(LIVE_DOMAIN, {
+    session_id: sessionId,
+    user_id: userId,
+    left_at: null,
+  });
+  const participant = (participants[0] as unknown as LiveParticipantRow) || null;
 
   if (requiredRole && participant) {
     const roleRank: Record<LiveParticipantRole, number> = { viewer: 0, guest: 1, moderator: 2, host: 3 };
@@ -186,21 +164,17 @@ export async function authorizeSessionAccess(
     }
   }
 
-  return { session, participant };
+  return { session: sessionRow, participant };
 }
 
 /** Resolve the authenticated user's accepted friend ids (from the users project). */
 async function getFriendIds(userId: string): Promise<string[]> {
   try {
-    const friendsRes = await database.query('users', {
-      table: 'friends',
-      filters: [
-        { column: 'requester_id', op: 'eq', value: userId },
-        { column: 'status', op: 'eq', value: 'accepted' },
-      ],
-    } as any);
-    const rows = (friendsRes as any[]) || [];
-    return rows.map((r: any) => r.receiver_id).filter(Boolean);
+    const rows = await database.query('users', {
+      requester_id: userId,
+      status: 'accepted',
+    });
+    return (rows as unknown[]).map((r: any) => r.receiver_id).filter(Boolean);
   } catch {
     return [];
   }
@@ -222,7 +196,6 @@ export async function createLiveSession(data: {
   recording?: boolean;
   max_viewers?: number | null;
 }): Promise<LiveSessionRow> {
-  const client = await getLiveClient();
   const now = new Date().toISOString();
   const row: Partial<LiveSessionRow> = {
     id: crypto.randomUUID(),
@@ -245,36 +218,52 @@ export async function createLiveSession(data: {
     updated_at: now,
   };
 
-  const result = await database.write(LIVE_DOMAIN, row as any);
+  const result = await database.write(LIVE_DOMAIN, row as Record<string, unknown>);
   const created = (Array.isArray(result) ? result[0] : result) as unknown as LiveSessionRow;
+
+  // Emit a session_created event for notifications + moderation consumers.
+  await recordLiveEvent({
+    session_id: created.id,
+    event_type: 'session_created',
+    actor_id: data.host_id,
+  });
+
+  // Notify the host's friends that they are live (public or friends audience).
+  if (data.audience_type !== 'only_me') {
+    try {
+      const friendIds = await getFriendIds(data.host_id);
+      for (const friendId of friendIds) {
+        notificationQueue.enqueue({
+          userId: friendId,
+          type: 'IN_APP',
+          title: `${data.title ?? 'Live Stream'} is now live`,
+          body: `${data.host_id} started a ${data.stream_type} live stream`,
+          payload: { session_id: created.id, stream_type: data.stream_type },
+        });
+      }
+    } catch {
+      // Notification failures must not fail session creation.
+    }
+  }
+
   return created;
 }
 
 export async function getLiveSession(sessionId: string): Promise<LiveSessionRow | null> {
-  const client = await getLiveClient();
-  const result = await database.query(LIVE_DOMAIN, {
-    table: 'live_sessions',
-    filters: [{ column: 'id', op: 'eq', value: sessionId }],
-  } as any);
-  const sessions = (result as any[]) || [];
-  return (sessions[0] as unknown as LiveSessionRow) || null;
+  const session = await database.read(LIVE_DOMAIN, sessionId);
+  return (session as unknown as LiveSessionRow) || null;
 }
 
 export async function getActiveLiveSessions(): Promise<LiveSessionRow[]> {
-  const client = await getLiveClient();
-  const result = await database.query(LIVE_DOMAIN, {
-    table: 'live_sessions',
-    filters: [{ column: 'status', op: 'eq', value: 'live' }],
-  } as any);
-  return (result as any[]) || [];
+  const rows = await database.query(LIVE_DOMAIN, { status: 'live' });
+  return rows as unknown as LiveSessionRow[];
 }
 
 export async function updateLiveSession(
   sessionId: string,
   data: Partial<LiveSessionRow>
 ): Promise<LiveSessionRow | null> {
-  const client = await getLiveClient();
-  const result = await database.update(LIVE_DOMAIN, sessionId, data as any);
+  const result = await database.update(LIVE_DOMAIN, sessionId, data as Record<string, unknown>);
   return (result as unknown as LiveSessionRow) || null;
 }
 
@@ -283,12 +272,6 @@ export async function endLiveSession(sessionId: string): Promise<LiveSessionRow 
     status: 'ended',
     ended_at: new Date().toISOString(),
   });
-}
-
-export async function incrementViewerCount(sessionId: string): Promise<void> {
-  await database.update(LIVE_DOMAIN, sessionId, {
-    viewer_count: -1, // sentinel handled client-side by gateway; see incrementViewerCountBy
-  } as any);
 }
 
 // ============================================================================
@@ -300,7 +283,6 @@ export async function addLiveParticipant(data: {
   user_id: string;
   role?: LiveParticipantRole;
 }): Promise<LiveParticipantRow> {
-  const client = await getLiveClient();
   const now = new Date().toISOString();
   const row: Partial<LiveParticipantRow> = {
     id: crypto.randomUUID(),
@@ -312,20 +294,16 @@ export async function addLiveParticipant(data: {
     is_muted: false,
     is_video_off: false,
   };
-  const result = await database.write(LIVE_DOMAIN, row as any);
+  const result = await database.write(LIVE_DOMAIN, row as Record<string, unknown>);
   return (Array.isArray(result) ? result[0] : result) as unknown as LiveParticipantRow;
 }
 
 export async function getSessionParticipants(sessionId: string): Promise<LiveParticipantRow[]> {
-  const client = await getLiveClient();
-  const result = await database.query(LIVE_DOMAIN, {
-    table: 'live_participants',
-    filters: [
-      { column: 'session_id', op: 'eq', value: sessionId },
-      { column: 'left_at', op: 'is', value: null },
-    ],
-  } as any);
-  return (result as any[]) || [];
+  const rows = await database.query(LIVE_DOMAIN, {
+    session_id: sessionId,
+    left_at: null,
+  });
+  return rows as unknown as LiveParticipantRow[];
 }
 
 export async function updateLiveParticipant(
@@ -333,22 +311,31 @@ export async function updateLiveParticipant(
   userId: string,
   data: Partial<LiveParticipantRow>
 ): Promise<LiveParticipantRow | null> {
-  const client = await getLiveClient();
-  // Use the gateway's update-by-filters path via query + write; fall back to
-  // the domain write with a composite filter key.
-  const result = await database.write(LIVE_DOMAIN, {
-    ...data,
+  // Find the participant row first (the gateway's update takes a single id).
+  const rows = await database.query(LIVE_DOMAIN, {
     session_id: sessionId,
     user_id: userId,
-    _match: { session_id: sessionId, user_id: userId, left_at: null },
-  } as any);
+    left_at: null,
+  });
+  const participant = (rows[0] as unknown as LiveParticipantRow) || null;
+  if (!participant) return null;
+
+  const result = await database.update(LIVE_DOMAIN, participant.id, data as Record<string, unknown>);
   return (result as unknown as LiveParticipantRow) || null;
 }
 
 export async function leaveLiveSession(sessionId: string, userId: string): Promise<void> {
-  await database.update(LIVE_DOMAIN, `${sessionId}:${userId}`, {
+  const rows = await database.query(LIVE_DOMAIN, {
+    session_id: sessionId,
+    user_id: userId,
+    left_at: null,
+  });
+  const participant = (rows[0] as unknown as LiveParticipantRow) || null;
+  if (!participant) return;
+
+  await database.update(LIVE_DOMAIN, participant.id, {
     left_at: new Date().toISOString(),
-  } as any);
+  } as Record<string, unknown>);
 }
 
 // ============================================================================
@@ -360,7 +347,6 @@ export async function addLiveComment(data: {
   user_id: string;
   content: string;
 }): Promise<LiveCommentRow> {
-  const client = await getLiveClient();
   const now = new Date().toISOString();
   const row: Partial<LiveCommentRow> = {
     id: crypto.randomUUID(),
@@ -372,20 +358,27 @@ export async function addLiveComment(data: {
     hidden_by: null,
     hidden_at: null,
   };
-  const result = await database.write(LIVE_DOMAIN, row as any);
+  const result = await database.write(LIVE_DOMAIN, row as Record<string, unknown>);
   return (Array.isArray(result) ? result[0] : result) as unknown as LiveCommentRow;
 }
 
 export async function getLiveComments(sessionId: string, limit = 50): Promise<LiveCommentRow[]> {
-  const client = await getLiveClient();
-  const result = await database.query(LIVE_DOMAIN, {
-    table: 'live_comments',
-    filters: [
-      { column: 'session_id', op: 'eq', value: sessionId },
-      { column: 'is_hidden', op: 'eq', value: false },
-    ],
-  } as any);
-  return (result as any[]) || [];
+  const rows = await database.query(LIVE_DOMAIN, {
+    session_id: sessionId,
+    is_hidden: false,
+  });
+  // Apply ordering + limit client-side (gateway query() does eq filters only).
+  const sorted = (rows as unknown[]).sort(
+    (a: any, b: any) => String(a.created_at).localeCompare(String(b.created_at))
+  );
+  return sorted.slice(0, limit) as unknown as LiveCommentRow[];
+}
+
+export async function hideComment(commentId: string): Promise<void> {
+  await database.update(LIVE_DOMAIN, commentId, {
+    is_hidden: true,
+    hidden_at: new Date().toISOString(),
+  } as Record<string, unknown>);
 }
 
 // ============================================================================
@@ -397,7 +390,6 @@ export async function addLiveReaction(data: {
   user_id: string;
   reaction_type: string;
 }): Promise<LiveReactionRow> {
-  const client = await getLiveClient();
   const now = new Date().toISOString();
   const row: Partial<LiveReactionRow> = {
     id: crypto.randomUUID(),
@@ -406,17 +398,13 @@ export async function addLiveReaction(data: {
     reaction_type: data.reaction_type,
     created_at: now,
   };
-  const result = await database.write(LIVE_DOMAIN, row as any);
+  const result = await database.write(LIVE_DOMAIN, row as Record<string, unknown>);
   return (Array.isArray(result) ? result[0] : result) as unknown as LiveReactionRow;
 }
 
 export async function getLiveReactions(sessionId: string): Promise<LiveReactionRow[]> {
-  const client = await getLiveClient();
-  const result = await database.query(LIVE_DOMAIN, {
-    table: 'live_reactions',
-    filters: [{ column: 'session_id', op: 'eq', value: sessionId }],
-  } as any);
-  return (result as any[]) || [];
+  const rows = await database.query(LIVE_DOMAIN, { session_id: sessionId });
+  return rows as unknown as LiveReactionRow[];
 }
 
 // ============================================================================
@@ -426,7 +414,6 @@ export async function getLiveReactions(sessionId: string): Promise<LiveReactionR
 export async function addLiveRecording(data: {
   session_id: string;
 }): Promise<LiveRecordingRow> {
-  const client = await getLiveClient();
   const now = new Date().toISOString();
   const row: Partial<LiveRecordingRow> = {
     id: crypto.randomUUID(),
@@ -437,7 +424,7 @@ export async function addLiveRecording(data: {
     ended_at: null,
     duration_seconds: null,
   };
-  const result = await database.write(LIVE_DOMAIN, row as any);
+  const result = await database.write(LIVE_DOMAIN, row as Record<string, unknown>);
   return (Array.isArray(result) ? result[0] : result) as unknown as LiveRecordingRow;
 }
 
@@ -452,7 +439,6 @@ export async function submitLiveReport(data: {
   reason: string;
   description?: string | null;
 }): Promise<LiveReportRow> {
-  const client = await getLiveClient();
   const now = new Date().toISOString();
   const row: Partial<LiveReportRow> = {
     id: crypto.randomUUID(),
@@ -464,7 +450,7 @@ export async function submitLiveReport(data: {
     status: 'open',
     created_at: now,
   };
-  const result = await database.write(LIVE_DOMAIN, row as any);
+  const result = await database.write(LIVE_DOMAIN, row as Record<string, unknown>);
   return (Array.isArray(result) ? result[0] : result) as unknown as LiveReportRow;
 }
 
@@ -479,7 +465,6 @@ export async function recordLiveEvent(data: {
   target_user_id?: string | null;
   metadata?: Record<string, unknown> | null;
 }): Promise<LiveEventRow> {
-  const client = await getLiveClient();
   const now = new Date().toISOString();
   const row: Partial<LiveEventRow> = {
     id: crypto.randomUUID(),
@@ -490,6 +475,6 @@ export async function recordLiveEvent(data: {
     metadata: data.metadata ?? null,
     created_at: now,
   };
-  const result = await database.write(LIVE_DOMAIN, row as any);
+  const result = await database.write(LIVE_DOMAIN, row as Record<string, unknown>);
   return (Array.isArray(result) ? result[0] : result) as unknown as LiveEventRow;
 }

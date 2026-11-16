@@ -13,6 +13,8 @@ export type SignalingEvent =
   | 'video-on'
   | 'participant-joined'
   | 'participant-left'
+  | 'participant-updated'
+  | 'comment-hidden'
   | 'session-ended';
 
 export interface SignalingPayload {

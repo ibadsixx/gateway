@@ -12,11 +12,13 @@ import {
   leaveLiveSession,
   addLiveComment,
   getLiveComments,
+  hideComment,
   addLiveReaction,
   getLiveReactions,
   addLiveRecording,
   submitLiveReport,
   recordLiveEvent,
+  authorizeSessionAccess,
   type LiveSessionRow,
   type LiveParticipantRow,
   type LiveCommentRow,
@@ -270,13 +272,31 @@ liveRouter.get('/sessions/:id/participants', async (req: Request, res: Response)
   }
 });
 
-/** Update participant state (mute, video off, etc.). Host/moderator or self. */
+/** Update participant state (mute, video off, role). Host/moderator or self. */
 liveRouter.put('/sessions/:id/participants/:userId', async (req: Request, res: Response) => {
   try {
     const callerId = req.user!.id;
     const { id: sessionId, userId } = req.params;
     const body = requireBody(req, res, []);
     if (!body) return;
+
+    // Authorize: host/moderator can moderate any participant; a user can only
+    // moderate themselves (mute/unmute own audio/video).
+    const { session, participant: callerParticipant } = await authorizeSessionAccess(sessionId, callerId);
+    const isSelf = userId === callerId;
+    const isHostOrMod = callerParticipant &&
+      (callerParticipant.role === 'host' || callerParticipant.role === 'moderator');
+
+    if (!isSelf && !isHostOrMod) {
+      res.status(403).json({ error: 'Only hosts and moderators can moderate other participants' });
+      return;
+    }
+
+    // A non-host cannot change another user's role.
+    if (body.role !== undefined && !isHostOrMod) {
+      res.status(403).json({ error: 'Only the host can change participant roles' });
+      return;
+    }
 
     const participant = await updateLiveParticipant(sessionId, userId, {
       is_muted: body.is_muted,
@@ -288,6 +308,13 @@ liveRouter.put('/sessions/:id/participants/:userId', async (req: Request, res: R
       res.status(404).json({ error: 'Participant not found' });
       return;
     }
+
+    // Broadcast the change to the session.
+    const payload = makeSignalingPayload(sessionId, callerId, 'participant-updated', {
+      toUserId: userId,
+      role: participant.role,
+    });
+    publishSignalingEvent(payload);
 
     res.json(participant);
   } catch (error) {
@@ -355,6 +382,30 @@ liveRouter.get('/sessions/:id/comments', async (req: Request, res: Response) => 
   } catch (error) {
     console.error('[Live] get comments failed:', (error as Error).message);
     res.status(500).json({ error: 'Failed to get comments' });
+  }
+});
+
+/** Hide a comment (host/moderator only). */
+liveRouter.delete('/sessions/:id/comments/:commentId', async (req: Request, res: Response) => {
+  try {
+    const callerId = req.user!.id;
+    const { id: sessionId, commentId } = req.params;
+
+    // Authorize: host or moderator of the session.
+    const { participant: callerParticipant } = await authorizeSessionAccess(sessionId, callerId, 'moderator');
+
+    await hideComment(commentId);
+
+    // Broadcast the hide to the session.
+    const payload = makeSignalingPayload(sessionId, callerId, 'comment-hidden', {
+      toUserId: undefined,
+    });
+    publishSignalingEvent(payload);
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('[Live] hide comment failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to hide comment' });
   }
 });
 
