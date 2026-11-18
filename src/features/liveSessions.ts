@@ -97,10 +97,10 @@ export interface LiveEventRow {
   created_at: string;
 }
 
-const LIVE_DOMAIN = 'live-1';
+const LIVE_DOMAIN = 'live_sessions';
 
 // ---------------------------------------------------------------------------
-// In-memory store — used when the live-1 domain is not registered in the
+// In-memory store — used when the live_sessions domain is not registered in the
 // gateway's project registry. This allows the live API routes to work
 // end-to-end without a dedicated Supabase project.
 // ---------------------------------------------------------------------------

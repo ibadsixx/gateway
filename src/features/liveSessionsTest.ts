@@ -142,7 +142,7 @@ async function main(): Promise<void> {
   assertEqual(fetched?.stream_type, 'video', 'getLiveSession stream_type');
 
   // 4. getActiveLiveSessions filters by status=live.
-  await database.write('live-1', {
+  await database.write('live_sessions', {
     id: 'active-session-1',
     host_id: 'user-3',
     title: null,

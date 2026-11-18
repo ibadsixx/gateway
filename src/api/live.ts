@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { auth } from '../auth';
+import { database } from '../infrastructure/database';
 import {
   createLiveSession,
   getLiveSession,
@@ -406,6 +407,56 @@ liveRouter.delete('/sessions/:id/comments/:commentId', async (req: Request, res:
   } catch (error) {
     console.error('[Live] hide comment failed:', (error as Error).message);
     res.status(500).json({ error: 'Failed to hide comment' });
+  }
+});
+
+// ============================================================================
+// Live session posts
+// ============================================================================
+
+/** Create a live post for a session (frontend calls this when starting a broadcast). */
+liveRouter.post('/sessions/:sessionId/posts', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { sessionId } = req.params;
+    const body = requireBody(req, res, ['title', 'stream_type', 'audience_type']);
+    if (!body) return;
+
+    // Verify the session exists and the caller is the host.
+    const session = await getLiveSession(sessionId);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+    if (session.host_id !== userId) {
+      res.status(403).json({ error: 'Only the host can create a live post for this session' });
+      return;
+    }
+
+    // Create the post in the posts table linked to this session.
+    const postData = {
+      id: crypto.randomUUID(),
+      user_id: session.host_id,
+      host_id: session.host_id,
+      title: body.title ?? null,
+      stream_type: body.stream_type,
+      status: 'live',
+      audience_type: body.audience_type ?? 'public',
+      audience_user_ids: body.audience_user_ids ?? null,
+      audience_excluded_user_ids: body.audience_excluded_user_ids ?? null,
+      audience_list_id: body.audience_list_id ?? null,
+      live_session_id: sessionId,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    const result = await database.write('posts', postData);
+    const created = (Array.isArray(result) ? result[0] : result) as { id: string };
+
+    res.status(201).json({ id: created.id });
+  } catch (error) {
+    console.error('[Live] create live post failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to create live post' });
   }
 });
 
