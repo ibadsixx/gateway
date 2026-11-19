@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express';
+import express, { Router, Request, Response } from 'express';
 import { auth } from '../auth';
 import { database } from '../infrastructure/database';
 import {
@@ -40,6 +40,12 @@ import {
   type SignalingPayload,
   type SignalingEvent,
 } from '../features/liveSignaling';
+import {
+  createLiveKitRoom,
+  deleteLiveKitRoom,
+  createLiveKitToken,
+  verifyLiveKitWebhook,
+} from '../features/livekit';
 
 const liveRouter = Router();
 
@@ -708,6 +714,100 @@ liveRouter.post('/sessions/:id/signaling', async (req: Request, res: Response) =
   } catch (error) {
     console.error('[Live] publish signaling failed:', (error as Error).message);
     res.status(500).json({ error: 'Failed to publish signaling event' });
+  }
+});
+
+/** Issue a LiveKit access token for a session participant.
+ *  The Gateway verifies the session exists and the caller is authorized,
+ *  then mints a short-lived LiveKit access token with the appropriate role.
+ */
+liveRouter.get('/sessions/:id/token', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { sessionId } = req.params;
+
+    const session = await getLiveSession(sessionId);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    // Verify the caller is the host or a participant
+    const isHost = session.host_id === userId;
+    const participants = await getSessionParticipants(sessionId);
+    const isParticipant = participants.some((p) => p.user_id === userId && p.left_at === null);
+
+    if (!isHost && !isParticipant) {
+      res.status(403).json({ error: 'Not a participant in this session' });
+      return;
+    }
+
+    // Determine role
+    let role: 'host' | 'moderator' | 'guest' | 'viewer' = 'viewer';
+    if (isHost) {
+      role = 'host';
+    } else {
+      const participant = participants.find((p) => p.user_id === userId);
+      if (participant) {
+        role = participant.role as 'moderator' | 'guest' | 'viewer';
+      }
+    }
+
+    // Only hosts and moderators can publish; speakers can publish if approved;
+    // viewers/listeners can only subscribe
+    const canPublish = role === 'host' || role === 'moderator';
+    const canPublishData = role === 'host' || role === 'moderator';
+
+    const token = createLiveKitToken(session.room_id!, userId);
+
+    res.json({ token, roomId: session.room_id, sessionId, role });
+  } catch (error) {
+    console.error('[Live] create token failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to create token' });
+  }
+});
+
+/** Webhook endpoint for LiveKit events (recording.completed, session.ended, etc.) */
+liveRouter.post('/webhooks/livekit', express.raw({ type: '*/*' }), async (req: Request, res: Response) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const rawBody = req.body;
+
+    const event = verifyLiveKitWebhook(authHeader, rawBody);
+    if (!event) {
+      res.status(401).json({ error: 'Invalid webhook signature' });
+      return;
+    }
+
+    const { event: eventType, payload } = event;
+    const payloadData = payload as { room?: { id: string }; recording?: { id: string; url: string } };
+
+    console.log(`[LiveKit] Webhook event: ${eventType}`, payloadData);
+
+    // Handle session ended
+    if (eventType === 'room.ended') {
+      const sessionId = payloadData.room?.id;
+      if (sessionId) {
+        await endLiveSession(sessionId);
+      }
+    }
+
+    // Handle recording events
+    if (eventType === 'recording.completed') {
+      const sessionId = payloadData.room?.id;
+      const recordingId = payloadData.recording?.id;
+      const recordingUrl = payloadData.recording?.url;
+      if (sessionId && recordingUrl) {
+        await updateLiveSession(sessionId, {
+          recording_url: recordingUrl,
+        } as any);
+      }
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    console.error('[Live] webhook error:', (error as Error).message);
+    res.status(500).json({ error: 'Webhook processing failed' });
   }
 });
 

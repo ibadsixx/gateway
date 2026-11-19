@@ -20,7 +20,8 @@
     "test:highlight-privacy": "ts-node src/features/highlightPrivacyTest.ts",
     "test:guest-access": "ts-node src/features/guestAccessTest.ts",
     "test:page-posts": "ts-node src/features/pagePostsTest.ts",
-    "test:page-authorship": "ts-node src/features/pageAuthorshipTest.ts",    "test:relationship-counts": "ts-node src/features/relationshipCountsTest.ts",
+    "test:page-authorship": "ts-node src/features/pageAuthorshipTest.ts",
+    "test:relationship-counts": "ts-node src/features/relationshipCountsTest.ts",
     "test:reaction-counts": "ts-node src/features/reactionCountsTest.ts",
     "test:reaction-users": "ts-node src/features/reactionUsersTest.ts",
     "test:profile-content": "ts-node src/features/profileContentTest.ts",
@@ -45,6 +46,7 @@
     "dotenv": "^17.4.2",
     "express": "^4.18.2",
     "jose": "^6.2.4",
+    "livekit-server-sdk": "^2.20.1",
     "pg": "^8.22.0",
     "ws": "^8.21.3",
     "zod": "^3.22.4"

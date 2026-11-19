@@ -1,4 +1,5 @@
 import { auth } from '../auth';
+import { createLiveKitRoom, deleteLiveKitRoom } from './livekit';
 
 export type LiveStreamType = 'video' | 'audio';
 export type LiveSessionStatus = 'scheduled' | 'live' | 'ended';
@@ -24,6 +25,7 @@ export interface LiveSessionRow {
   ended_at: string | null;
   created_at: string;
   updated_at: string;
+  room_id: string | null;
 }
 
 export interface LiveParticipantRow {
@@ -218,6 +220,11 @@ export async function createLiveSession(data: {
   max_viewers?: number | null;
 }): Promise<LiveSessionRow> {
   const now = new Date().toISOString();
+  const roomId = `live-${crypto.randomUUID()}`;
+
+  // Create the LiveKit room
+  await createLiveKitRoom(roomId);
+
   const row: Partial<LiveSessionRow> = {
     id: crypto.randomUUID(),
     host_id: data.host_id,
@@ -237,6 +244,7 @@ export async function createLiveSession(data: {
     ended_at: null,
     created_at: now,
     updated_at: now,
+    room_id: roomId,
   };
 
   const created = await memWrite(LIVE_DOMAIN, row as Record<string, unknown>);
@@ -262,6 +270,19 @@ export async function updateLiveSession(
 }
 
 export async function endLiveSession(sessionId: string): Promise<LiveSessionRow | null> {
+  const session = await memRead(LIVE_DOMAIN, sessionId);
+  if (!session) return null;
+
+  // Delete the LiveKit room
+  const roomId = (session as unknown as LiveSessionRow).room_id;
+  if (roomId) {
+    try {
+      await deleteLiveKitRoom(roomId);
+    } catch (err) {
+      console.warn(`[LiveKit] Failed to delete room ${roomId}:`, (err as Error).message);
+    }
+  }
+
   return updateLiveSession(sessionId, {
     status: 'ended',
     ended_at: new Date().toISOString(),
