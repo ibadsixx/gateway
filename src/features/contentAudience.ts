@@ -163,13 +163,15 @@ export function isGuestSafePublicAudience(row: AudienceRow): boolean {
   return isExactlyPublic(legacy);
 }
 
-// Unpublished content is author-only. `status` is absent on many legacy rows, so
-// only an explicit non-published value denies; an unknown status is NOT treated
-// as published, because publishing is the state a row must be moved into.
+// Unpublished content is author-only. Active live streams are visible.
+// `status` is absent on many legacy rows, so only an explicit non-published,
+// non-live value denies; an unknown status is NOT treated as published,
+// because publishing is the state a row must be moved into.
 export function isPublishedContent(row: AudienceRow): boolean {
   const status = row['status'];
   if (status === null || status === undefined) return true;
-  return String(status).trim().toLowerCase() === 'published';
+  const s = String(status).trim().toLowerCase();
+  return s === 'published' || s === 'live';
 }
 
 // The one predicate every public/anonymous surface must go through: a guest

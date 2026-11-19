@@ -660,10 +660,11 @@ export function canViewerViewPost(
   if (ownerId && ownerId === viewerId) return true;
   if (!viewerId) return isGuestPostVisible(post);
 
-  // Drafts and scheduled posts are author-only. The author already returned
-  // above, so a non-author must never receive an unpublished row.
+  // Drafts and scheduled posts are author-only. Active live streams are visible.
+  // The author already returned above, so a non-author must never receive an
+  // unpublished row.
   const status = rowValue(post, 'status');
-  if (status && status !== 'published') return false;
+  if (status && status !== 'published' && status !== 'live') return false;
 
   const audience = resolveContentAudience(post);
   if (audience === 'public') return !stringArray(post.audience_excluded_user_ids).includes(viewerId);
