@@ -1,11 +1,14 @@
 // Tone Live — UNIT TESTS: durable signaling store semantics.
 // Runs with ts-node against the deterministic in-memory fallback (no Supabase
-// network access). The same semantics are provided by the Supabase tables in
-// migration 005 in production.
+// network access). A fake client also asserts the production code paths use
+// DELETE ... RETURNING and a database-generated identity cursor, with no
+// Supabase custom RPC. Production schema: migrations 006 and 007.
 //
 // Covers:
 //   - short-lived single-use tickets (replay rejected)
+//   - atomic delete-based ticket consumption (no select-then-delete, no RPC)
 //   - idempotent message delivery by client-generated id
+//   - generated database cursor with no client/sequence function dependency
 //   - cursor-based bounded fetches and reconnect/resubscription
 //   - broadcast vs directed recipient routing
 //   - expiry and cleanup
@@ -18,6 +21,8 @@ import {
   cleanupExpiredSignaling,
   useInMemorySignalingForTests,
   expireSignalingTicketForTests,
+  setSignalingClientFactoryForTests,
+  resetSignalingClientFactoryForTests,
 } from './liveSignalingStore';
 
 let passed = 0;
@@ -156,6 +161,89 @@ async function main(): Promise<void> {
     sessionId: 'session-1', recipientUserId: 'user-2', limit: 50,
   });
   assert(afterCleanup.some((m) => m.id === 'broadcast-1'), 'unexpired rows survive cleanup');
+
+  console.log('\n--- production client path (fake Supabase client) ---');
+  const fakeResults: Array<{ data?: unknown; error?: { message: string } | null }> = [
+    { error: null },                                                    // ticket insert
+    { data: { session_id: 'session-9', user_id: 'user-9', role: 'viewer' }, error: null }, // delete returning
+    { data: { seq: 77 }, error: null },                                  // message identity cursor
+  ];
+  const fakeCalls: string[] = [];
+  let upsertedRow: Record<string, unknown> | null = null;
+
+  class FakeQuery {
+    constructor(
+      private readonly table: string,
+      private readonly result: { data?: unknown; error?: { message: string } | null },
+    ) {
+      fakeCalls.push(`from:${table}`);
+    }
+
+    delete(): this { fakeCalls.push('delete'); return this; }
+    update(): this { fakeCalls.push('update'); return this; }
+    insert(row: Record<string, unknown>): this {
+      fakeCalls.push('insert');
+      if (this.table === 'live_signaling_tickets') upsertedRow = row;
+      return this;
+    }
+    upsert(row: Record<string, unknown>): this {
+      fakeCalls.push('upsert');
+      upsertedRow = row;
+      return this;
+    }
+    eq(column: string, _value: unknown): this { fakeCalls.push(`eq:${column}`); return this; }
+    is(column: string, _value: unknown): this { fakeCalls.push(`is:${column}`); return this; }
+    gt(column: string, _value: unknown): this { fakeCalls.push(`gt:${column}`); return this; }
+    lt(column: string, _value: unknown): this { fakeCalls.push(`lt:${column}`); return this; }
+    select(columns = '*'): this { fakeCalls.push(`select:${columns}`); return this; }
+    order(): this { fakeCalls.push('order'); return this; }
+    limit(): this { fakeCalls.push('limit'); return this; }
+    maybeSingle(): Promise<{ data?: unknown; error?: { message: string } | null }> {
+      fakeCalls.push('maybeSingle');
+      return Promise.resolve(this.result);
+    }
+    then(onFulfilled?: unknown, onRejected?: unknown): Promise<unknown> {
+      return Promise.resolve(this.result).then(
+        onFulfilled as (value: unknown) => unknown,
+        onRejected as (reason: unknown) => unknown,
+      );
+    }
+  }
+
+  const fakeClient = {
+    from(table: string): FakeQuery {
+      const result = fakeResults.shift() ?? { data: null, error: null };
+      return new FakeQuery(table, result);
+    },
+    rpc(): never {
+      fakeCalls.push('rpc');
+      throw new Error('Custom Supabase RPC must not be used');
+    },
+  };
+
+  setSignalingClientFactoryForTests(async () => fakeClient);
+  const fakeTicket = await createSignalingTicket({
+    sessionId: 'session-9', userId: 'user-9', role: 'viewer', ttlSeconds: 60,
+  });
+  const fakeConsumed = await consumeSignalingTicket(fakeTicket.ticket, 'session-9');
+  const fakeStored = await storeSignalingMessage({
+    id: 'generated-cursor-1', sessionId: 'session-9', fromUserId: 'user-9',
+    type: 'offer', role: 'viewer', sdp: 'v=0',
+  });
+
+  assert(fakeConsumed?.userId === 'user-9', 'delete-returning resolves the ticket user');
+  assert(fakeCalls.includes('delete'), 'ticket consumption issues DELETE');
+  assert(fakeCalls.includes('eq:token_hash'), 'ticket hash is matched in the DELETE predicate');
+  assert(fakeCalls.includes('is:consumed_at'), 'unconsumed state is required in the DELETE predicate');
+  assert(fakeCalls.includes('gt:expires_at'), 'unexpired state is required in the DELETE predicate');
+  assert(fakeCalls.includes('select:session_id,user_id,role'), 'DELETE returns the consumed row');
+  assert(!fakeCalls.includes('update'), 'ticket consumption is not SELECT-then-UPDATE');
+  assert(!fakeCalls.includes('rpc'), 'no Supabase custom RPC/function is called');
+  assert(fakeStored.seq === 77 && !fakeStored.duplicate, 'database-generated cursor is returned');
+  assert(upsertedRow !== null && !('seq' in upsertedRow), 'message insert omits client-generated seq');
+
+  resetSignalingClientFactoryForTests();
+  useInMemorySignalingForTests();
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
   if (failed > 0) process.exit(1);

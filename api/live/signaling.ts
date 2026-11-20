@@ -110,7 +110,8 @@ wss.on('connection', async (ws: WebSocket, req: http.IncomingMessage) => {
       return;
     }
 
-    // Atomic, single-use ticket consumption (Supabase-backed across instances).
+    // Atomic, single-use ticket consumption: one DELETE ... RETURNING in the
+    // Gateway, no custom Supabase function.
     const ticket = await consumeSignalingTicket(rawTicket);
     if (!ticket) {
       closeWith(ws, 4002, 'invalid_or_used_ticket');
