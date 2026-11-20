@@ -1,4 +1,5 @@
 import express, { Router, Request, Response } from 'express';
+import { randomUUID } from 'crypto';
 import { auth } from '../auth';
 import { database } from '../infrastructure/database';
 import {
@@ -22,6 +23,8 @@ import {
   raiseHand,
   lowerHand,
   authorizeSessionAccess,
+  assertLiveAudienceAccess,
+  getEffectiveLiveRole,
   type LiveSessionRow,
   type LiveParticipantRow,
   type LiveCommentRow,
@@ -34,21 +37,39 @@ import {
   type LiveAudienceType,
   type LiveParticipantRole,
 } from '../features/liveSessions';
-import {
-  subscribeToSessionSignaling,
-  subscribeToUserSignaling,
-  publishSignalingEvent,
-  makeSignalingPayload,
-  type SignalingPayload,
-  type SignalingEvent,
-} from '../features/liveSignaling';
-import {
-  createLiveKitRoom,
-  deleteLiveKitRoom,
-  createLiveKitToken,
-  verifyLiveKitWebhook,
-  LIVEKIT_URL,
-} from '../features/livekit';
+import { createSignalingTicket, storeSignalingMessage } from '../features/liveSignalingStore';
+import type { ServerSignalingMessage, ParticipantStatePayload } from '../features/liveSignalingProtocol';
+
+/**
+ * Publish a durable, WebSocket-deliverable state event. All role/session
+ * authorization happens in the calling route; this helper only writes the
+ * Gateway-authored event to the shared signaling store.
+ */
+async function publishDurableState(input: {
+  sessionId: string;
+  fromUserId: string;
+  type: ServerSignalingMessage['type'];
+  role: ServerSignalingMessage['role'];
+  toUserId?: string;
+  state?: ParticipantStatePayload;
+}): Promise<void> {
+  try {
+    await storeSignalingMessage({
+      id: randomUUID(),
+      sessionId: input.sessionId,
+      fromUserId: input.fromUserId,
+      toUserId: input.toUserId,
+      type: input.type,
+      role: input.role,
+      state: input.state,
+      ttlSeconds: 120,
+    });
+  } catch (error) {
+    // The REST mutation itself has already succeeded; never fail it because a
+    // transient signaling write failed. Peers reconcile from REST on reconnect.
+    console.error('[Live] durable state publish failed:', (error as Error).message);
+  }
+}
 
 const liveRouter = Router();
 
@@ -203,9 +224,8 @@ liveRouter.post('/sessions/:id/end', async (req: Request, res: Response) => {
       return;
     }
 
-    // Broadcast session-ended to all participants.
-    const payload = makeSignalingPayload(id, userId, 'session-ended');
-    publishSignalingEvent(payload);
+    // Durable session-ended event; delivered to every connected peer.
+    await publishDurableState({ sessionId: id, fromUserId: userId, type: 'session-ended', role: 'host' });
     await recordLiveEvent({ session_id: id, event_type: 'session_ended', actor_id: userId });
 
     res.json(ended);
@@ -237,25 +257,25 @@ liveRouter.post('/sessions/:id/participants', async (req: Request, res: Response
       return;
     }
 
-    // Check audience access
-    if (session.audience_type === 'friends' && session.host_id !== userId) {
-      res.status(403).json({ error: 'Friends-only session' });
+    // Enforce the session's existing Tone audience/privacy rules.
+    try {
+      await assertLiveAudienceAccess(session, userId);
+    } catch (err) {
+      res.status(403).json({ error: (err as Error).message });
       return;
     }
 
-    const role = (body.role as LiveParticipantRole) ?? 'viewer';
+    // Never trust a client-supplied role. Joiners always start as viewers;
+    // promotion to guest/moderator is a separate Gateway-authorized action.
+    const role: LiveParticipantRole = 'viewer';
     const participant = await addLiveParticipant({
       session_id: sessionId,
       user_id: userId,
       role,
     });
 
-    // Broadcast participant-joined to the session.
-    const payload = makeSignalingPayload(sessionId, userId, 'participant-joined', {
-      role,
-      streamType: session.stream_type,
-    });
-    publishSignalingEvent(payload);
+    // Existing peers create offers when they see this durable join event.
+    await publishDurableState({ sessionId, fromUserId: userId, type: 'join', role: 'viewer' });
     await recordLiveEvent({
       session_id: sessionId,
       event_type: 'participant_joined',
@@ -319,17 +339,65 @@ liveRouter.put('/sessions/:id/participants/:userId', async (req: Request, res: R
       return;
     }
 
-    // Broadcast the change to the session.
-    const payload = makeSignalingPayload(sessionId, callerId, 'participant-updated', {
-      toUserId: userId,
-      role: participant.role,
+    // Durable state update so every peer sees the new role/mute/video state.
+    await publishDurableState({
+      sessionId,
+      fromUserId: callerId,
+      type: 'participant-state',
+      role: session.host_id === callerId ? 'host' : (callerParticipant?.role ?? 'viewer'),
+      state: {
+        targetUserId: userId,
+        role: participant.role as ParticipantStatePayload['role'],
+        ...(participant.is_muted !== undefined ? { isMuted: participant.is_muted } : {}),
+        ...(participant.is_video_off !== undefined ? { isVideoOff: participant.is_video_off } : {}),
+      },
     });
-    publishSignalingEvent(payload);
 
     res.json(participant);
   } catch (error) {
     console.error('[Live] update participant failed:', (error as Error).message);
     res.status(500).json({ error: 'Failed to update participant' });
+  }
+});
+
+/**
+ * Remove another participant. Hosts and moderators only; the host can never be
+ * removed. Used by the host UI's participant moderation controls.
+ */
+liveRouter.delete('/sessions/:id/participants/:userId', async (req: Request, res: Response) => {
+  try {
+    const callerId = req.user!.id;
+    const { id: sessionId, userId: targetUserId } = req.params;
+    const { session, participant: caller } = await authorizeSessionAccess(sessionId, callerId, 'moderator');
+
+    if (targetUserId === session.host_id) {
+      res.status(403).json({ error: 'The host cannot be removed' });
+      return;
+    }
+    if (targetUserId !== callerId && session.host_id !== callerId && caller?.role !== 'moderator') {
+      res.status(403).json({ error: 'Not authorized to remove this participant' });
+      return;
+    }
+
+    await leaveLiveSession(sessionId, targetUserId);
+    await publishDurableState({
+      sessionId,
+      fromUserId: callerId,
+      type: 'leave',
+      role: session.host_id === callerId ? 'host' : (caller?.role ?? 'viewer'),
+      state: { targetUserId },
+    });
+    await recordLiveEvent({
+      session_id: sessionId,
+      event_type: 'participant_removed',
+      actor_id: callerId,
+      target_user_id: targetUserId,
+    });
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('[Live] remove participant failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to remove participant' });
   }
 });
 
@@ -341,8 +409,9 @@ liveRouter.post('/sessions/:id/leave', async (req: Request, res: Response) => {
 
     await leaveLiveSession(sessionId, userId);
 
-    const payload = makeSignalingPayload(sessionId, userId, 'participant-left');
-    publishSignalingEvent(payload);
+    await publishDurableState({
+      sessionId, fromUserId: userId, type: 'leave', role: 'viewer', state: { targetUserId: userId },
+    });
     await recordLiveEvent({
       session_id: sessionId,
       event_type: 'participant_left',
@@ -368,6 +437,13 @@ liveRouter.post('/sessions/:id/participants/:userId/raise-hand', async (req: Req
       res.status(404).json({ error: 'Session not found' });
       return;
     }
+    const { participant: caller } = await authorizeSessionAccess(sessionId, userId);
+    const canModerate = session.host_id === userId ||
+      caller?.role === 'host' || caller?.role === 'moderator';
+    if (targetUserId !== userId && !canModerate) {
+      res.status(403).json({ error: 'Only hosts and moderators can raise hands for others' });
+      return;
+    }
 
     const participant = await raiseHand(sessionId, targetUserId);
     if (!participant) {
@@ -375,11 +451,13 @@ liveRouter.post('/sessions/:id/participants/:userId/raise-hand', async (req: Req
       return;
     }
 
-    const payload = makeSignalingPayload(sessionId, userId, 'participant-raised-hand', {
-      toUserId: targetUserId,
-      raisedHand: true,
+    await publishDurableState({
+      sessionId,
+      fromUserId: userId,
+      type: 'participant-state',
+      role: session.host_id === userId ? 'host' : (caller?.role ?? 'viewer'),
+      state: { raisedHand: true, targetUserId },
     });
-    publishSignalingEvent(payload);
 
     res.json(participant);
   } catch (error) {
@@ -399,6 +477,13 @@ liveRouter.post('/sessions/:id/participants/:userId/lower-hand', async (req: Req
       res.status(404).json({ error: 'Session not found' });
       return;
     }
+    const { participant: caller } = await authorizeSessionAccess(sessionId, userId);
+    const canModerate = session.host_id === userId ||
+      caller?.role === 'host' || caller?.role === 'moderator';
+    if (targetUserId !== userId && !canModerate) {
+      res.status(403).json({ error: 'Only hosts and moderators can lower hands for others' });
+      return;
+    }
 
     const participant = await lowerHand(sessionId, targetUserId);
     if (!participant) {
@@ -406,11 +491,13 @@ liveRouter.post('/sessions/:id/participants/:userId/lower-hand', async (req: Req
       return;
     }
 
-    const payload = makeSignalingPayload(sessionId, userId, 'participant-lowered-hand', {
-      toUserId: targetUserId,
-      raisedHand: false,
+    await publishDurableState({
+      sessionId,
+      fromUserId: userId,
+      type: 'participant-state',
+      role: session.host_id === userId ? 'host' : (caller?.role ?? 'viewer'),
+      state: { raisedHand: false, targetUserId },
     });
-    publishSignalingEvent(payload);
 
     res.json(participant);
   } catch (error) {
@@ -468,12 +555,8 @@ liveRouter.delete('/sessions/:id/comments/:commentId', async (req: Request, res:
 
     await hideComment(commentId);
 
-    // Broadcast the hide to the session.
-    const payload = makeSignalingPayload(sessionId, callerId, 'comment-hidden', {
-      toUserId: undefined,
-    });
-    publishSignalingEvent(payload);
-
+    // Comment moderation is a REST concern; clients refresh comments after
+    // this call. No WebRTC signaling event is required.
     res.json({ ok: true });
   } catch (error) {
     console.error('[Live] hide comment failed:', (error as Error).message);
@@ -501,6 +584,14 @@ liveRouter.post('/sessions/:sessionId/posts', async (req: Request, res: Response
     }
     if (session.host_id !== userId) {
       res.status(403).json({ error: 'Only the host can create a live post for this session' });
+      return;
+    }
+
+    // Idempotency: a reconnect must never create a second LIVE post. Return the
+    // existing post for this session if one was already created.
+    const existing = await database.query('posts', { live_session_id: sessionId });
+    if (existing.length > 0) {
+      res.status(200).json({ id: (existing[0] as { id: string }).id, existing: true });
       return;
     }
 
@@ -658,227 +749,70 @@ liveRouter.post('/sessions/:id/events', async (req: Request, res: Response) => {
 });
 
 // ============================================================================
-// Signaling (WebRTC) - SSE-based
+// Signaling (WebRTC) — durable WebSocket only
 // ============================================================================
+// The previous SSE subscribe/publish endpoints were removed with the old
+// media-server transport.
+// Browser media signaling is now carried exclusively by the authenticated
+// WebSocket at /api/live/signaling, coordinated through the durable Supabase
+// tables created in migration 005.
 
-/** Subscribe to a live session's signaling channel (SSE). */
-liveRouter.get('/sessions/:id/signaling', async (req: Request, res: Response) => {
-  try {
-    const userId = req.user!.id;
-    const { id: sessionId } = req.params;
-
-    const session = await getLiveSession(sessionId);
-    if (!session) {
-      res.status(404).json({ error: 'Session not found' });
-      return;
-    }
-
-    // Audience enforcement for signaling (same as session access).
-    if (session.audience_type === 'friends' && session.host_id !== userId) {
-      res.status(403).json({ error: 'Access denied: friends-only session' });
-      return;
-    }
-
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-    res.flushHeaders?.();
-
-    const connId = subscribeToSessionSignaling(sessionId, userId, res);
-    res.write(`event: init\ndata: ${JSON.stringify({ connId, sessionId, userId })}\n\n`);
-
-    const heartbeat = setInterval(() => {
-      try {
-        res.write(': keep-alive\n\n');
-      } catch {
-        clearInterval(heartbeat);
-      }
-    }, 25000);
-
-    req.on('close', () => {
-      clearInterval(heartbeat);
-    });
-  } catch (error) {
-    console.error('[Live] signaling subscribe failed:', (error as Error).message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Failed to subscribe to signaling' });
-    }
-  }
-});
-
-/** Subscribe to a user's private signaling channel (SSE). */
-liveRouter.get('/users/:userId/signaling', async (req: Request, res: Response) => {
-  try {
-    const callerId = req.user!.id;
-    const { userId } = req.params;
-
-    // Users can only subscribe to their own private signaling channel.
-    if (userId !== callerId) {
-      res.status(403).json({ error: 'You may only subscribe to your own channel' });
-      return;
-    }
-
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    });
-    res.flushHeaders?.();
-
-    const connId = subscribeToUserSignaling(userId, res);
-    res.write(`event: init\ndata: ${JSON.stringify({ connId, userId })}\n\n`);
-
-    const heartbeat = setInterval(() => {
-      try {
-        res.write(': keep-alive\n\n');
-      } catch {
-        clearInterval(heartbeat);
-      }
-    }, 25000);
-
-    req.on('close', () => {
-      clearInterval(heartbeat);
-    });
-  } catch (error) {
-    console.error('[Live] user signaling subscribe failed:', (error as Error).message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Failed to subscribe to user signaling' });
-    }
-  }
-});
-
-/** Publish a signaling event to a session (offer/answer/ICE candidate). */
-liveRouter.post('/sessions/:id/signaling', async (req: Request, res: Response) => {
-  try {
-    const userId = req.user!.id;
-    const { id: sessionId } = req.params;
-    const body = requireBody(req, res, ['type']);
-    if (!body) return;
-
-    const session = await getLiveSession(sessionId);
-    if (!session) {
-      res.status(404).json({ error: 'Session not found' });
-      return;
-    }
-
-    const payload = makeSignalingPayload(sessionId, userId, body.type as SignalingEvent, {
-      toUserId: body.toUserId as string | undefined,
-      sdp: body.sdp as string | undefined,
-      candidate: body.candidate as any,
-      role: body.role as any,
-      streamType: body.streamType as any,
-    });
-
-    const delivered = publishSignalingEvent(payload);
-
-    res.json({ ok: true, delivered });
-  } catch (error) {
-    console.error('[Live] publish signaling failed:', (error as Error).message);
-    res.status(500).json({ error: 'Failed to publish signaling event' });
-  }
-});
-
-/** Issue a LiveKit access token for a session participant.
- *  The Gateway verifies the session exists and the caller is authorized,
- *  then mints a short-lived LiveKit access token with the appropriate role.
+/**
+ * Issue a short-lived, single-use WebSocket signaling ticket.
+ *
+ * Browsers cannot attach an Authorization header to a WebSocket upgrade, so the
+ * client first calls this authenticated HTTP endpoint. The Gateway verifies the
+ * user's identity, session access, audience restrictions and role, then returns
+ * an opaque ticket. The WebSocket endpoint consumes the ticket exactly once.
+ * No long-lived access token or secret is ever placed in a WebSocket URL.
  */
-liveRouter.get('/sessions/:id/token', async (req: Request, res: Response) => {
+liveRouter.post('/sessions/:id/signaling-ticket', async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
-    const { sessionId } = req.params;
+    const { id: sessionId } = req.params;
 
     const session = await getLiveSession(sessionId);
     if (!session) {
       res.status(404).json({ error: 'Session not found' });
       return;
     }
+    if (session.status !== 'live' && session.status !== 'scheduled') {
+      res.status(409).json({ error: 'Session is not active' });
+      return;
+    }
 
-    // Verify the caller is the host or a participant
-    const isHost = session.host_id === userId;
+    // Audience/privacy enforcement (public, friends, specific, ...).
+    try {
+      await assertLiveAudienceAccess(session, userId);
+    } catch (err) {
+      res.status(403).json({ error: (err as Error).message });
+      return;
+    }
+
     const participants = await getSessionParticipants(sessionId);
-    const isParticipant = participants.some((p) => p.user_id === userId && p.left_at === null);
+    const me = participants.find((p) => p.user_id === userId) ?? null;
+    const role = getEffectiveLiveRole(session, userId, me);
 
-    if (!isHost && !isParticipant) {
-      res.status(403).json({ error: 'Not a participant in this session' });
+    // Viewer/listener cap for the signaling mesh.
+    if (session.max_viewers != null && session.host_id !== userId &&
+        participants.length >= session.max_viewers) {
+      res.status(403).json({ error: 'Session is full' });
       return;
     }
 
-    // Determine role
-    let role: 'host' | 'moderator' | 'guest' | 'viewer' = 'viewer';
-    if (isHost) {
-      role = 'host';
-    } else {
-      const participant = participants.find((p) => p.user_id === userId);
-      if (participant) {
-        role = participant.role as 'moderator' | 'guest' | 'viewer';
-      }
-    }
-
-    // Only hosts and moderators can publish; speakers can publish if approved;
-    // viewers/listeners can only subscribe
-    const canPublish = role === 'host' || role === 'moderator';
-    const canPublishData = role === 'host' || role === 'moderator';
-
-    const token = await createLiveKitToken({
-      room: session.room_id!,
-      identity: userId,
-      canPublish,
-      canPublishData,
-      canSubscribe: true,
+    const issued = await createSignalingTicket({ sessionId, userId, role, ttlSeconds: 60 });
+    // The raw ticket is returned once; only its hash is stored server-side.
+    res.json({
+      ticket: issued.ticket,
+      sessionId: issued.sessionId,
+      userId: issued.userId,
+      role: issued.role,
+      expiresAt: issued.expiresAt,
+      ttlSeconds: 60,
     });
-
-    res.json({ token, roomId: session.room_id, sessionId, role, livekitUrl: LIVEKIT_URL });
   } catch (error) {
-    console.error('[Live] create token failed:', (error as Error).message);
-    res.status(500).json({ error: 'Failed to create token' });
-  }
-});
-
-/** Webhook endpoint for LiveKit events (recording.completed, session.ended, etc.) */
-liveRouter.post('/webhooks/livekit', express.raw({ type: '*/*' }), async (req: Request, res: Response) => {
-  try {
-    const authHeader = req.headers.authorization;
-    const rawBody = req.body;
-
-    const event = await verifyLiveKitWebhook(authHeader, rawBody);
-    if (!event) {
-      res.status(401).json({ error: 'Invalid webhook signature' });
-      return;
-    }
-
-    const { event: eventType, payload } = event;
-    const payloadData = payload as { room?: { id: string }; recording?: { id: string; url: string } };
-
-    console.log(`[LiveKit] Webhook event: ${eventType}`, payloadData);
-
-    // Handle session ended
-    if (eventType === 'room.ended') {
-      const sessionId = payloadData.room?.id;
-      if (sessionId) {
-        await endLiveSession(sessionId);
-      }
-    }
-
-    // Handle recording events
-    if (eventType === 'recording.completed') {
-      const sessionId = payloadData.room?.id;
-      const recordingId = payloadData.recording?.id;
-      const recordingUrl = payloadData.recording?.url;
-      if (sessionId && recordingUrl) {
-        await updateLiveSession(sessionId, {
-          recording_url: recordingUrl,
-        } as any);
-      }
-    }
-
-    res.json({ received: true });
-  } catch (error) {
-    console.error('[Live] webhook error:', (error as Error).message);
-    res.status(500).json({ error: 'Webhook processing failed' });
+    console.error('[Live] signaling ticket failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to issue signaling ticket' });
   }
 });
 

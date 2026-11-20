@@ -4,6 +4,9 @@
   "functions": {
     "api/[...slug].ts": {
       "maxDuration": 300
+    },
+    "api/live/signaling.ts": {
+      "maxDuration": 300
     }
   },
   "crons": [

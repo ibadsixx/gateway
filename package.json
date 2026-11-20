@@ -36,7 +36,10 @@
     "test:presence": "ts-node src/features/presenceTest.ts",
     "test:online-friends": "ts-node src/features/onlineFriendsTest.ts",
     "test:unread-conversations": "ts-node src/features/unreadConversationsTest.ts",
-    "test:hashtag-backfill": "ts-node src/features/hashtagBackfillTest.ts"
+    "test:hashtag-backfill": "ts-node src/features/hashtagBackfillTest.ts",
+    "test:live-signaling-protocol": "ts-node src/features/liveSignalingProtocol.test.ts",
+    "test:live-signaling-store": "ts-node src/features/liveSignalingStore.test.ts",
+    "test:live-lifecycle": "ts-node src/features/liveSessionLifecycle.test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.0",
@@ -46,7 +49,6 @@
     "dotenv": "^17.4.2",
     "express": "^4.18.2",
     "jose": "^6.2.4",
-    "livekit-server-sdk": "^2.20.1",
     "pg": "^8.22.0",
     "ws": "^8.21.3",
     "zod": "^3.22.4"

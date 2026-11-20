@@ -16,6 +16,8 @@ import {
   updateLiveParticipant,
   leaveLiveSession,
   authorizeSessionAccess,
+  assertLiveAudienceAccess,
+  getEffectiveLiveRole,
   type LiveSessionRow,
   type LiveParticipantRow,
 } from './liveSessions';
@@ -225,29 +227,55 @@ async function main(): Promise<void> {
   assert(sessionStillThere!.id === sessionId, 'session ID matches on reconnect');
 
   // -----------------------------------------------------------------------
-  // 5. Session creation creates LiveKit room (room_id is set)
+  // 5. P2P sessions create no media-server room
   // -----------------------------------------------------------------------
-  console.log('\n--- LiveKit room creation ---');
+  console.log('\n--- P2P room lifecycle ---');
   const roomSession = await createLiveSession({
     host_id: 'host-user',
     title: 'Room Test Stream',
     stream_type: 'video',
     audience_type: 'public',
   });
-  assert(roomSession.room_id !== null, 'session has room_id');
-  assert(typeof roomSession.room_id === 'string', 'room_id is a string');
-  assert(roomSession!.room_id!.startsWith('live-'), 'room_id starts with live- prefix');
+  assert(roomSession.room_id === null, 'P2P session has no media-server room_id');
 
   // -----------------------------------------------------------------------
-  // 6. Ending session deletes LiveKit room
+  // 6. Ending a session is idempotent
   // -----------------------------------------------------------------------
-  console.log('\n--- Session ending deletes LiveKit room ---');
-  const roomId = roomSession.room_id!;
+  console.log('\n--- Session ending is idempotent ---');
   await endLiveSession(roomSession.id);
   const endedSession = await getLiveSession(roomSession.id);
   assert(endedSession!.status === 'ended', 'session is ended');
-  // Note: LiveKit room deletion is called within endLiveSession;
-  // without credentials it logs a warning but doesn't throw.
+  const endedAt = endedSession!.ended_at;
+  await endLiveSession(roomSession.id);
+  const endedAgain = await getLiveSession(roomSession.id);
+  assert(endedAgain!.ended_at === endedAt, 'ending twice preserves the original ended_at');
+
+  // -----------------------------------------------------------------------
+  // 7. Audience / privacy enforcement for signaling tickets
+  // -----------------------------------------------------------------------
+  console.log('\n--- Audience and privacy enforcement ---');
+  const audienceBase = { host_id: 'host-user', audience_type: 'public' } as LiveSessionRow;
+  const allows = async (row: LiveSessionRow, uid: string) => {
+    try { await assertLiveAudienceAccess(row, uid); return true; } catch { return false; }
+  };
+  assert(await allows(audienceBase, 'any-user'), 'public audience allows any authenticated user');
+  assert(await allows(audienceBase, 'host-user'), 'host always allowed');
+  assert(!await allows({ ...audienceBase, audience_type: 'only_me' } as LiveSessionRow, 'other-user'),
+    'only-me audience denies other users');
+  assert(!await allows({ ...audienceBase, audience_type: 'friends' } as LiveSessionRow, 'other-user'),
+    'friends-only audience fails closed without a friend-graph proof');
+  assert(!await allows({ ...audienceBase, audience_type: 'friends_except' } as LiveSessionRow, 'other-user'),
+    'friends_except fails closed for non-hosts');
+  assert(await allows({ ...audienceBase, audience_type: 'specific', audience_user_ids: ['invited'] } as LiveSessionRow, 'invited'),
+    'specific audience allows listed user');
+  assert(!await allows({ ...audienceBase, audience_type: 'specific', audience_user_ids: ['invited'] } as LiveSessionRow, 'intruder'),
+    'specific audience denies unlisted user');
+  assert(!await allows({ ...audienceBase, audience_type: 'unrecognized-value' } as unknown as LiveSessionRow, 'other-user'),
+    'unknown audience fails closed');
+  assert(getEffectiveLiveRole(audienceBase, 'host-user', null) === 'host', 'host role comes from server state');
+  assert(getEffectiveLiveRole(audienceBase, 'other-user', null) === 'viewer', 'unknown user is a viewer by default');
+  assert(getEffectiveLiveRole(audienceBase, 'other-user', { role: 'moderator' } as LiveParticipantRow) === 'moderator',
+    'stored participant role is authoritative');
 
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
   process.exit(failed > 0 ? 1 : 0);

@@ -1,5 +1,6 @@
 import { auth } from '../auth';
-import { createLiveKitRoom, deleteLiveKitRoom } from './livekit';
+import { canonicalAudienceType } from './contentAudience';
+import { defaultDeps as peopleYouMayKnowDeps } from './peopleYouMayKnow';
 
 export type LiveStreamType = 'video' | 'audio';
 export type LiveSessionStatus = 'scheduled' | 'live' | 'ended';
@@ -174,6 +175,58 @@ async function requireUserId(req: { headers: Record<string, string | undefined> 
 }
 
 /**
+ * Enforce the session's existing Tone audience/privacy rules for an
+ * authenticated user. Unknown audience values fail closed. Friend audiences use
+ * the Gateway's existing accepted-friendship definition (shared with presence
+ * and message-request categorization) rather than a second interpretation.
+ * Role/permission decisions are always made from stored server-side state,
+ * never from client input.
+ */
+export async function assertLiveAudienceAccess(session: LiveSessionRow, userId: string): Promise<void> {
+  if (session.host_id === userId) return; // the host always has access
+
+  const audience = canonicalAudienceType(session.audience_type) ?? 'denied';
+  const allowedIds = new Set<string>(session.audience_user_ids ?? []);
+  const excludedIds = new Set<string>(session.audience_excluded_user_ids ?? []);
+
+  switch (audience) {
+    case 'public':
+      return;
+    case 'only_me':
+      throw new Error('Access denied: private session');
+    case 'specific':
+    case 'custom_list':
+      if (!allowedIds.has(userId)) throw new Error('Access denied: not on the session audience list');
+      return;
+    case 'friends': {
+      const friends = await peopleYouMayKnowDeps.acceptedFriendIds(session.host_id);
+      if (!friends.has(userId)) throw new Error('Access denied: friends-only session');
+      return;
+    }
+    case 'friends_except': {
+      const friends = await peopleYouMayKnowDeps.acceptedFriendIds(session.host_id);
+      if (!friends.has(userId) || excludedIds.has(userId)) {
+        throw new Error('Access denied: friends-only session or excluded user');
+      }
+      return;
+    }
+    case 'denied':
+    default:
+      throw new Error('Access denied: unrecognized session audience');
+  }
+}
+
+/** Resolve a user's effective role from stored server-side state. */
+export function getEffectiveLiveRole(
+  session: LiveSessionRow,
+  userId: string,
+  participant: LiveParticipantRow | null
+): LiveParticipantRole {
+  if (session.host_id === userId) return 'host';
+  return participant?.role ?? 'viewer';
+}
+
+/**
  * Authorize a participant action on a session.
  */
 export async function authorizeSessionAccess(
@@ -187,16 +240,15 @@ export async function authorizeSessionAccess(
   }
   const sessionRow = session as unknown as LiveSessionRow;
 
-  if (sessionRow.audience_type === 'friends' && sessionRow.host_id !== userId) {
-    throw new Error('Access denied: friends-only session');
-  }
+  await assertLiveAudienceAccess(sessionRow, userId);
 
   const participants = await memQuery(LIVE_DOMAIN, { session_id: sessionId, user_id: userId, left_at: null });
   const participant = (participants[0] as unknown as LiveParticipantRow) || null;
 
-  if (requiredRole && participant) {
+  if (requiredRole) {
+    const effectiveRole: LiveParticipantRole = sessionRow.host_id === userId ? 'host' : (participant?.role ?? 'viewer');
     const roleRank: Record<LiveParticipantRole, number> = { viewer: 0, guest: 1, moderator: 2, host: 3 };
-    if (roleRank[participant.role] < roleRank[requiredRole]) {
+    if (roleRank[effectiveRole] < roleRank[requiredRole]) {
       throw new Error(`Access denied: requires ${requiredRole} role`);
     }
   }
@@ -221,10 +273,8 @@ export async function createLiveSession(data: {
   max_viewers?: number | null;
 }): Promise<LiveSessionRow> {
   const now = new Date().toISOString();
-  const roomId = `live-${crypto.randomUUID()}`;
-
-  // Create the LiveKit room
-  await createLiveKitRoom({ roomName: roomId });
+  // Media is direct browser-to-browser WebRTC; there is no media server room.
+  // `room_id` is retained as a legacy field for older clients and is null.
 
   const row: Partial<LiveSessionRow> = {
     id: crypto.randomUUID(),
@@ -245,7 +295,7 @@ export async function createLiveSession(data: {
     ended_at: null,
     created_at: now,
     updated_at: now,
-    room_id: roomId,
+    room_id: null,
   };
 
   const created = await memWrite(LIVE_DOMAIN, row as Record<string, unknown>);
@@ -274,19 +324,10 @@ export async function endLiveSession(sessionId: string): Promise<LiveSessionRow 
   const session = await memRead(LIVE_DOMAIN, sessionId);
   if (!session) return null;
 
-  // Delete the LiveKit room
-  const roomId = (session as unknown as LiveSessionRow).room_id;
-  if (roomId) {
-    try {
-      await deleteLiveKitRoom(roomId);
-    } catch (err) {
-      console.warn(`[LiveKit] Failed to delete room ${roomId}:`, (err as Error).message);
-    }
-  }
-
+  // Idempotent: ending an already-ended session is a no-op update.
   return updateLiveSession(sessionId, {
     status: 'ended',
-    ended_at: new Date().toISOString(),
+    ended_at: (session as unknown as LiveSessionRow).ended_at ?? new Date().toISOString(),
   });
 }
 
