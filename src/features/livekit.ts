@@ -1,8 +1,8 @@
 import { AccessToken, RoomServiceClient, WebhookReceiver } from 'livekit-server-sdk';
 
-const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || '';
-const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || '';
-const LIVEKIT_URL = process.env.LIVEKIT_URL || 'ws://localhost:7880';
+export const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || '';
+export const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || '';
+export const LIVEKIT_URL = process.env.LIVEKIT_URL || 'ws://localhost:7880';
 
 export interface LiveKitRoomConfig {
   roomName: string;
@@ -22,7 +22,8 @@ export interface LiveKitTokenOptions {
 
 export async function createLiveKitRoom(config: LiveKitRoomConfig): Promise<void> {
   if (!LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
-    throw new Error('LiveKit API credentials not configured');
+    console.warn('[LiveKit] Room creation skipped: API credentials not configured');
+    return;
   }
 
   const client = new RoomServiceClient(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL);
@@ -44,7 +45,8 @@ export async function createLiveKitRoom(config: LiveKitRoomConfig): Promise<void
 
 export async function deleteLiveKitRoom(roomName: string): Promise<void> {
   if (!LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
-    throw new Error('LiveKit API credentials not configured');
+    console.warn('[LiveKit] Room deletion skipped: API credentials not configured');
+    return;
   }
 
   const client = new RoomServiceClient(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL);

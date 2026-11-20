@@ -45,6 +45,7 @@ import {
   deleteLiveKitRoom,
   createLiveKitToken,
   verifyLiveKitWebhook,
+  LIVEKIT_URL,
 } from '../features/livekit';
 
 const liveRouter = Router();
@@ -766,7 +767,7 @@ liveRouter.get('/sessions/:id/token', async (req: Request, res: Response) => {
       canSubscribe: true,
     });
 
-    res.json({ token, roomId: session.room_id, sessionId, role });
+    res.json({ token, roomId: session.room_id, sessionId, role, livekitUrl: LIVEKIT_URL });
   } catch (error) {
     console.error('[Live] create token failed:', (error as Error).message);
     res.status(500).json({ error: 'Failed to create token' });
