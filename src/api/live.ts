@@ -19,6 +19,8 @@ import {
   addLiveRecording,
   submitLiveReport,
   recordLiveEvent,
+  raiseHand,
+  lowerHand,
   authorizeSessionAccess,
   type LiveSessionRow,
   type LiveParticipantRow,
@@ -352,6 +354,68 @@ liveRouter.post('/sessions/:id/leave', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('[Live] leave session failed:', (error as Error).message);
     res.status(500).json({ error: 'Failed to leave session' });
+  }
+});
+
+/** Raise hand in a live session. */
+liveRouter.post('/sessions/:id/participants/:userId/raise-hand', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { id: sessionId, userId: targetUserId } = req.params;
+
+    const session = await getLiveSession(sessionId);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const participant = await raiseHand(sessionId, targetUserId);
+    if (!participant) {
+      res.status(404).json({ error: 'Participant not found' });
+      return;
+    }
+
+    const payload = makeSignalingPayload(sessionId, userId, 'participant-raised-hand', {
+      toUserId: targetUserId,
+      raisedHand: true,
+    });
+    publishSignalingEvent(payload);
+
+    res.json(participant);
+  } catch (error) {
+    console.error('[Live] raise hand failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to raise hand' });
+  }
+});
+
+/** Lower hand in a live session. */
+liveRouter.post('/sessions/:id/participants/:userId/lower-hand', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { id: sessionId, userId: targetUserId } = req.params;
+
+    const session = await getLiveSession(sessionId);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const participant = await lowerHand(sessionId, targetUserId);
+    if (!participant) {
+      res.status(404).json({ error: 'Participant not found' });
+      return;
+    }
+
+    const payload = makeSignalingPayload(sessionId, userId, 'participant-lowered-hand', {
+      toUserId: targetUserId,
+      raisedHand: false,
+    });
+    publishSignalingEvent(payload);
+
+    res.json(participant);
+  } catch (error) {
+    console.error('[Live] lower hand failed:', (error as Error).message);
+    res.status(500).json({ error: 'Failed to lower hand' });
   }
 });
 

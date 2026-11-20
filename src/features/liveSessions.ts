@@ -37,6 +37,7 @@ export interface LiveParticipantRow {
   left_at: string | null;
   is_muted: boolean;
   is_video_off: boolean;
+  raised_hand: boolean;
 }
 
 export interface LiveInviteRow {
@@ -337,6 +338,24 @@ export async function leaveLiveSession(sessionId: string, userId: string): Promi
   if (!participant) return;
 
   await memUpdate(LIVE_DOMAIN, participant.id, { left_at: new Date().toISOString() } as Record<string, unknown>);
+}
+
+export async function raiseHand(sessionId: string, userId: string): Promise<LiveParticipantRow | null> {
+  const rows = await memQuery(LIVE_DOMAIN, { session_id: sessionId, user_id: userId, left_at: null });
+  const participant = (rows[0] as unknown as LiveParticipantRow) || null;
+  if (!participant) return null;
+
+  const result = await memUpdate(LIVE_DOMAIN, participant.id, { raised_hand: true } as Record<string, unknown>);
+  return (result as unknown as LiveParticipantRow) || null;
+}
+
+export async function lowerHand(sessionId: string, userId: string): Promise<LiveParticipantRow | null> {
+  const rows = await memQuery(LIVE_DOMAIN, { session_id: sessionId, user_id: userId, left_at: null });
+  const participant = (rows[0] as unknown as LiveParticipantRow) || null;
+  if (!participant) return null;
+
+  const result = await memUpdate(LIVE_DOMAIN, participant.id, { raised_hand: false } as Record<string, unknown>);
+  return (result as unknown as LiveParticipantRow) || null;
 }
 
 // ============================================================================

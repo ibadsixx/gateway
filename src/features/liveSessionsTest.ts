@@ -263,6 +263,7 @@ async function main(): Promise<void> {
     left_at: null,
     is_muted: false,
     is_video_off: false,
+    raised_hand: false,
   };
   assert(partRow.role === 'viewer', 'LiveParticipantRow.role');
 

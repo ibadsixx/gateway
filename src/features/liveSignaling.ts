@@ -14,6 +14,8 @@ export type SignalingEvent =
   | 'participant-joined'
   | 'participant-left'
   | 'participant-updated'
+  | 'participant-raised-hand'
+  | 'participant-lowered-hand'
   | 'comment-hidden'
   | 'session-ended';
 
@@ -26,6 +28,7 @@ export interface SignalingPayload {
   candidate?: { sdpMid: string; sdpMLineIndex: number; candidate: string };
   role?: 'host' | 'moderator' | 'guest' | 'viewer';
   streamType?: 'video' | 'audio';
+  raisedHand?: boolean;
   timestamp: string;
 }
 
@@ -97,6 +100,7 @@ export function makeSignalingPayload(
     candidate?: SignalingPayload['candidate'];
     role?: SignalingPayload['role'];
     streamType?: SignalingPayload['streamType'];
+    raisedHand?: SignalingPayload['raisedHand'];
   } = {}
 ): SignalingPayload {
   return {
@@ -108,6 +112,7 @@ export function makeSignalingPayload(
     candidate: opts.candidate,
     role: opts.role,
     streamType: opts.streamType,
+    raisedHand: opts.raisedHand,
     timestamp: new Date().toISOString(),
   };
 }
