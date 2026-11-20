@@ -758,7 +758,13 @@ liveRouter.get('/sessions/:id/token', async (req: Request, res: Response) => {
     const canPublish = role === 'host' || role === 'moderator';
     const canPublishData = role === 'host' || role === 'moderator';
 
-    const token = createLiveKitToken(session.room_id!, userId);
+    const token = await createLiveKitToken({
+      room: session.room_id!,
+      identity: userId,
+      canPublish,
+      canPublishData,
+      canSubscribe: true,
+    });
 
     res.json({ token, roomId: session.room_id, sessionId, role });
   } catch (error) {
@@ -773,7 +779,7 @@ liveRouter.post('/webhooks/livekit', express.raw({ type: '*/*' }), async (req: R
     const authHeader = req.headers.authorization;
     const rawBody = req.body;
 
-    const event = verifyLiveKitWebhook(authHeader, rawBody);
+    const event = await verifyLiveKitWebhook(authHeader, rawBody);
     if (!event) {
       res.status(401).json({ error: 'Invalid webhook signature' });
       return;

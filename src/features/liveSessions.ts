@@ -223,7 +223,7 @@ export async function createLiveSession(data: {
   const roomId = `live-${crypto.randomUUID()}`;
 
   // Create the LiveKit room
-  await createLiveKitRoom(roomId);
+  await createLiveKitRoom({ roomName: roomId });
 
   const row: Partial<LiveSessionRow> = {
     id: crypto.randomUUID(),
