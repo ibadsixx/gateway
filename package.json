@@ -3,9 +3,13 @@
   "version": "1.0.0",
   "description": "Tone API Gateway - Single entry point for the Tone ecosystem",
   "main": "dist/src/dev.js",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/src/dev.js",
+    "start:docker": "node dist/src/dockerServer.js",
     "dev": "ts-node src/dev.ts",
     "test:channel-moderator": "ts-node src/features/channelModeratorTest.ts",
     "test:group-settings": "ts-node src/features/groupSettingsTest.ts",
